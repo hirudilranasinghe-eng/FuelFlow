@@ -160,6 +160,7 @@ export interface Pump {
 }
 
 export interface PumpReading {
+  id?: string; // Optional unique entry ID for multi-assignment / handover entries
   pumpId: string;
   pumpName: string;
   fuelType: FuelType;
@@ -214,6 +215,7 @@ export interface StockDelivery {
   fuelType: FuelType;
   tankId?: string; // Target Storage Tank ID
   tankName?: string; // Target Storage Tank Name
+  destination_tank?: string; // Target destination tank or multi-tank breakdown e.g. "Tank 01 (6,600 L) + Tank 02 (6,600 L)"
   quantity: number; // in liters
   supplier: string;
   cost: number;
@@ -309,13 +311,46 @@ export interface TankDipEntry {
   variancePercentage: number; // (varianceLiters / systemVolume) * 100
   status: 'Normal' | 'Gain' | 'Loss' | 'Warning';
   notes?: string;
+  dipMm?: number; // Physical dip level in mm
+}
+
+export interface BowserDeliveryDipData {
+  tankId: string;
+  tankName: string;
+  fuelType: string;
+  invoicedVolume: number; // Invoiced Bowser Volume in Liters (e.g. 6600, 13200)
+  
+  // Pre-Unload Dip
+  preDipMm: number; // in mm
+  preDipLiters: number; // in Liters
+  preDipNotes?: string;
+  
+  // Post-Unload Dip
+  postDipMm: number; // in mm
+  postDipLiters: number; // in Liters
+  postDipNotes?: string;
+  
+  // Decanting Variance Audit
+  actualReceivedVolume: number; // postDipLiters - preDipLiters
+  varianceLiters: number; // actualReceivedVolume - invoicedVolume
+  variancePercentage: number; // (varianceLiters / invoicedVolume) * 100
+  status: 'Exact Match' | 'Excess' | 'Shortage';
+  
+  bowserNo?: string;
+  invoiceNo?: string;
+  driverName?: string;
+  sealIntact?: boolean;
+  waterTestNegative?: boolean;
+  density?: number;
+  temperature?: number;
 }
 
 export interface DailyDipSession {
   id: string;
   date: string; // e.g. "2026-08-14"
   time: string; // e.g. "08:30"
-  shift: string; // e.g. "Morning", "Evening", "Night", "Daily Audit"
+  shift: string; // e.g. "Morning", "Evening", "Night", "Daily Audit", "Bowser Delivery Unload Audit"
+  sessionType?: 'daily_routine' | 'bowser_delivery';
   supervisor: string;
   remarks?: string;
   entries: TankDipEntry[];
@@ -324,6 +359,7 @@ export interface DailyDipSession {
   totalVarianceLiters: number;
   tanksCount: number;
   createdAt?: string;
+  bowserAudit?: BowserDeliveryDipData;
 }
 
 export interface TankDipLog {

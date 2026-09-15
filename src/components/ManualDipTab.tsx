@@ -7,9 +7,11 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { 
   Droplet, Plus, RefreshCw, Download, Search, AlertTriangle, 
   TrendingUp, TrendingDown, X, CheckCircle2, Eye, Calendar,
-  Clock, User, FileText, Check, ArrowUpDown, ChevronRight
+  Clock, User, FileText, Check, ArrowUpDown, ChevronRight,
+  Truck, Layers, Gauge, ShieldCheck, Fuel, ArrowRight,
+  Sparkles, CheckCircle, HelpCircle, Activity
 } from 'lucide-react';
-import { FuelTank, DailyDipSession, TankDipEntry } from '../types';
+import { FuelTank, DailyDipSession, TankDipEntry, BowserDeliveryDipData } from '../types';
 import { supabase } from '../lib/supabase';
 
 interface ManualDipTabProps {
@@ -19,18 +21,68 @@ interface ManualDipTabProps {
 
 const STORAGE_KEY_SESSIONS = 'fms_daily_dip_sessions';
 
+/**
+ * Standard reference depth in mm for underground cylindrical tanks based on capacity.
+ */
+export function getTankMaxDipMm(capacity: number): number {
+  if (capacity <= 10000) return 1950;
+  if (capacity <= 15000) return 2150;
+  if (capacity <= 25000) return 2400;
+  if (capacity <= 35000) return 2600;
+  return 2800;
+}
+
+/**
+ * Calculates fuel volume in Liters from a dip reading in mm for a horizontal cylindrical tank.
+ * Uses exact geometric volume fraction.
+ */
+export function calculateDipVolume(dipMm: number, tankCapacity: number): number {
+  if (isNaN(dipMm) || dipMm <= 0) return 0;
+  const maxDipMm = getTankMaxDipMm(tankCapacity);
+  if (dipMm >= maxDipMm) return tankCapacity;
+
+  const f = Math.max(0, Math.min(1, dipMm / maxDipMm));
+  // Exact geometric horizontal cylinder cross-section area formula:
+  const fraction = (Math.acos(1 - 2 * f) - (1 - 2 * f) * Math.sqrt(4 * f * (1 - f))) / Math.PI;
+  return Math.round(tankCapacity * fraction);
+}
+
+/**
+ * Inverse calculation: estimates dip in mm from volume in Liters.
+ */
+export function estimateDipMm(volumeLiters: number, tankCapacity: number): number {
+  if (isNaN(volumeLiters) || volumeLiters <= 0) return 0;
+  const maxDipMm = getTankMaxDipMm(tankCapacity);
+  if (volumeLiters >= tankCapacity) return maxDipMm;
+
+  let low = 0;
+  let high = maxDipMm;
+  for (let i = 0; i < 20; i++) {
+    const mid = (low + high) / 2;
+    const v = calculateDipVolume(mid, tankCapacity);
+    if (v < volumeLiters) {
+      low = mid;
+    } else {
+      high = mid;
+    }
+  }
+  return Math.round((low + high) / 2);
+}
+
 export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
   const [sessions, setSessions] = useState<DailyDipSession[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   
   // Modals state
-  const [isEntryModalOpen, setIsEntryModalOpen] = useState<boolean>(false);
+  const [isDailyDipModalOpen, setIsDailyDipModalOpen] = useState<boolean>(false);
+  const [isBowserDipModalOpen, setIsBowserDipModalOpen] = useState<boolean>(false);
   const [selectedDetailSession, setSelectedDetailSession] = useState<DailyDipSession | null>(null);
   
   // Search & Filter
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedShiftFilter, setSelectedShiftFilter] = useState<string>('all');
+  const [typeFilter, setTypeFilter] = useState<'all' | 'daily_routine' | 'bowser_delivery'>('all');
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   // Available Tanks (Naturally sorted in ascending order: Tank 01, Tank 02, etc.)
@@ -41,7 +93,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
     );
   }, [tanks]);
 
-  // Form State for Multi-Tank Entry Modal
+  // Form State for Multi-Tank Routine Entry Modal
   const [formData, setFormData] = useState({
     date: new Date().toISOString().slice(0, 10),
     time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }),
@@ -53,11 +105,40 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
   // Physical dip inputs mapped by tankId: string
   const [dipInputs, setDipInputs] = useState<{ [tankId: string]: string }>({});
 
-  // Initialize dip inputs with current system volume when modal opens
-  const handleOpenNewDipModal = () => {
+  // Form State for Bowser Delivery Unload Audit (Pre & Post Dip)
+  const [bowserForm, setBowserForm] = useState({
+    date: new Date().toISOString().slice(0, 10),
+    time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }),
+    supervisor: 'Supervisor',
+    tankId: availableTanks[0]?.id || '',
+    invoicedVolume: '6600',
+    bowserNo: '',
+    invoiceNo: '',
+    driverName: '',
+    sealIntact: true,
+    waterTestNegative: true,
+    density: '0.835',
+    temperature: '29.5',
+    remarks: '',
+    
+    // Pre-Unload Dip
+    preDipMm: '',
+    preDipLiters: '',
+    
+    // Post-Unload Dip
+    postDipMm: '',
+    postDipLiters: '',
+  });
+
+  // Selected tank for Bowser Delivery Audit
+  const selectedBowserTank = useMemo(() => {
+    return availableTanks.find(t => t.id === bowserForm.tankId) || availableTanks[0];
+  }, [availableTanks, bowserForm.tankId]);
+
+  // Open Daily Routine Dip Modal
+  const handleOpenDailyDipModal = () => {
     const initialInputs: { [tankId: string]: string } = {};
     availableTanks.forEach(tank => {
-      // Default to empty or currentLevel for easy editing
       initialInputs[tank.id] = '';
     });
     setDipInputs(initialInputs);
@@ -68,7 +149,54 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
       supervisor: 'Supervisor',
       remarks: '',
     });
-    setIsEntryModalOpen(true);
+    setIsDailyDipModalOpen(true);
+  };
+
+  // Open Bowser Delivery Unload Dip Modal
+  const handleOpenBowserDipModal = () => {
+    const defaultTank = availableTanks[0];
+    const initialPreLiters = defaultTank ? Math.round(defaultTank.currentLevel) : 0;
+    const initialPreMm = defaultTank ? estimateDipMm(initialPreLiters, defaultTank.capacity) : 0;
+    
+    setBowserForm({
+      date: new Date().toISOString().slice(0, 10),
+      time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }),
+      supervisor: 'Supervisor',
+      tankId: defaultTank?.id || '',
+      invoicedVolume: '6600',
+      bowserNo: '',
+      invoiceNo: '',
+      driverName: '',
+      sealIntact: true,
+      waterTestNegative: true,
+      density: defaultTank?.fuelType.toLowerCase().includes('diesel') ? '0.835' : '0.745',
+      temperature: '29.5',
+      remarks: '',
+      preDipMm: initialPreMm > 0 ? initialPreMm.toString() : '',
+      preDipLiters: initialPreLiters > 0 ? initialPreLiters.toString() : '',
+      postDipMm: '',
+      postDipLiters: '',
+    });
+
+    setIsBowserDipModalOpen(true);
+  };
+
+  // When Bowser Tank changes, update pre-dip suggestions and density default
+  const handleBowserTankChange = (newTankId: string) => {
+    const targetTank = availableTanks.find(t => t.id === newTankId);
+    if (targetTank) {
+      const currentL = Math.round(targetTank.currentLevel);
+      const estMm = estimateDipMm(currentL, targetTank.capacity);
+      setBowserForm(prev => ({
+        ...prev,
+        tankId: newTankId,
+        preDipMm: estMm > 0 ? estMm.toString() : prev.preDipMm,
+        preDipLiters: currentL > 0 ? currentL.toString() : prev.preDipLiters,
+        density: targetTank.fuelType.toLowerCase().includes('diesel') ? '0.835' : '0.745',
+      }));
+    } else {
+      setBowserForm(prev => ({ ...prev, tankId: newTankId }));
+    }
   };
 
   // Toast Notification Trigger
@@ -122,26 +250,32 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
 
       if (dipData) {
         if (dipData.length > 0) {
-          const mappedSessions: DailyDipSession[] = dipData.map((d: any) => ({
-            id: d.id,
-            date: d.date || new Date().toISOString().slice(0, 10),
-            time: d.time || '08:00',
-            shift: d.shift || 'Morning (06:00 - 14:00)',
-            supervisor: d.supervisor || d.recorded_by || 'Supervisor',
-            remarks: d.remarks || d.notes || '',
-            entries: Array.isArray(d.entries) ? d.entries : (typeof d.entries === 'string' ? JSON.parse(d.entries) : []),
-            totalSystemVolume: Number(d.total_system_volume ?? d.totalSystemVolume) || 0,
-            totalPhysicalDip: Number(d.total_physical_dip ?? d.totalPhysicalDip) || 0,
-            totalVarianceLiters: Number(d.total_variance_liters ?? d.totalVarianceLiters) || 0,
-            tanksCount: Number(d.tanks_count ?? d.tanksCount) || 0,
-            createdAt: d.created_at || d.createdAt
-          }));
+          const mappedSessions: DailyDipSession[] = dipData.map((d: any) => {
+            const rawEntries = Array.isArray(d.entries) ? d.entries : (typeof d.entries === 'string' ? JSON.parse(d.entries) : []);
+            const bowserAuditData = d.bowser_audit || d.bowserAudit || (typeof d.bowser_audit === 'string' ? JSON.parse(d.bowser_audit) : undefined);
+            
+            return {
+              id: d.id,
+              date: d.date || new Date().toISOString().slice(0, 10),
+              time: d.time || '08:00',
+              shift: d.shift || (d.session_type === 'bowser_delivery' ? 'Bowser Delivery Unload Audit' : 'Morning (06:00 - 14:00)'),
+              sessionType: d.session_type || d.sessionType || (d.shift?.includes('Bowser') || bowserAuditData ? 'bowser_delivery' : 'daily_routine'),
+              supervisor: d.supervisor || d.recorded_by || 'Supervisor',
+              remarks: d.remarks || d.notes || '',
+              entries: rawEntries,
+              totalSystemVolume: Number(d.total_system_volume ?? d.totalSystemVolume) || 0,
+              totalPhysicalDip: Number(d.total_physical_dip ?? d.totalPhysicalDip) || 0,
+              totalVarianceLiters: Number(d.total_variance_liters ?? d.totalVarianceLiters) || 0,
+              tanksCount: Number(d.tanks_count ?? d.tanksCount) || 0,
+              createdAt: d.created_at || d.createdAt,
+              bowserAudit: bowserAuditData
+            };
+          });
           setSessions(mappedSessions);
           try {
             localStorage.setItem(STORAGE_KEY_SESSIONS, JSON.stringify(mappedSessions));
           } catch (_) {}
         } else {
-          // Zero rows in Supabase: keep state strictly empty, do NOT inject mock data
           setSessions([]);
           try {
             localStorage.setItem(STORAGE_KEY_SESSIONS, JSON.stringify([]));
@@ -176,6 +310,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                   date: d.date || new Date().toISOString().slice(0, 10),
                   time: d.time || '08:00',
                   shift: d.shift || 'Morning (06:00 - 14:00)',
+                  sessionType: d.session_type || d.sessionType || 'daily_routine',
                   supervisor: d.supervisor || d.recorded_by || 'Supervisor',
                   remarks: d.remarks || d.notes || '',
                   entries: Array.isArray(d.entries) ? d.entries : (typeof d.entries === 'string' ? JSON.parse(d.entries) : []),
@@ -183,7 +318,8 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                   totalPhysicalDip: Number(d.total_physical_dip ?? d.totalPhysicalDip) || 0,
                   totalVarianceLiters: Number(d.total_variance_liters ?? d.totalVarianceLiters) || 0,
                   tanksCount: Number(d.tanks_count ?? d.tanksCount) || 0,
-                  createdAt: d.created_at || d.createdAt
+                  createdAt: d.created_at || d.createdAt,
+                  bowserAudit: d.bowser_audit || d.bowserAudit
                 };
                 setSessions(prev => {
                   if (prev.some(s => s.id === newSession.id)) {
@@ -198,6 +334,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                   date: d.date,
                   time: d.time || '08:00',
                   shift: d.shift || 'Morning (06:00 - 14:00)',
+                  sessionType: d.session_type || d.sessionType || 'daily_routine',
                   supervisor: d.supervisor || d.recorded_by || 'Supervisor',
                   remarks: d.remarks || d.notes || '',
                   entries: Array.isArray(d.entries) ? d.entries : (typeof d.entries === 'string' ? JSON.parse(d.entries) : []),
@@ -205,7 +342,8 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                   totalPhysicalDip: Number(d.total_physical_dip ?? d.totalPhysicalDip) || 0,
                   totalVarianceLiters: Number(d.total_variance_liters ?? d.totalVarianceLiters) || 0,
                   tanksCount: Number(d.tanks_count ?? d.tanksCount) || 0,
-                  createdAt: d.created_at || d.createdAt
+                  createdAt: d.created_at || d.createdAt,
+                  bowserAudit: d.bowser_audit || d.bowserAudit
                 };
                 setSessions(prev => prev.map(s => s.id === updatedSession.id ? updatedSession : s));
               } else if (payload.eventType === 'DELETE') {
@@ -228,7 +366,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
     };
   }, []);
 
-  // Compute live multi-tank calculations for entry modal
+  // Compute live multi-tank calculations for routine entry modal
   const modalCalculations = useMemo(() => {
     let totalSys = 0;
     let totalPhys = 0;
@@ -282,7 +420,64 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
     };
   }, [availableTanks, dipInputs]);
 
-  // Handle Save All-Tanks Daily Dip Record
+  // Compute live Bowser Delivery Unload Audit calculations
+  const bowserAuditCalculations = useMemo(() => {
+    if (!selectedBowserTank) {
+      return {
+        invoicedVol: 0,
+        preLiters: 0,
+        postLiters: 0,
+        actualReceived: 0,
+        varianceLiters: 0,
+        variancePercentage: 0,
+        status: 'Exact Match' as 'Exact Match' | 'Excess' | 'Shortage',
+        preMm: 0,
+        postMm: 0,
+        maxCapacity: 10000,
+      };
+    }
+
+    const maxCapacity = selectedBowserTank.capacity;
+    const invoicedVol = parseFloat(bowserForm.invoicedVolume) || 0;
+    
+    const preMm = parseFloat(bowserForm.preDipMm) || 0;
+    const preLiters = bowserForm.preDipLiters !== '' 
+      ? parseFloat(bowserForm.preDipLiters) || 0 
+      : (preMm > 0 ? calculateDipVolume(preMm, maxCapacity) : 0);
+
+    const postMm = parseFloat(bowserForm.postDipMm) || 0;
+    const postLiters = bowserForm.postDipLiters !== '' 
+      ? parseFloat(bowserForm.postDipLiters) || 0 
+      : (postMm > 0 ? calculateDipVolume(postMm, maxCapacity) : 0);
+
+    const actualReceived = Math.max(0, postLiters - preLiters);
+    const varianceLiters = actualReceived - invoicedVol;
+    const variancePercentage = invoicedVol > 0 ? (varianceLiters / invoicedVol) * 100 : 0;
+
+    let status: 'Exact Match' | 'Excess' | 'Shortage' = 'Exact Match';
+    if (Math.abs(varianceLiters) < 0.5) {
+      status = 'Exact Match';
+    } else if (varianceLiters > 0.5) {
+      status = 'Excess';
+    } else {
+      status = 'Shortage';
+    }
+
+    return {
+      invoicedVol,
+      preLiters,
+      postLiters,
+      actualReceived,
+      varianceLiters,
+      variancePercentage,
+      status,
+      preMm,
+      postMm,
+      maxCapacity,
+    };
+  }, [selectedBowserTank, bowserForm]);
+
+  // Handle Save All-Tanks Daily Routine Dip Record
   const handleSaveDailyDip = async (e: React.FormEvent) => {
     e.preventDefault();
 
@@ -302,6 +497,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
       date: formData.date || new Date().toISOString().slice(0, 10),
       time: formData.time || '08:00',
       shift: formData.shift,
+      sessionType: 'daily_routine',
       supervisor: formData.supervisor || 'Supervisor',
       remarks: formData.remarks,
       entries: tankEntries,
@@ -319,7 +515,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
       localStorage.setItem(STORAGE_KEY_SESSIONS, JSON.stringify(updatedSessions));
     } catch (_) {}
 
-    setIsEntryModalOpen(false);
+    setIsDailyDipModalOpen(false);
     showToast(`Daily Dip Record (${tankEntries.length} tanks) saved successfully!`);
 
     // Sync to Supabase
@@ -329,6 +525,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
         date: newSession.date,
         time: newSession.time,
         shift: newSession.shift,
+        session_type: 'daily_routine',
         supervisor: newSession.supervisor,
         remarks: newSession.remarks,
         entries: newSession.entries,
@@ -340,9 +537,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
       };
 
       const { error } = await supabase.from('daily_dip_sessions').insert([payload]);
-
       if (error) {
-        // Fallback to daily_dip_records table if daily_dip_sessions is named differently
         const { error: err2 } = await supabase.from('daily_dip_records').insert([payload]);
         if (err2) {
           console.warn("Supabase insert notice for dip records:", err2.message);
@@ -353,20 +548,145 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
     }
   };
 
-  // Filtered Sessions
+  // Handle Save Bowser Delivery Unload Audit Record
+  const handleSaveBowserDeliveryAudit = async (e: React.FormEvent) => {
+    e.preventDefault();
+
+    if (!selectedBowserTank) {
+      showToast("Please select a target fuel tank.");
+      return;
+    }
+
+    const { 
+      invoicedVol, preLiters, postLiters, actualReceived, 
+      varianceLiters, variancePercentage, status, preMm, postMm 
+    } = bowserAuditCalculations;
+
+    if (invoicedVol <= 0) {
+      showToast("Please enter a valid invoiced bowser delivery volume.");
+      return;
+    }
+
+    if (postLiters <= preLiters && postMm <= preMm) {
+      showToast("Post-unload dip reading must be greater than pre-unload dip reading.");
+      return;
+    }
+
+    const bowserAuditData: BowserDeliveryDipData = {
+      tankId: selectedBowserTank.id,
+      tankName: selectedBowserTank.name,
+      fuelType: selectedBowserTank.fuelType,
+      invoicedVolume: invoicedVol,
+      preDipMm: preMm,
+      preDipLiters: preLiters,
+      postDipMm: postMm,
+      postDipLiters: postLiters,
+      actualReceivedVolume: actualReceived,
+      varianceLiters: varianceLiters,
+      variancePercentage: variancePercentage,
+      status: status,
+      bowserNo: bowserForm.bowserNo.trim() || undefined,
+      invoiceNo: bowserForm.invoiceNo.trim() || undefined,
+      driverName: bowserForm.driverName.trim() || undefined,
+      sealIntact: bowserForm.sealIntact,
+      waterTestNegative: bowserForm.waterTestNegative,
+      density: parseFloat(bowserForm.density) || undefined,
+      temperature: parseFloat(bowserForm.temperature) || undefined,
+    };
+
+    const tankEntry: TankDipEntry = {
+      tankId: selectedBowserTank.id,
+      tankName: selectedBowserTank.name,
+      fuelType: selectedBowserTank.fuelType,
+      systemVolume: preLiters,
+      physicalDip: postLiters,
+      varianceLiters: varianceLiters,
+      variancePercentage: variancePercentage,
+      status: status === 'Exact Match' ? 'Normal' : status === 'Excess' ? 'Gain' : 'Loss',
+      dipMm: postMm,
+      notes: `Pre-Dip: ${preMm}mm (${preLiters.toLocaleString()}L) | Post-Dip: ${postMm}mm (${postLiters.toLocaleString()}L) | Invoiced: ${invoicedVol.toLocaleString()}L | Decanted: ${actualReceived.toLocaleString()}L`
+    };
+
+    const newSession: DailyDipSession = {
+      id: `bowser_dip_${Date.now()}`,
+      date: bowserForm.date || new Date().toISOString().slice(0, 10),
+      time: bowserForm.time || '08:00',
+      shift: 'Bowser Delivery Unload Audit',
+      sessionType: 'bowser_delivery',
+      supervisor: bowserForm.supervisor || 'Supervisor',
+      remarks: bowserForm.remarks || `Bowser Unload Audit for ${selectedBowserTank.name} (${selectedBowserTank.fuelType}) - Invoiced: ${invoicedVol.toLocaleString()}L, Received: ${actualReceived.toLocaleString()}L, Variance: ${varianceLiters >= 0 ? '+' : ''}${varianceLiters.toFixed(1)}L`,
+      entries: [tankEntry],
+      totalSystemVolume: preLiters + invoicedVol,
+      totalPhysicalDip: postLiters,
+      totalVarianceLiters: varianceLiters,
+      tanksCount: 1,
+      createdAt: new Date().toISOString(),
+      bowserAudit: bowserAuditData
+    };
+
+    // Optimistic UI state update
+    const updatedSessions = [newSession, ...sessions];
+    setSessions(updatedSessions);
+    try {
+      localStorage.setItem(STORAGE_KEY_SESSIONS, JSON.stringify(updatedSessions));
+    } catch (_) {}
+
+    setIsBowserDipModalOpen(false);
+    showToast(`Bowser Unload Audit (${selectedBowserTank.name}) saved! Variance: ${varianceLiters >= 0 ? '+' : ''}${varianceLiters.toFixed(1)} L`);
+
+    // Sync to Supabase
+    try {
+      const payload = {
+        id: newSession.id,
+        date: newSession.date,
+        time: newSession.time,
+        shift: newSession.shift,
+        session_type: 'bowser_delivery',
+        supervisor: newSession.supervisor,
+        remarks: newSession.remarks,
+        entries: newSession.entries,
+        total_system_volume: newSession.totalSystemVolume,
+        total_physical_dip: newSession.totalPhysicalDip,
+        total_variance_liters: newSession.totalVarianceLiters,
+        tanks_count: 1,
+        created_at: newSession.createdAt,
+        bowser_audit: bowserAuditData
+      };
+
+      const { error } = await supabase.from('daily_dip_sessions').insert([payload]);
+      if (error) {
+        const { error: err2 } = await supabase.from('daily_dip_records').insert([payload]);
+        if (err2) {
+          console.warn("Supabase insert notice for bowser dip audit:", err2.message);
+        }
+      }
+    } catch (err) {
+      console.warn("Supabase bowser dip insert error:", err);
+    }
+  };
+
+  // Filtered Sessions with mode, search, and shift filter
   const filteredSessions = useMemo(() => {
     return sessions.filter(session => {
+      const isBowser = session.sessionType === 'bowser_delivery' || !!session.bowserAudit || session.shift?.includes('Bowser');
+      
+      if (typeFilter === 'bowser_delivery' && !isBowser) return false;
+      if (typeFilter === 'daily_routine' && isBowser) return false;
+
       const matchesSearch = 
         session.date.includes(searchQuery) ||
         session.supervisor.toLowerCase().includes(searchQuery.toLowerCase()) ||
         (session.remarks || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
-        session.shift.toLowerCase().includes(searchQuery.toLowerCase());
+        session.shift.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        (session.bowserAudit?.bowserNo || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+        (session.bowserAudit?.invoiceNo || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+        (session.bowserAudit?.tankName || '').toLowerCase().includes(searchQuery.toLowerCase());
 
       const matchesShift = selectedShiftFilter === 'all' || session.shift === selectedShiftFilter;
 
       return matchesSearch && matchesShift;
     });
-  }, [sessions, searchQuery, selectedShiftFilter]);
+  }, [sessions, searchQuery, selectedShiftFilter, typeFilter]);
 
   // Master Export CSV Functionality
   const exportMasterCSV = () => {
@@ -376,23 +696,30 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
     }
 
     const headers = [
-      'Audit Date', 'Audit Time', 'Shift/Session', 'Supervisor', 
-      'Total Tanks', 'Total System Volume (L)', 'Total Physical Dip (L)', 
-      'Net Variance (L)', 'Net Variance (%)', 'Remarks'
+      'Audit Date', 'Audit Time', 'Audit Type', 'Shift/Session', 'Supervisor', 
+      'Tanks Involved', 'Invoiced Vol (L)', 'Actual Received (L)', 'Pre-Dip (L)', 'Post-Dip (L)',
+      'Net Variance (L)', 'Variance (%)', 'Status', 'Bowser No', 'Invoice No', 'Remarks'
     ];
 
     const rows = sessions.map(s => {
-      const varPct = s.totalSystemVolume > 0 ? (s.totalVarianceLiters / s.totalSystemVolume) * 100 : 0;
+      const isBowser = s.sessionType === 'bowser_delivery' || !!s.bowserAudit;
+      const b = s.bowserAudit;
       return [
         s.date,
         s.time,
+        isBowser ? 'Bowser Delivery Unload Audit' : 'Daily Routine Audit',
         `"${s.shift}"`,
         `"${s.supervisor}"`,
-        s.tanksCount,
-        s.totalSystemVolume.toFixed(2),
-        s.totalPhysicalDip.toFixed(2),
+        isBowser ? `"${b?.tankName || 'Tank'}"` : s.tanksCount,
+        isBowser ? (b?.invoicedVolume || 0) : '-',
+        isBowser ? (b?.actualReceivedVolume || 0) : '-',
+        isBowser ? (b?.preDipLiters || 0) : s.totalSystemVolume.toFixed(2),
+        isBowser ? (b?.postDipLiters || 0) : s.totalPhysicalDip.toFixed(2),
         s.totalVarianceLiters.toFixed(2),
-        `${varPct.toFixed(2)}%`,
+        isBowser ? `${(b?.variancePercentage || 0).toFixed(2)}%` : `${s.totalSystemVolume > 0 ? ((s.totalVarianceLiters / s.totalSystemVolume) * 100).toFixed(2) : 0}%`,
+        isBowser ? b?.status || 'Normal' : (s.totalVarianceLiters >= 0 ? 'Gain' : 'Loss'),
+        `"${b?.bowserNo || ''}"`,
+        `"${b?.invoiceNo || ''}"`,
         `"${(s.remarks || '').replace(/"/g, '""')}"`
       ];
     });
@@ -401,15 +728,56 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
     link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `Daily_Dip_Audit_Master_${new Date().toISOString().slice(0, 10)}.csv`);
+    link.setAttribute('download', `Dip_Audit_Master_${new Date().toISOString().slice(0, 10)}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    showToast("Master Dip Records exported to CSV successfully.");
+    showToast("Dip Audit Records exported to CSV successfully.");
   };
 
-  // Single Session Tank-by-Tank CSV Export
+  // Single Session CSV Export
   const exportSingleSessionCSV = (session: DailyDipSession) => {
+    const isBowser = session.sessionType === 'bowser_delivery' || !!session.bowserAudit;
+    const b = session.bowserAudit;
+
+    if (isBowser && b) {
+      const headers = ['Metric', 'Value'];
+      const rows = [
+        ['Audit Type', 'Bowser Delivery Unload Audit (Pre & Post Dip)'],
+        ['Date', session.date],
+        ['Time', session.time],
+        ['Supervisor', session.supervisor],
+        ['Tank', b.tankName],
+        ['Fuel Grade', b.fuelType],
+        ['Bowser Vehicle No', b.bowserNo || 'N/A'],
+        ['Invoice / Chitty No', b.invoiceNo || 'N/A'],
+        ['Invoiced Bowser Volume (L)', b.invoicedVolume.toFixed(2)],
+        ['Pre-Unload Dip (mm)', b.preDipMm.toString()],
+        ['Pre-Unload Volume (L)', b.preDipLiters.toFixed(2)],
+        ['Post-Unload Dip (mm)', b.postDipMm.toString()],
+        ['Post-Unload Volume (L)', b.postDipLiters.toFixed(2)],
+        ['Actual Received Volume (L)', b.actualReceivedVolume.toFixed(2)],
+        ['Decanting Variance (L)', b.varianceLiters.toFixed(2)],
+        ['Variance Percentage (%)', `${b.variancePercentage.toFixed(2)}%`],
+        ['Audit Status', b.status],
+        ['Free Water Test', b.waterTestNegative ? 'Negative (Passed)' : 'Failed'],
+        ['Chamber Seal', b.sealIntact ? 'Intact & Verified' : 'Compromised'],
+        ['Density (kg/L)', b.density ? b.density.toString() : 'N/A'],
+        ['Temperature (°C)', b.temperature ? `${b.temperature}°C` : 'N/A'],
+        ['Remarks', session.remarks || '']
+      ];
+
+      const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(r => `"${r[0]}","${(r[1] || '').toString().replace(/"/g, '""')}"`)].join('\n');
+      const encodedUri = encodeURI(csvContent);
+      const link = document.createElement('a');
+      link.setAttribute('href', encodedUri);
+      link.setAttribute('download', `Bowser_Unload_Audit_${b.tankName.replace(/\s+/g, '_')}_${session.date}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      return;
+    }
+
     const headers = [
       'Audit Date', 'Shift', 'Tank Name', 'Fuel Grade', 
       'System Volume (L)', 'Physical Dip (L)', 'Variance (L)', 'Variance (%)', 'Status', 'Supervisor'
@@ -458,11 +826,11 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
             <h1 className="text-lg font-bold text-slate-900 tracking-tight font-sans">Manual Dip Record &amp; Stock Audit</h1>
           </div>
           <p className="text-xs text-gray-500 font-medium pl-0.5">
-            Simultaneously record physical dip readings across all underground storage tanks, calculate live variances, and review audit history.
+            Record multi-tank daily routine physical dips or perform pre &amp; post bowser delivery unload tests to verify invoice quantities.
           </p>
         </div>
 
-        <div className="flex items-center gap-2.5 self-start sm:self-auto">
+        <div className="flex items-center gap-2.5 self-start sm:self-auto flex-wrap">
           <button
             onClick={fetchDipSessions}
             className="p-2 bg-white hover:bg-gray-50 text-gray-700 border border-gray-200 rounded-xl text-xs font-bold transition-all cursor-pointer shadow-2xs"
@@ -477,48 +845,84 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
             className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-white hover:bg-gray-50 disabled:opacity-50 text-gray-700 border border-gray-200 rounded-xl text-xs font-bold transition-all cursor-pointer shadow-2xs"
           >
             <Download className="w-3.5 h-3.5 text-gray-600" />
-            <span>Export</span>
+            <span>Export CSV</span>
           </button>
 
-          {/* Prominent Add New Dip Button */}
+          {/* Button 1: Record Daily Dip Audit */}
           <button
             id="btn-add-daily-dip"
-            onClick={handleOpenNewDipModal}
+            onClick={handleOpenDailyDipModal}
             className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-sm hover:shadow-md active:scale-95"
           >
             <Plus className="w-4 h-4" />
-            <span>Add New Dip</span>
+            <span>+ Record Daily Dip Audit</span>
+          </button>
+
+          {/* Button 2: Bowser Unload Dip Audit */}
+          <button
+            id="btn-add-bowser-dip"
+            onClick={handleOpenBowserDipModal}
+            className="inline-flex items-center gap-2 px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-sm hover:shadow-md active:scale-95"
+          >
+            <Truck className="w-4 h-4" />
+            <span>+ Bowser Unload Dip Audit</span>
           </button>
         </div>
       </div>
 
       {/* Master Daily Dip History List Table */}
       <div className="bg-white rounded-2xl border border-gray-200/80 p-5 shadow-2xs space-y-4">
-        {/* Controls Header */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-gray-100">
-          <div className="relative flex-1 max-w-sm">
-            <Search className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              placeholder="Search by date, supervisor, shift..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-9 pr-3 py-1.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
-            />
+        {/* Controls Header & Type Switcher */}
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 pb-3 border-b border-gray-100">
+          <div className="flex items-center gap-2 flex-wrap">
+            {/* Type Filter Tabs */}
+            <div className="inline-flex p-1 bg-gray-100 rounded-xl text-xs font-bold">
+              <button
+                onClick={() => setTypeFilter('all')}
+                className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer ${typeFilter === 'all' ? 'bg-white text-blue-600 shadow-2xs' : 'text-gray-600 hover:text-gray-900'}`}
+              >
+                All Audits ({sessions.length})
+              </button>
+              <button
+                onClick={() => setTypeFilter('daily_routine')}
+                className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${typeFilter === 'daily_routine' ? 'bg-white text-blue-600 shadow-2xs' : 'text-gray-600 hover:text-gray-900'}`}
+              >
+                <Layers className="w-3.5 h-3.5" />
+                <span>Routine Dips</span>
+              </button>
+              <button
+                onClick={() => setTypeFilter('bowser_delivery')}
+                className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${typeFilter === 'bowser_delivery' ? 'bg-white text-amber-700 shadow-2xs' : 'text-gray-600 hover:text-gray-900'}`}
+              >
+                <Truck className="w-3.5 h-3.5" />
+                <span>Bowser Unload Audits</span>
+              </button>
+            </div>
           </div>
 
-          <div className="flex items-center gap-2.5">
-            <span className="text-xs font-bold text-gray-500">Filter Shift:</span>
+          <div className="flex items-center gap-2.5 flex-1 max-w-lg justify-end">
+            <div className="relative flex-1">
+              <Search className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                placeholder="Search by date, tank, bowser no, invoice..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full pl-9 pr-3 py-1.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+              />
+            </div>
+
             <select
               value={selectedShiftFilter}
               onChange={(e) => setSelectedShiftFilter(e.target.value)}
-              className="px-3 py-1.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+              className="px-3 py-1.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 shrink-0"
             >
-              <option value="all">All Shifts &amp; Audits</option>
-              <option value="Morning (06:00 - 14:00)">Morning (06:00 - 14:00)</option>
-              <option value="Evening (14:00 - 22:00)">Evening (14:00 - 22:00)</option>
-              <option value="Night (22:00 - 06:00)">Night (22:00 - 06:00)</option>
-              <option value="Daily Audit / Dip Reconciliation">Daily Audit / Dip Reconciliation</option>
+              <option value="all">All Shifts</option>
+              <option value="Morning (06:00 - 14:00)">Morning</option>
+              <option value="Evening (14:00 - 22:00)">Evening</option>
+              <option value="Night (22:00 - 06:00)">Night</option>
+              <option value="Bowser Delivery Unload Audit">Bowser Delivery</option>
+              <option value="Daily Audit / Dip Reconciliation">Daily Reconciliation</option>
             </select>
           </div>
         </div>
@@ -534,7 +938,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
         {/* Master History Table */}
         {isLoading && sessions.length === 0 ? (
           <div className="py-12 text-center text-xs text-gray-400 font-semibold animate-pulse">
-            Loading daily dip audit sessions...
+            Loading dip audit history...
           </div>
         ) : filteredSessions.length > 0 ? (
           <div className="overflow-x-auto border border-gray-100 rounded-xl">
@@ -542,41 +946,63 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
               <thead className="bg-gray-50 font-bold text-gray-500 text-[10px] uppercase border-b border-gray-100">
                 <tr>
                   <th className="p-3.5">Audit Date &amp; Time</th>
-                  <th className="p-3.5">Shift / Session</th>
-                  <th className="p-3.5">Recorded By</th>
-                  <th className="p-3.5 text-center">Tanks</th>
-                  <th className="p-3.5 text-right">System Book Volume</th>
-                  <th className="p-3.5 text-right">Physical Measured Dip</th>
-                  <th className="p-3.5 text-right">Net Total Variance</th>
+                  <th className="p-3.5">Audit Type / Scope</th>
+                  <th className="p-3.5">Supervisor / Driver</th>
+                  <th className="p-3.5">Pre-Dip Level</th>
+                  <th className="p-3.5">Post-Dip / Book Level</th>
+                  <th className="p-3.5 text-right">Invoiced / Received</th>
+                  <th className="p-3.5 text-right">Decanting Variance</th>
                   <th className="p-3.5 text-center">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100 font-medium text-gray-800">
                 {filteredSessions.map((session) => {
-                  const isLoss = session.totalVarianceLiters < 0;
-                  const isGain = session.totalVarianceLiters > 0;
-                  const varPct = session.totalSystemVolume > 0 
-                    ? (session.totalVarianceLiters / session.totalSystemVolume) * 100 
-                    : 0;
+                  const isBowser = session.sessionType === 'bowser_delivery' || !!session.bowserAudit;
+                  const b = session.bowserAudit;
+                  const isLoss = session.totalVarianceLiters < -0.4;
+                  const isGain = session.totalVarianceLiters > 0.4;
+                  const varPct = isBowser && b?.invoicedVolume 
+                    ? b.variancePercentage 
+                    : (session.totalSystemVolume > 0 ? (session.totalVarianceLiters / session.totalSystemVolume) * 100 : 0);
 
                   return (
                     <tr 
                       key={session.id} 
-                      className="hover:bg-blue-50/30 transition-colors group cursor-pointer"
+                      className={`transition-colors group cursor-pointer ${isBowser ? 'hover:bg-amber-50/40 bg-amber-50/15' : 'hover:bg-blue-50/30'}`}
                       onClick={() => setSelectedDetailSession(session)}
                     >
                       <td className="p-3.5 whitespace-nowrap">
                         <div className="flex items-center gap-2">
-                          <Calendar className="w-3.5 h-3.5 text-blue-600" />
+                          <Calendar className={`w-3.5 h-3.5 ${isBowser ? 'text-amber-600' : 'text-blue-600'}`} />
                           <span className="font-bold text-slate-900">{session.date}</span>
                           <span className="text-[11px] text-gray-400 font-medium">{session.time}</span>
                         </div>
                       </td>
 
-                      <td className="p-3.5 font-semibold text-gray-700 whitespace-nowrap">
-                        <span className="px-2 py-0.5 rounded-lg bg-gray-100 text-gray-700 text-[11px] font-semibold">
-                          {session.shift}
-                        </span>
+                      <td className="p-3.5 whitespace-nowrap">
+                        {isBowser ? (
+                          <div className="flex items-center gap-1.5">
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-100/80 text-amber-900 text-[11px] font-bold border border-amber-200">
+                              <Truck className="w-3 h-3 text-amber-700" />
+                              <span>Bowser Unload</span>
+                            </span>
+                            {b && (
+                              <span className="text-[11px] font-semibold text-slate-700">
+                                {b.tankName} ({b.fuelType})
+                              </span>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-1.5">
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 text-[11px] font-semibold border border-blue-100">
+                              <Layers className="w-3 h-3" />
+                              <span>Routine Audit</span>
+                            </span>
+                            <span className="text-[11px] text-gray-500 font-medium">
+                              ({session.tanksCount || (session.entries?.length ?? 0)} Tanks)
+                            </span>
+                          </div>
+                        )}
                       </td>
 
                       <td className="p-3.5 text-gray-700 font-semibold whitespace-nowrap">
@@ -584,37 +1010,102 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                           <User className="w-3.5 h-3.5 text-gray-400" />
                           <span>{session.supervisor}</span>
                         </div>
+                        {isBowser && b?.bowserNo && (
+                          <div className="text-[10px] text-amber-800 font-medium pl-5">
+                            Bowser: {b.bowserNo} {b.driverName ? `• ${b.driverName}` : ''}
+                          </div>
+                        )}
                       </td>
 
-                      <td className="p-3.5 text-center whitespace-nowrap">
-                        <span className="px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 font-bold text-[11px]">
-                          {session.tanksCount || (session.entries?.length ?? 0)} Tanks
-                        </span>
-                      </td>
-
-                      <td className="p-3.5 text-right text-gray-600 font-semibold tabular-nums whitespace-nowrap">
-                        {session.totalSystemVolume.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
-                      </td>
-
-                      <td className="p-3.5 text-right font-bold text-slate-900 tabular-nums whitespace-nowrap">
-                        {session.totalPhysicalDip.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
-                      </td>
-
-                      <td className="p-3.5 text-right whitespace-nowrap">
-                        {isLoss ? (
-                          <span className="inline-flex items-center gap-1 font-bold text-rose-600 bg-rose-50 px-2.5 py-0.5 rounded-md border border-rose-200">
-                            <TrendingDown className="w-3 h-3 shrink-0" />
-                            <span>{session.totalVarianceLiters.toFixed(1)} L ({varPct.toFixed(2)}%)</span>
-                          </span>
-                        ) : isGain ? (
-                          <span className="inline-flex items-center gap-1 font-bold text-emerald-700 bg-emerald-50 px-2.5 py-0.5 rounded-md border border-emerald-200">
-                            <TrendingUp className="w-3 h-3 shrink-0" />
-                            <span>+{session.totalVarianceLiters.toFixed(1)} L (+{varPct.toFixed(2)}%)</span>
-                          </span>
+                      {/* Pre-Dip */}
+                      <td className="p-3.5 whitespace-nowrap">
+                        {isBowser && b ? (
+                          <div>
+                            <span className="font-bold text-slate-900 tabular-nums">
+                              {b.preDipLiters.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
+                            </span>
+                            <span className="text-[10px] text-gray-400 font-medium ml-1">
+                              ({b.preDipMm} mm)
+                            </span>
+                          </div>
                         ) : (
-                          <span className="inline-flex items-center gap-1 font-semibold text-gray-600 bg-gray-50 px-2 py-0.5 rounded-md border border-gray-200">
-                            <span>0.0 L (0.00%)</span>
+                          <span className="text-gray-500 font-medium text-[11px]">
+                            Opening Book: {session.totalSystemVolume.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
                           </span>
+                        )}
+                      </td>
+
+                      {/* Post-Dip */}
+                      <td className="p-3.5 whitespace-nowrap">
+                        {isBowser && b ? (
+                          <div>
+                            <span className="font-bold text-slate-900 tabular-nums">
+                              {b.postDipLiters.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
+                            </span>
+                            <span className="text-[10px] text-gray-400 font-medium ml-1">
+                              ({b.postDipMm} mm)
+                            </span>
+                          </div>
+                        ) : (
+                          <span className="font-bold text-slate-900 tabular-nums">
+                            {session.totalPhysicalDip.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
+                          </span>
+                        )}
+                      </td>
+
+                      {/* Invoiced vs Received */}
+                      <td className="p-3.5 text-right whitespace-nowrap">
+                        {isBowser && b ? (
+                          <div className="text-right">
+                            <div className="font-bold text-slate-900 tabular-nums">
+                              {b.actualReceivedVolume.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
+                            </div>
+                            <div className="text-[10px] text-gray-400 font-medium">
+                              Inv: {b.invoicedVolume.toLocaleString()} L
+                            </div>
+                          </div>
+                        ) : (
+                          <span className="text-gray-600 font-semibold tabular-nums">
+                            {session.totalPhysicalDip.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
+                          </span>
+                        )}
+                      </td>
+
+                      {/* Decanting Variance Badge */}
+                      <td className="p-3.5 text-right whitespace-nowrap">
+                        {isBowser && b ? (
+                          b.status === 'Exact Match' || Math.abs(b.varianceLiters) < 0.5 ? (
+                            <span className="inline-flex items-center gap-1 font-bold text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200 text-[11px]">
+                              <CheckCircle className="w-3 h-3 text-emerald-600" />
+                              <span>Exact Match (0L)</span>
+                            </span>
+                          ) : b.status === 'Excess' || b.varianceLiters > 0 ? (
+                            <span className="inline-flex items-center gap-1 font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200 text-[11px]">
+                              <TrendingUp className="w-3 h-3 shrink-0" />
+                              <span>Excess (+{b.varianceLiters.toFixed(1)}L)</span>
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 font-bold text-rose-700 bg-rose-50 px-2 py-0.5 rounded-md border border-rose-200 text-[11px]">
+                              <TrendingDown className="w-3 h-3 shrink-0" />
+                              <span>Shortage ({b.varianceLiters.toFixed(1)}L)</span>
+                            </span>
+                          )
+                        ) : (
+                          isLoss ? (
+                            <span className="inline-flex items-center gap-1 font-bold text-rose-600 bg-rose-50 px-2 py-0.5 rounded-md border border-rose-200 text-[11px]">
+                              <TrendingDown className="w-3 h-3 shrink-0" />
+                              <span>{session.totalVarianceLiters.toFixed(1)} L ({varPct.toFixed(2)}%)</span>
+                            </span>
+                          ) : isGain ? (
+                            <span className="inline-flex items-center gap-1 font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200 text-[11px]">
+                              <TrendingUp className="w-3 h-3 shrink-0" />
+                              <span>+{session.totalVarianceLiters.toFixed(1)} L (+{varPct.toFixed(2)}%)</span>
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 font-semibold text-gray-600 bg-gray-50 px-2 py-0.5 rounded-md border border-gray-200 text-[11px]">
+                              <span>0.0 L (0.00%)</span>
+                            </span>
+                          )
                         )}
                       </td>
 
@@ -623,16 +1114,16 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                           <button
                             onClick={() => setSelectedDetailSession(session)}
                             className="inline-flex items-center gap-1 px-2.5 py-1 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-lg text-[11px] font-bold transition-all cursor-pointer"
-                            title="View Tank Breakdown"
+                            title="View Full Breakdown & Audit Details"
                           >
                             <Eye className="w-3 h-3" />
-                            <span>View Breakdown</span>
+                            <span>Audit Details</span>
                           </button>
 
                           <button
                             onClick={() => exportSingleSessionCSV(session)}
                             className="p-1 text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors cursor-pointer"
-                            title="Export Session CSV"
+                            title="Export CSV"
                           >
                             <Download className="w-3.5 h-3.5" />
                           </button>
@@ -651,15 +1142,22 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
             </div>
             <h4 className="text-sm font-bold text-gray-900 font-sans">No Dip Records Found</h4>
             <p className="text-xs text-gray-500 max-w-md mx-auto font-medium leading-relaxed font-sans">
-              No dip records found. Click &apos;+ Add New Dip&apos; to record your first physical tank measurement.
+              No dip records found. Choose an action below to record routine tank dips or perform a bowser unloading audit.
             </p>
-            <div className="pt-2">
+            <div className="pt-2 flex items-center justify-center gap-2 flex-wrap">
               <button
-                onClick={handleOpenNewDipModal}
-                className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-sm active:scale-95"
+                onClick={handleOpenDailyDipModal}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-sm active:scale-95"
               >
                 <Plus className="w-4 h-4" />
-                <span>+ Add New Dip</span>
+                <span>+ Record Daily Dip Audit</span>
+              </button>
+              <button
+                onClick={handleOpenBowserDipModal}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-sm active:scale-95"
+              >
+                <Truck className="w-4 h-4" />
+                <span>+ Bowser Unload Dip Audit</span>
               </button>
             </div>
           </div>
@@ -670,13 +1168,14 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
             </div>
             <h4 className="text-sm font-bold text-gray-900 font-sans">No Matching Dip Records</h4>
             <p className="text-xs text-gray-500 max-w-md mx-auto font-medium font-sans">
-              No daily dip records match your current search or shift filter.
+              No daily dip records match your current search, mode, or shift filter.
             </p>
             <div className="pt-2">
               <button
                 onClick={() => {
                   setSearchQuery('');
                   setSelectedShiftFilter('all');
+                  setTypeFilter('all');
                 }}
                 className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-gray-200 hover:bg-gray-300 text-gray-800 rounded-xl text-xs font-semibold transition-all cursor-pointer"
               >
@@ -689,13 +1188,13 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
       </div>
 
       {/* ========================================================================= */}
-      {/* ALL-TANKS DAILY DIP ENTRY MODAL (SCREEN)                                   */}
+      {/* 1. DEDICATED DAILY ROUTINE DIP AUDIT MODAL (ALL TANKS)                    */}
       {/* ========================================================================= */}
-      {isEntryModalOpen && (
+      {isDailyDipModalOpen && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-xs z-50 flex items-center justify-center p-3 sm:p-4 overflow-y-auto animate-in fade-in duration-150">
           <div className="bg-white rounded-2xl max-w-4xl w-full p-5 sm:p-7 shadow-2xl border border-gray-200 my-auto max-h-[92vh] flex flex-col">
             {/* Modal Header */}
-            <div className="flex items-center justify-between pb-4 border-b border-gray-100 shrink-0">
+            <div className="pb-4 border-b border-gray-100 shrink-0 flex items-center justify-between">
               <div className="flex items-center gap-2.5">
                 <div className="p-2 bg-blue-50 text-blue-600 rounded-xl border border-blue-100">
                   <Droplet className="w-5 h-5" />
@@ -705,33 +1204,31 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                     Record All-Tanks Daily Dip Audit
                   </h3>
                   <p className="text-xs text-gray-500 font-medium">
-                    Enter physical measured dip volumes for all registered storage tanks simultaneously.
+                    Simultaneously enter physical measured dip volumes across all registered underground tanks.
                   </p>
                 </div>
               </div>
               <button
-                onClick={() => setIsEntryModalOpen(false)}
+                onClick={() => setIsDailyDipModalOpen(false)}
                 className="p-1.5 hover:bg-gray-100 text-gray-400 hover:text-gray-600 rounded-xl transition-colors cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            {/* Modal Form Scrollable Body */}
+            {/* Daily Routine Form */}
             <form onSubmit={handleSaveDailyDip} className="space-y-5 overflow-y-auto pt-4 flex-1 pr-1">
               {/* Global Metadata Inputs */}
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 bg-slate-50/80 p-3.5 rounded-2xl border border-slate-200/80 text-xs">
                 <div>
                   <label className="block font-semibold text-gray-700 mb-1">Audit Date</label>
-                  <div className="relative">
-                    <input
-                      type="date"
-                      required
-                      value={formData.date}
-                      onChange={(e) => setFormData(p => ({ ...p, date: e.target.value }))}
-                      className="w-full px-3 py-2 bg-white border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 font-semibold"
-                    />
-                  </div>
+                  <input
+                    type="date"
+                    required
+                    value={formData.date}
+                    onChange={(e) => setFormData(p => ({ ...p, date: e.target.value }))}
+                    className="w-full px-3 py-2 bg-white border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 font-semibold"
+                  />
                 </div>
 
                 <div>
@@ -912,7 +1409,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
               <div className="flex items-center justify-end gap-3 pt-3 border-t border-gray-100 shrink-0">
                 <button
                   type="button"
-                  onClick={() => setIsEntryModalOpen(false)}
+                  onClick={() => setIsDailyDipModalOpen(false)}
                   className="px-4 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-800 rounded-xl text-xs font-bold transition-all cursor-pointer"
                 >
                   Cancel
@@ -931,6 +1428,311 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
       )}
 
       {/* ========================================================================= */}
+      {/* 2. DEDICATED BOWSER UNLOADING DIP AUDIT MODAL (MINIMAL & ULTRA FAST)      */}
+      {/* ========================================================================= */}
+      {isBowserDipModalOpen && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-xs z-50 flex items-center justify-center p-3 sm:p-4 overflow-y-auto animate-in fade-in duration-150">
+          <div className="bg-white rounded-2xl max-w-xl w-full p-5 sm:p-6 shadow-2xl border border-gray-200 my-auto flex flex-col space-y-4">
+            {/* Modal Header */}
+            <div className="flex items-center justify-between pb-3 border-b border-gray-100 shrink-0">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 bg-amber-50 text-amber-700 rounded-xl border border-amber-200">
+                  <Truck className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900 tracking-tight font-sans">
+                    Bowser Unload Dip Audit
+                  </h3>
+                  <p className="text-xs text-gray-500 font-medium">
+                    Verify bowser delivery invoice vs. physical dip changes.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsBowserDipModalOpen(false)}
+                className="p-1.5 hover:bg-gray-100 text-gray-400 hover:text-gray-600 rounded-xl transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Bowser Form Content */}
+            <form onSubmit={handleSaveBowserDeliveryAudit} className="space-y-4">
+              {/* 1. Tank Selection & Invoiced Quantity */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200/80">
+                {/* Tank Select */}
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1 flex items-center gap-1">
+                    <Fuel className="w-3.5 h-3.5 text-amber-600" />
+                    <span>Select Tank</span>
+                  </label>
+                  <select
+                    value={bowserForm.tankId}
+                    onChange={(e) => handleBowserTankChange(e.target.value)}
+                    className="w-full px-3 py-2 bg-white border border-gray-300 rounded-xl text-xs font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-amber-500/20 focus:border-amber-500"
+                  >
+                    {availableTanks.map(tank => (
+                      <option key={tank.id} value={tank.id}>
+                        {tank.name} ({tank.fuelType}) — Cap: {tank.capacity.toLocaleString()} L
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Invoiced Bowser Volume */}
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">
+                    Invoiced Volume (Liters) *
+                  </label>
+                  <div className="relative">
+                    <input
+                      type="number"
+                      step="any"
+                      required
+                      min="1"
+                      placeholder="e.g. 6600"
+                      value={bowserForm.invoicedVolume}
+                      onChange={(e) => setBowserForm(p => ({ ...p, invoicedVolume: e.target.value }))}
+                      className="w-full px-3 py-2 bg-white border border-amber-300 rounded-xl text-xs font-extrabold text-slate-900 focus:outline-none focus:ring-2 focus:ring-amber-500/30 focus:border-amber-500 tabular-nums"
+                    />
+                    <span className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 font-semibold text-[11px]">
+                      L
+                    </span>
+                  </div>
+                  {/* Quick CPC standard preset buttons */}
+                  <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+                    {['6600', '13200', '19800', '33000'].map(vol => (
+                      <button
+                        key={vol}
+                        type="button"
+                        onClick={() => setBowserForm(p => ({ ...p, invoicedVolume: vol }))}
+                        className={`px-2 py-0.5 text-[10px] font-bold rounded-md transition-colors cursor-pointer ${
+                          bowserForm.invoicedVolume === vol
+                            ? 'bg-amber-600 text-white'
+                            : 'bg-white border border-gray-200 text-slate-700 hover:bg-gray-100'
+                        }`}
+                      >
+                        {vol === '6600' ? '6.6k L' : vol === '13200' ? '13.2k L' : vol === '19800' ? '19.8k L' : '33k L'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* Optional Ref (Bowser / Invoice No) */}
+              <div className="grid grid-cols-2 gap-3 text-xs">
+                <div>
+                  <label className="block text-[11px] font-medium text-gray-500 mb-1">Bowser No (Optional)</label>
+                  <input
+                    type="text"
+                    placeholder="e.g. WP-LI-4589"
+                    value={bowserForm.bowserNo}
+                    onChange={(e) => setBowserForm(p => ({ ...p, bowserNo: e.target.value }))}
+                    className="w-full px-3 py-1.5 bg-white border border-gray-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-amber-500/20"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-gray-500 mb-1">Invoice / Chitty No (Optional)</label>
+                  <input
+                    type="text"
+                    placeholder="e.g. INV-88219"
+                    value={bowserForm.invoiceNo}
+                    onChange={(e) => setBowserForm(p => ({ ...p, invoiceNo: e.target.value }))}
+                    className="w-full px-3 py-1.5 bg-white border border-gray-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-amber-500/20"
+                  />
+                </div>
+              </div>
+
+              {/* 2. Before & After Dip Reading Inputs (Side-by-Side) */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {/* BEFORE UNLOAD */}
+                <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
+                      <span className="w-5 h-5 rounded-full bg-blue-100 text-blue-700 text-[10px] font-extrabold flex items-center justify-center">1</span>
+                      BEFORE UNLOAD
+                    </span>
+                    <span className="text-[10px] font-semibold text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded border border-blue-100">
+                      Pre-Dip
+                    </span>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-semibold text-gray-600 mb-1">
+                      Dip Reading (mm) *
+                    </label>
+                    <div className="relative">
+                      <input
+                        type="number"
+                        step="any"
+                        min="0"
+                        placeholder="e.g. 850"
+                        value={bowserForm.preDipMm}
+                        onChange={(e) => {
+                          const mmVal = e.target.value;
+                          const numMm = parseFloat(mmVal) || 0;
+                          const calcLiters = selectedBowserTank ? calculateDipVolume(numMm, selectedBowserTank.capacity) : 0;
+                          setBowserForm(p => ({
+                            ...p,
+                            preDipMm: mmVal,
+                            preDipLiters: mmVal !== '' ? calcLiters.toString() : ''
+                          }));
+                        }}
+                        className="w-full px-3 py-2 bg-white border border-gray-300 rounded-xl text-sm font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500 tabular-nums"
+                      />
+                      <span className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 font-semibold text-xs">
+                        mm
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="bg-white p-2 rounded-lg border border-slate-200/80 flex items-center justify-between text-xs">
+                    <span className="text-gray-500 font-medium text-[11px]">Calculated Volume:</span>
+                    <span className="font-bold text-blue-700 tabular-nums">
+                      {bowserAuditCalculations.preLiters.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
+                    </span>
+                  </div>
+                </div>
+
+                {/* AFTER UNLOAD */}
+                <div className="bg-amber-50/50 p-3.5 rounded-xl border border-amber-200/80 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
+                      <span className="w-5 h-5 rounded-full bg-amber-500 text-white text-[10px] font-extrabold flex items-center justify-center">2</span>
+                      AFTER UNLOAD
+                    </span>
+                    <span className="text-[10px] font-semibold text-amber-800 bg-amber-100/70 px-1.5 py-0.5 rounded border border-amber-200">
+                      Post-Dip
+                    </span>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-semibold text-gray-600 mb-1">
+                      Dip Reading (mm) *
+                    </label>
+                    <div className="relative">
+                      <input
+                        type="number"
+                        step="any"
+                        min="0"
+                        placeholder="e.g. 1650"
+                        value={bowserForm.postDipMm}
+                        onChange={(e) => {
+                          const mmVal = e.target.value;
+                          const numMm = parseFloat(mmVal) || 0;
+                          const calcLiters = selectedBowserTank ? calculateDipVolume(numMm, selectedBowserTank.capacity) : 0;
+                          setBowserForm(p => ({
+                            ...p,
+                            postDipMm: mmVal,
+                            postDipLiters: mmVal !== '' ? calcLiters.toString() : ''
+                          }));
+                        }}
+                        className="w-full px-3 py-2 bg-white border border-amber-300 rounded-xl text-sm font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-amber-500 tabular-nums"
+                      />
+                      <span className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 font-semibold text-xs">
+                        mm
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="bg-white p-2 rounded-lg border border-amber-200/80 flex items-center justify-between text-xs">
+                    <span className="text-gray-500 font-medium text-[11px]">Calculated Volume:</span>
+                    <span className="font-bold text-amber-900 tabular-nums">
+                      {bowserAuditCalculations.postLiters.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* 3. Instant Result Summary Box */}
+              <div className="bg-slate-900 text-white p-3.5 sm:p-4 rounded-xl shadow-xs space-y-3">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                  <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                    Live Audit Result
+                  </span>
+                  {bowserAuditCalculations.invoicedVol > 0 && (
+                    <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg text-xs font-bold ${
+                      bowserAuditCalculations.status === 'Shortage'
+                        ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                        : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                    }`}>
+                      {bowserAuditCalculations.status === 'Shortage' ? (
+                        <>
+                          <AlertTriangle className="w-3.5 h-3.5" />
+                          <span>Shortage</span>
+                        </>
+                      ) : bowserAuditCalculations.status === 'Excess' ? (
+                        <>
+                          <TrendingUp className="w-3.5 h-3.5" />
+                          <span>Gain (Excess)</span>
+                        </>
+                      ) : (
+                        <>
+                          <CheckCircle className="w-3.5 h-3.5" />
+                          <span>Balanced</span>
+                        </>
+                      )}
+                    </span>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-2 gap-3 text-xs">
+                  <div className="bg-slate-800/80 p-2.5 rounded-lg border border-slate-700/60">
+                    <span className="text-[10px] text-slate-400 uppercase font-semibold block mb-0.5">
+                      Net Received (After - Before)
+                    </span>
+                    <span className="text-base font-extrabold text-amber-400 tabular-nums">
+                      {bowserAuditCalculations.actualReceived.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
+                    </span>
+                  </div>
+
+                  <div className={`p-2.5 rounded-lg border ${
+                    bowserAuditCalculations.varianceLiters < 0
+                      ? 'bg-rose-950/40 border-rose-800/60'
+                      : 'bg-emerald-950/40 border-emerald-800/60'
+                  }`}>
+                    <span className="text-[10px] text-slate-300 uppercase font-semibold block mb-0.5">
+                      Variance (Received - Invoiced)
+                    </span>
+                    <span className={`text-base font-extrabold tabular-nums ${
+                      bowserAuditCalculations.varianceLiters < 0 ? 'text-rose-400' : 'text-emerald-400'
+                    }`}>
+                      {bowserAuditCalculations.varianceLiters >= 0 
+                        ? `+${bowserAuditCalculations.varianceLiters.toFixed(1)} L` 
+                        : `${bowserAuditCalculations.varianceLiters.toFixed(1)} L`}
+                    </span>
+                    <span className="text-[10px] text-slate-300 block mt-0.5">
+                      {bowserAuditCalculations.variancePercentage >= 0 ? '+' : ''}
+                      {bowserAuditCalculations.variancePercentage.toFixed(2)}%
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Action Buttons */}
+              <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-gray-100 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setIsBowserDipModalOpen(false)}
+                  className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl text-xs font-bold transition-all cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="inline-flex items-center gap-1.5 px-5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-xs active:scale-95"
+                >
+                  <Check className="w-4 h-4" />
+                  <span>Save Bowser Audit</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
       {/* DETAILED SINGLE RECORD BREAKDOWN VIEW MODAL                                */}
       {/* ========================================================================= */}
       {selectedDetailSession && (
@@ -939,19 +1741,27 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
             {/* Breakdown Header */}
             <div className="flex items-center justify-between pb-3 border-b border-gray-100 shrink-0">
               <div className="flex items-center gap-2.5">
-                <div className="p-2 bg-blue-50 text-blue-600 rounded-xl border border-blue-100">
-                  <FileText className="w-5 h-5" />
+                <div className={`p-2 rounded-xl border ${selectedDetailSession.sessionType === 'bowser_delivery' || !!selectedDetailSession.bowserAudit ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-blue-50 text-blue-600 border-blue-100'}`}>
+                  {selectedDetailSession.sessionType === 'bowser_delivery' || !!selectedDetailSession.bowserAudit ? (
+                    <Truck className="w-5 h-5" />
+                  ) : (
+                    <FileText className="w-5 h-5" />
+                  )}
                 </div>
                 <div>
                   <h3 className="text-base font-bold text-slate-900 tracking-tight font-sans">
-                    Daily Dip Audit Breakdown
+                    {selectedDetailSession.sessionType === 'bowser_delivery' || !!selectedDetailSession.bowserAudit 
+                      ? 'Bowser Unloading Dip Audit Report' 
+                      : 'Daily Dip Audit Breakdown'}
                   </h3>
                   <div className="flex items-center gap-2 text-xs text-gray-500 font-medium">
                     <span>{selectedDetailSession.date}</span>
                     <span>•</span>
                     <span>{selectedDetailSession.time}</span>
                     <span>•</span>
-                    <span className="font-semibold text-blue-700">{selectedDetailSession.shift}</span>
+                    <span className={`font-semibold ${selectedDetailSession.sessionType === 'bowser_delivery' || !!selectedDetailSession.bowserAudit ? 'text-amber-800' : 'text-blue-700'}`}>
+                      {selectedDetailSession.shift}
+                    </span>
                   </div>
                 </div>
               </div>
@@ -962,7 +1772,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                   className="inline-flex items-center gap-1 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs font-bold transition-all cursor-pointer"
                 >
                   <Download className="w-3.5 h-3.5" />
-                  <span>Export</span>
+                  <span>Export CSV</span>
                 </button>
                 <button
                   onClick={() => setSelectedDetailSession(null)}
@@ -973,104 +1783,224 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
               </div>
             </div>
 
-            {/* Summary Strip */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200/80 text-xs">
-              <div>
-                <span className="text-[10px] text-gray-400 uppercase font-bold block">Supervisor</span>
-                <span className="font-bold text-slate-800">{selectedDetailSession.supervisor}</span>
-              </div>
-              <div>
-                <span className="text-[10px] text-gray-400 uppercase font-bold block">Total System (L)</span>
-                <span className="font-bold text-slate-800 tabular-nums">
-                  {selectedDetailSession.totalSystemVolume.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
-                </span>
-              </div>
-              <div>
-                <span className="text-[10px] text-gray-400 uppercase font-bold block">Total Physical Dip (L)</span>
-                <span className="font-bold text-slate-900 tabular-nums">
-                  {selectedDetailSession.totalPhysicalDip.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
-                </span>
-              </div>
-              <div>
-                <span className="text-[10px] text-gray-400 uppercase font-bold block">Net Variance</span>
-                <span className={`font-extrabold tabular-nums ${selectedDetailSession.totalVarianceLiters >= 0 ? 'text-emerald-700' : 'text-rose-600'}`}>
-                  {selectedDetailSession.totalVarianceLiters >= 0 ? `+${selectedDetailSession.totalVarianceLiters.toFixed(1)} L` : `${selectedDetailSession.totalVarianceLiters.toFixed(1)} L`}
-                </span>
-              </div>
-            </div>
+            {/* BOWSER DELIVERY DETAILED REPORT */}
+            {selectedDetailSession.sessionType === 'bowser_delivery' || !!selectedDetailSession.bowserAudit ? (
+              <div className="space-y-4 overflow-y-auto flex-1 pr-1">
+                {/* Bowser Audit KPI Card */}
+                {(() => {
+                  const b = selectedDetailSession.bowserAudit || {
+                    tankId: '',
+                    tankName: selectedDetailSession.entries[0]?.tankName || 'Tank 01',
+                    fuelType: selectedDetailSession.entries[0]?.fuelType || 'Fuel',
+                    invoicedVolume: selectedDetailSession.totalSystemVolume || 6600,
+                    preDipMm: 0,
+                    preDipLiters: selectedDetailSession.totalSystemVolume,
+                    postDipMm: selectedDetailSession.entries[0]?.dipMm || 0,
+                    postDipLiters: selectedDetailSession.totalPhysicalDip,
+                    actualReceivedVolume: selectedDetailSession.totalPhysicalDip,
+                    varianceLiters: selectedDetailSession.totalVarianceLiters,
+                    variancePercentage: (selectedDetailSession.totalVarianceLiters / 6600) * 100,
+                    status: selectedDetailSession.totalVarianceLiters >= 0 ? 'Excess' : 'Shortage',
+                  };
 
-            {/* Tank-by-Tank Detailed Breakdown Table */}
-            <div className="overflow-y-auto flex-1 border border-gray-200 rounded-xl">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-gray-100 font-bold uppercase text-[10px] text-slate-600 border-b border-gray-200 sticky top-0">
-                  <tr>
-                    <th className="p-3">#</th>
-                    <th className="p-3">Tank &amp; Fuel Grade</th>
-                    <th className="p-3 text-right">System Book (L)</th>
-                    <th className="p-3 text-right">Physical Dip (L)</th>
-                    <th className="p-3 text-right">Variance (L)</th>
-                    <th className="p-3 text-right">Variance (%)</th>
-                    <th className="p-3 text-center">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-100 font-medium text-slate-800">
-                  {selectedDetailSession.entries.map((entry, idx) => {
-                    const isLoss = entry.varianceLiters < 0;
-                    const isGain = entry.varianceLiters > 0;
-                    return (
-                      <tr key={entry.tankId || idx} className="hover:bg-slate-50/50">
-                        <td className="p-3 text-center text-gray-400 font-bold">{idx + 1}</td>
-                        <td className="p-3 font-bold text-slate-900">
-                          <div>{entry.tankName}</div>
-                          <div className="text-[10px] text-gray-500 font-normal">{entry.fuelType}</div>
-                        </td>
-                        <td className="p-3 text-right text-gray-600 tabular-nums">
-                          {entry.systemVolume.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
-                        </td>
-                        <td className="p-3 text-right font-bold text-slate-900 tabular-nums">
-                          {entry.physicalDip.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
-                        </td>
-                        <td className="p-3 text-right font-bold tabular-nums whitespace-nowrap">
-                          <span className={isLoss ? 'text-rose-600' : isGain ? 'text-emerald-700' : 'text-gray-500'}>
-                            {isGain ? '+' : ''}{entry.varianceLiters.toFixed(1)} L
+                  return (
+                    <div className="space-y-4 text-xs">
+                      {/* Top Metric Cards */}
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-slate-900 text-white p-4 rounded-2xl shadow-xs">
+                        <div>
+                          <span className="text-[10px] text-slate-400 uppercase font-bold block">Target Tank</span>
+                          <span className="font-extrabold text-amber-400 text-sm block mt-0.5">{b.tankName}</span>
+                          <span className="text-[11px] text-slate-300 font-medium">{b.fuelType}</span>
+                        </div>
+
+                        <div>
+                          <span className="text-[10px] text-slate-400 uppercase font-bold block">Invoiced Bowser Vol</span>
+                          <span className="font-extrabold text-white text-sm tabular-nums block mt-0.5">{b.invoicedVolume.toLocaleString()} L</span>
+                          <span className="text-[10px] text-slate-400">Supplier Chitty</span>
+                        </div>
+
+                        <div>
+                          <span className="text-[10px] text-slate-400 uppercase font-bold block">Actual Decanted Vol</span>
+                          <span className="font-extrabold text-amber-400 text-sm tabular-nums block mt-0.5">{b.actualReceivedVolume.toLocaleString()} L</span>
+                          <span className="text-[10px] text-slate-400">Post - Pre Dip</span>
+                        </div>
+
+                        <div>
+                          <span className="text-[10px] text-slate-400 uppercase font-bold block">Variance &amp; Status</span>
+                          <span className={`font-extrabold text-sm tabular-nums block mt-0.5 ${b.varianceLiters >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                            {b.varianceLiters >= 0 ? `+${b.varianceLiters.toFixed(1)} L` : `${b.varianceLiters.toFixed(1)} L`}
                           </span>
-                        </td>
-                        <td className="p-3 text-right font-semibold tabular-nums whitespace-nowrap">
-                          <span className={isLoss ? 'text-rose-600' : isGain ? 'text-emerald-700' : 'text-gray-500'}>
-                            {entry.variancePercentage >= 0 ? '+' : ''}{entry.variancePercentage.toFixed(2)}%
+                          <span className={`text-[10px] font-bold ${b.varianceLiters >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                            {b.status} ({b.variancePercentage >= 0 ? '+' : ''}{b.variancePercentage.toFixed(2)}%)
                           </span>
-                        </td>
-                        <td className="p-3 text-center whitespace-nowrap">
-                          {entry.status === 'Warning' ? (
-                            <span className="px-2 py-0.5 bg-amber-50 text-amber-700 border border-amber-200 rounded-md font-bold text-[10px]">
-                              High Deviation
-                            </span>
-                          ) : isLoss ? (
-                            <span className="px-2 py-0.5 bg-rose-50 text-rose-700 border border-rose-200 rounded-md font-bold text-[10px]">
-                              Loss
-                            </span>
-                          ) : isGain ? (
-                            <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-md font-bold text-[10px]">
-                              Gain
-                            </span>
-                          ) : (
-                            <span className="px-2 py-0.5 bg-gray-50 text-gray-600 border border-gray-200 rounded-md font-semibold text-[10px]">
-                              Balanced
-                            </span>
-                          )}
-                        </td>
+                        </div>
+                      </div>
+
+                      {/* Decanting Pre vs Post Dip Details */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 space-y-2">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-100 inline-block">
+                            Pre-Unload Dip (Before Decanting)
+                          </span>
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="text-gray-500 font-medium">Dip Rod Reading:</span>
+                            <span className="font-bold text-slate-900">{b.preDipMm} mm</span>
+                          </div>
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="text-gray-500 font-medium">Underground Volume:</span>
+                            <span className="font-extrabold text-blue-700 tabular-nums">{b.preDipLiters.toLocaleString()} Liters</span>
+                          </div>
+                        </div>
+
+                        <div className="bg-amber-50/50 p-3.5 rounded-xl border border-amber-200/80 space-y-2">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-amber-800 bg-amber-100/70 px-2 py-0.5 rounded border border-amber-200 inline-block">
+                            Post-Unload Dip (After Decanting)
+                          </span>
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="text-gray-500 font-medium">Dip Rod Reading:</span>
+                            <span className="font-bold text-slate-900">{b.postDipMm} mm</span>
+                          </div>
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="text-gray-500 font-medium">Underground Volume:</span>
+                            <span className="font-extrabold text-amber-900 tabular-nums">{b.postDipLiters.toLocaleString()} Liters</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Delivery Verification Credentials */}
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 bg-gray-50 p-3 rounded-xl border border-gray-200 text-xs">
+                        <div>
+                          <span className="text-[10px] text-gray-400 font-bold block uppercase">Bowser Vehicle</span>
+                          <span className="font-bold text-slate-800">{b.bowserNo || 'Not Logged'}</span>
+                        </div>
+                        <div>
+                          <span className="text-[10px] text-gray-400 font-bold block uppercase">Invoice / Chitty</span>
+                          <span className="font-bold text-slate-800">{b.invoiceNo || 'Not Logged'}</span>
+                        </div>
+                        <div>
+                          <span className="text-[10px] text-gray-400 font-bold block uppercase">Driver Name</span>
+                          <span className="font-bold text-slate-800">{b.driverName || 'N/A'}</span>
+                        </div>
+                        <div>
+                          <span className="text-[10px] text-gray-400 font-bold block uppercase">Supervisor</span>
+                          <span className="font-bold text-slate-800">{selectedDetailSession.supervisor}</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Remarks */}
+                {selectedDetailSession.remarks && (
+                  <div className="bg-amber-50/70 p-3 rounded-xl border border-amber-200 text-xs">
+                    <span className="font-bold text-amber-950 block mb-0.5">Decanting &amp; Audit Notes:</span>
+                    <p className="text-slate-700 leading-relaxed font-medium">{selectedDetailSession.remarks}</p>
+                  </div>
+                )}
+              </div>
+            ) : (
+              /* ROUTINE AUDIT MULTI-TANK BREAKDOWN */
+              <div className="space-y-4 overflow-y-auto flex-1 pr-1">
+                {/* Summary Strip */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200/80 text-xs">
+                  <div>
+                    <span className="text-[10px] text-gray-400 uppercase font-bold block">Supervisor</span>
+                    <span className="font-bold text-slate-800">{selectedDetailSession.supervisor}</span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-gray-400 uppercase font-bold block">Total System (L)</span>
+                    <span className="font-bold text-slate-800 tabular-nums">
+                      {selectedDetailSession.totalSystemVolume.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-gray-400 uppercase font-bold block">Total Physical Dip (L)</span>
+                    <span className="font-bold text-slate-900 tabular-nums">
+                      {selectedDetailSession.totalPhysicalDip.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-gray-400 uppercase font-bold block">Net Variance</span>
+                    <span className={`font-extrabold tabular-nums ${selectedDetailSession.totalVarianceLiters >= 0 ? 'text-emerald-700' : 'text-rose-600'}`}>
+                      {selectedDetailSession.totalVarianceLiters >= 0 ? `+${selectedDetailSession.totalVarianceLiters.toFixed(1)} L` : `${selectedDetailSession.totalVarianceLiters.toFixed(1)} L`}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Tank-by-Tank Detailed Breakdown Table */}
+                <div className="border border-gray-200 rounded-xl overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-gray-100 font-bold uppercase text-[10px] text-slate-600 border-b border-gray-200 sticky top-0">
+                      <tr>
+                        <th className="p-3">#</th>
+                        <th className="p-3">Tank &amp; Fuel Grade</th>
+                        <th className="p-3 text-right">System Book (L)</th>
+                        <th className="p-3 text-right">Physical Dip (L)</th>
+                        <th className="p-3 text-right">Variance (L)</th>
+                        <th className="p-3 text-right">Variance (%)</th>
+                        <th className="p-3 text-center">Status</th>
                       </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100 font-medium text-slate-800">
+                      {selectedDetailSession.entries.map((entry, idx) => {
+                        const isLoss = entry.varianceLiters < 0;
+                        const isGain = entry.varianceLiters > 0;
+                        return (
+                          <tr key={entry.tankId || idx} className="hover:bg-slate-50/50">
+                            <td className="p-3 text-center text-gray-400 font-bold">{idx + 1}</td>
+                            <td className="p-3 font-bold text-slate-900">
+                              <div>{entry.tankName}</div>
+                              <div className="text-[10px] text-gray-500 font-normal">{entry.fuelType}</div>
+                            </td>
+                            <td className="p-3 text-right text-gray-600 tabular-nums">
+                              {entry.systemVolume.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
+                            </td>
+                            <td className="p-3 text-right font-bold text-slate-900 tabular-nums">
+                              {entry.physicalDip.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
+                            </td>
+                            <td className="p-3 text-right font-bold tabular-nums whitespace-nowrap">
+                              <span className={isLoss ? 'text-rose-600' : isGain ? 'text-emerald-700' : 'text-gray-500'}>
+                                {isGain ? '+' : ''}{entry.varianceLiters.toFixed(1)} L
+                              </span>
+                            </td>
+                            <td className="p-3 text-right font-semibold tabular-nums whitespace-nowrap">
+                              <span className={isLoss ? 'text-rose-600' : isGain ? 'text-emerald-700' : 'text-gray-500'}>
+                                {entry.variancePercentage >= 0 ? '+' : ''}{entry.variancePercentage.toFixed(2)}%
+                              </span>
+                            </td>
+                            <td className="p-3 text-center whitespace-nowrap">
+                              {entry.status === 'Warning' ? (
+                                <span className="px-2 py-0.5 bg-amber-50 text-amber-700 border border-amber-200 rounded-md font-bold text-[10px]">
+                                  High Deviation
+                                </span>
+                              ) : isLoss ? (
+                                <span className="px-2 py-0.5 bg-rose-50 text-rose-700 border border-rose-200 rounded-md font-bold text-[10px]">
+                                  Loss
+                                </span>
+                              ) : isGain ? (
+                                <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-md font-bold text-[10px]">
+                                  Gain
+                                </span>
+                              ) : (
+                                <span className="px-2 py-0.5 bg-gray-50 text-gray-600 border border-gray-200 rounded-md font-semibold text-[10px]">
+                                  Balanced
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
 
-            {/* Remarks Section */}
-            {selectedDetailSession.remarks && (
-              <div className="bg-blue-50/60 p-3 rounded-xl border border-blue-100 text-xs">
-                <span className="font-bold text-blue-950 block mb-0.5">Audit Remarks:</span>
-                <p className="text-slate-700 leading-relaxed font-medium">{selectedDetailSession.remarks}</p>
+                {/* Remarks Section */}
+                {selectedDetailSession.remarks && (
+                  <div className="bg-blue-50/60 p-3 rounded-xl border border-blue-100 text-xs">
+                    <span className="font-bold text-blue-950 block mb-0.5">Audit Remarks:</span>
+                    <p className="text-slate-700 leading-relaxed font-medium">{selectedDetailSession.remarks}</p>
+                  </div>
+                )}
               </div>
             )}
 
@@ -1080,7 +2010,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                 onClick={() => setSelectedDetailSession(null)}
                 className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold transition-all cursor-pointer"
               >
-                Close Breakdown
+                Close Report
               </button>
             </div>
           </div>

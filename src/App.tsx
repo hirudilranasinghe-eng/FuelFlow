@@ -27,7 +27,7 @@ import EmployeesTab from './components/EmployeesTab';
 import AdminControlTab from './components/AdminControlTab';
 import PriceManagementTab from './components/PriceManagementTab';
 import LoginPage from './components/LoginPage';
-import { AuthUser, Employee, FuelTank, OilTank, Pump, PumpMachine, Shift, StockDelivery, PriceSchedule, Customer, CreditTransaction, CreditPayment, resolveUserRole } from './types';
+import { AuthUser, Employee, FuelTank, OilTank, Pump, PumpMachine, Shift, StockDelivery, PriceSchedule, Customer, CreditTransaction, CreditPayment, LPGasItem, resolveUserRole } from './types';
 import { supabase, getTanksTableName, setTanksTableName } from './lib/supabase';
 import { upsertPumpReadings, syncCreditAndCardSales, updateNozzleMeterCarryover, saveOilTank } from './lib/supabaseClient';
 
@@ -284,6 +284,45 @@ export default function App() {
     } catch (_) {}
     return [];
   });
+
+  // Global LP Gas Stock State
+  const [gasStock, setGasStock] = useState<LPGasItem[]>(() => {
+    try {
+      const stored = localStorage.getItem('fuel_flow_gas_stock') || localStorage.getItem('fuel_flow_gas_inventory');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch (_) {}
+    return [
+      { id: 'gas-12.5kg', size: '12.5 kg', full_count: 0, empty_count: 0, last_updated: new Date().toISOString() },
+      { id: 'gas-37.5kg', size: '37.5 kg', full_count: 0, empty_count: 0, last_updated: new Date().toISOString() },
+      { id: 'gas-5.0kg', size: '5.0 kg', full_count: 0, empty_count: 0, last_updated: new Date().toISOString() },
+      { id: 'gas-2.3kg', size: '2.3 kg', full_count: 0, empty_count: 0, last_updated: new Date().toISOString() }
+    ];
+  });
+
+  const handleUpdateGasStock = (updated: LPGasItem[]) => {
+    setGasStock(updated);
+    try {
+      localStorage.setItem('fuel_flow_gas_stock', JSON.stringify(updated));
+      localStorage.setItem('fuel_flow_gas_inventory', JSON.stringify(updated));
+    } catch (_) {}
+    window.dispatchEvent(new CustomEvent('gas-inventory-updated', {
+      detail: { updatedInventory: updated }
+    }));
+  };
+
+  useEffect(() => {
+    const handleGasUpdate = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      if (customEvent.detail && Array.isArray(customEvent.detail.updatedInventory)) {
+        setGasStock(customEvent.detail.updatedInventory);
+      }
+    };
+    window.addEventListener('gas-inventory-updated', handleGasUpdate);
+    return () => window.removeEventListener('gas-inventory-updated', handleGasUpdate);
+  }, []);
 
   useEffect(() => {
     try {
@@ -1569,7 +1608,10 @@ export default function App() {
             )}
 
             {activeTab === 'gas-inventory' && (
-              <LPGasInventoryTab />
+              <LPGasInventoryTab 
+                gasStock={gasStock}
+                onUpdateGasStock={handleUpdateGasStock}
+              />
             )}
 
             {activeTab === 'purchases' && (
@@ -1580,6 +1622,8 @@ export default function App() {
                 setOilTanks={setOilTanks}
                 deliveries={deliveries}
                 setDeliveries={setDeliveries}
+                gasStock={gasStock}
+                onUpdateGasStock={handleUpdateGasStock}
                 employees={employees}
                 user={user}
                 userRole={user?.role}

@@ -9,9 +9,9 @@ import {
   Calendar, Search, Filter, Plus, Trash2, AlertTriangle, 
   CheckCircle2, Download, X, ArrowDownRight, Layers,
   Database, RefreshCw, ChevronRight, Info, Building2, Tag, DollarSign,
-  Printer, Eye, Flame
+  Printer, Eye, Flame, GitBranch, Check, Droplet, Sparkles, ArrowLeft
 } from 'lucide-react';
-import { FuelTank, OilTank, StockDelivery, FuelType, Employee, PackagedOilItem, OilGRNRecord, ReceiptDesignerConfig, DEFAULT_RECEIPT_CONFIG, AuthUser } from '../types';
+import { FuelTank, OilTank, StockDelivery, FuelType, Employee, PackagedOilItem, OilGRNRecord, ReceiptDesignerConfig, DEFAULT_RECEIPT_CONFIG, AuthUser, LPGasItem } from '../types';
 import { supabase, getTanksTableName } from '../lib/supabase';
 import { saveOilTank } from '../lib/supabaseClient';
 import { isAdmin } from '../lib/auth';
@@ -47,6 +47,8 @@ interface PurchasesTabProps {
   setOilTanks: React.Dispatch<React.SetStateAction<OilTank[]>>;
   deliveries: StockDelivery[];
   setDeliveries: React.Dispatch<React.SetStateAction<StockDelivery[]>>;
+  gasStock?: LPGasItem[];
+  onUpdateGasStock?: (items: LPGasItem[]) => void;
   employees?: Employee[];
   user?: AuthUser | null;
   userRole?: string;
@@ -59,6 +61,8 @@ export default function PurchasesTab({
   setOilTanks,
   deliveries,
   setDeliveries,
+  gasStock,
+  onUpdateGasStock,
   employees = [],
   user,
   userRole
@@ -140,7 +144,6 @@ export default function PurchasesTab({
   const [lpGasForm, setLPGasForm] = useState({
     size: '12.5 kg',
     fullQuantity: '',
-    emptyReturned: '',
     unitPrice: '',
     supplier: 'Litro Gas Lanka',
     invoiceNo: '',
@@ -176,27 +179,33 @@ export default function PurchasesTab({
     }
 
     const fullQty = Number(lpGasForm.fullQuantity) || 0;
-    const emptyReturned = Number(lpGasForm.emptyReturned) || 0;
     const unitPrice = Number(lpGasForm.unitPrice) || 0;
     const totalCost = fullQty * unitPrice;
     
-    const normalizeSize = (s: string) => s.toLowerCase().replace(/[^0-9.]/g, '');
-    const normSelectedSize = normalizeSize(lpGasForm.size);
-    const targetId = `gas-${normSelectedSize}kg`;
+    const getGasItemId = (sizeStr: string): string => {
+      const norm = sizeStr.toLowerCase().replace(/[^0-9.]/g, '');
+      if (norm === '12.5') return 'gas-12.5kg';
+      if (norm === '37.5') return 'gas-37.5kg';
+      if (norm === '5' || norm === '5.0') return 'gas-5.0kg';
+      if (norm === '2.3') return 'gas-2.3kg';
+      return `gas-${norm}kg`;
+    };
+
+    const targetId = getGasItemId(lpGasForm.size);
 
     const purchaseEntry = {
-      id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 9),
-      date: lpGasForm.date,
+      id: crypto.randomUUID ? crypto.randomUUID() : `lpg-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+      date: lpGasForm.date || new Date().toISOString().split('T')[0],
       size: lpGasForm.size,
       full_quantity: fullQty,
-      empty_returned: emptyReturned,
+      empty_returned: 0,
       unit_price: unitPrice,
       total_cost: totalCost,
       supplier: lpGasForm.supplier,
       invoice_no: lpGasForm.invoiceNo,
     };
 
-    // 1. Instantly update the local UI table
+    // 1. Instantly update the local UI purchase logs table
     setLPGasDeliveries(prev => [purchaseEntry, ...prev]);
     setIsLPGasModalOpen(false);
     showToast('LP Gas Delivery added successfully');
@@ -204,7 +213,6 @@ export default function PurchasesTab({
     setLPGasForm({
       size: '12.5 kg',
       fullQuantity: '',
-      emptyReturned: '',
       unitPrice: '',
       supplier: 'Litro Gas Lanka',
       invoiceNo: '',
@@ -212,29 +220,65 @@ export default function PurchasesTab({
     });
     setLPGasModalError(null);
 
-    // 3. Direct LocalStorage Sync
+    // 2. Direct LocalStorage Sync & Event Dispatch (ONLY update full_count, leave empty_count intact)
     let updatedFull = fullQty;
-    let updatedEmpty = 0;
     try {
-      const localDataRaw = localStorage.getItem('fuel_flow_gas_inventory');
-      let localData = localDataRaw ? JSON.parse(localDataRaw) : [];
+      const rawStored = localStorage.getItem('fuel_flow_gas_stock') || localStorage.getItem('fuel_flow_gas_inventory');
+      let localData: any[] = rawStored ? JSON.parse(rawStored) : [];
+      
+      const defaultSizes: { id: string; size: '12.5 kg' | '37.5 kg' | '5.0 kg' | '2.3 kg' }[] = [
+        { id: 'gas-12.5kg', size: '12.5 kg' },
+        { id: 'gas-37.5kg', size: '37.5 kg' },
+        { id: 'gas-5.0kg', size: '5.0 kg' },
+        { id: 'gas-2.3kg', size: '2.3 kg' }
+      ];
+
+      if (!Array.isArray(localData) || localData.length === 0) {
+        localData = defaultSizes.map(s => ({
+          id: s.id,
+          size: s.size,
+          full_count: 0,
+          empty_count: 0,
+          last_updated: new Date().toISOString()
+        }));
+      }
+
       let found = false;
       localData = localData.map((item: any) => {
-        if (normalizeSize(item.size) === normSelectedSize || item.id === targetId) {
+        if (item.id === targetId || item.size === lpGasForm.size || getGasItemId(item.size || '') === targetId) {
           found = true;
           updatedFull = (Number(item.full_count) || 0) + fullQty;
-          updatedEmpty = Math.max(0, (Number(item.empty_count) || 0) - emptyReturned);
-          return { ...item, full_count: updatedFull, empty_count: updatedEmpty, last_updated: new Date().toISOString() };
+          return {
+            ...item,
+            id: targetId,
+            size: lpGasForm.size,
+            full_count: updatedFull,
+            empty_count: Number(item.empty_count) || 0,
+            last_updated: new Date().toISOString()
+          };
         }
         return item;
       });
+
       if (!found) {
-        updatedEmpty = Math.max(0, -emptyReturned);
-        localData.push({ id: targetId, size: lpGasForm.size, full_count: updatedFull, empty_count: updatedEmpty, last_updated: new Date().toISOString() });
+        updatedFull = fullQty;
+        localData.push({
+          id: targetId,
+          size: lpGasForm.size,
+          full_count: updatedFull,
+          empty_count: 0,
+          last_updated: new Date().toISOString()
+        });
       }
+
+      localStorage.setItem('fuel_flow_gas_stock', JSON.stringify(localData));
       localStorage.setItem('fuel_flow_gas_inventory', JSON.stringify(localData));
       
-      // Dispatch update event
+      if (onUpdateGasStock) {
+        onUpdateGasStock(localData);
+      }
+
+      // Dispatch update event for instant UI re-render across all tabs
       window.dispatchEvent(new CustomEvent('gas-inventory-updated', { 
         detail: { updatedInventory: localData } 
       }));
@@ -242,37 +286,35 @@ export default function PurchasesTab({
       console.error('LocalStorage sync failed', e);
     }
 
-    // 2. Perform DB operations safely in the background
+    // 3. Perform DB operations safely in the background
     try {
-      // Insert into lp_gas_purchases table
       const { error: purchaseError } = await supabase
         .from('lp_gas_purchases')
         .insert([purchaseEntry]);
         
       if (purchaseError && purchaseError.code !== 'PGRST205') {
-         console.error('Error saving LP Gas purchase:', purchaseError);
+        console.error('Error saving LP Gas purchase:', purchaseError);
       }
 
-      // Update gas_inventory table
-      const { data: invData, error: invFetchError } = await supabase
+      const { data: invData } = await supabase
         .from('gas_inventory')
         .select('*')
         .eq('id', targetId)
-        .single();
+        .maybeSingle();
         
-      const currentFull = invData ? (Number(invData.full_count) || 0) : 0;
+      const currentFull = invData ? (Number(invData.full_count) || 0) : (updatedFull - fullQty);
       const currentEmpty = invData ? (Number(invData.empty_count) || 0) : 0;
       const finalUpdatedFull = currentFull + fullQty;
-      const finalUpdatedEmpty = Math.max(0, currentEmpty - emptyReturned);
       
       await supabase
         .from('gas_inventory')
-        .update({
+        .upsert({
+          id: targetId,
+          size: lpGasForm.size,
           full_count: finalUpdatedFull,
-          empty_count: finalUpdatedEmpty,
+          empty_count: currentEmpty,
           last_updated: new Date().toISOString()
-        })
-        .eq('id', targetId);
+        });
 
     } catch (err: any) {
       if (err?.code !== 'PGRST205') console.error('Error in save LP Gas:', err);
@@ -280,12 +322,12 @@ export default function PurchasesTab({
   };
 
   // -------------------------------------------------------------
-  // 1. FUEL PURCHASE MODAL STATE (Exact existing form structure)
+  // 1. FUEL PURCHASE STATE (DIRECT TANK CARD ALLOCATIONS)
   // -------------------------------------------------------------
   const [isFuelModalOpen, setIsFuelModalOpen] = useState(false);
-  const [selectedTankId, setSelectedTankId] = useState<string>('');
-  const [deliveryFuelType, setDeliveryFuelType] = useState<FuelType>('Petrol 92');
   const [deliveryQty, setDeliveryQty] = useState<number | ''>('');
+  const [deliveryFuelType, setDeliveryFuelType] = useState<FuelType>('Petrol 92');
+  const [tankAllocations, setTankAllocations] = useState<Record<string, number | ''>>({});
   const [deliverySupplier, setDeliverySupplier] = useState('Ceylon Petroleum Corporation');
   const [deliveryInvoiceNo, setDeliveryInvoiceNo] = useState<string>('');
   const [deliveryDate, setDeliveryDate] = useState<string>(() => new Date().toISOString().split('T')[0]);
@@ -296,108 +338,298 @@ export default function PurchasesTab({
     return [...tanks].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || '', undefined, { numeric: true, sensitivity: 'base' }));
   }, [tanks]);
 
-  // Handle Fuel Delivery Submit (Exact logic from FuelStockTab)
-  const handleAddFuelDeliverySubmit = async () => {
-    const numQty = typeof deliveryQty === 'number' ? deliveryQty : parseFloat(deliveryQty) || 0;
-    if (numQty <= 0) {
-      setFuelModalError('Delivery volume must be a positive number.');
-      return;
-    }
-    
-    // Find selected target tank
-    const targetTank = tanks.find(t => t.id === selectedTankId) || tanks.find(t => t.fuelType === deliveryFuelType) || sortedTanks[0];
-    if (!targetTank) {
-      setFuelModalError('Please select a target storage tank.');
-      return;
-    }
+  // Standard fuel products sequence (Ceylon Petroleum Corporation)
+  const ALL_FUEL_PRODUCTS: FuelType[] = ['Petrol 92', 'Petrol 95', 'Auto Diesel', 'Super Diesel', 'Lanka Ordinary Diesel'];
 
-    const freeSpace = targetTank.capacity - targetTank.currentLevel;
-    if (numQty > freeSpace) {
-      setFuelModalError(`Delivery volume (${numQty.toLocaleString()} L) exceeds target tank free space (${freeSpace.toFixed(1)} L) for ${targetTank.name}! Max volume you can add is ${freeSpace.toFixed(1)} L.`);
-      return;
-    }
+  // Dynamic Fuel Product Filtering: ONLY products that have at least 1 active storage tank in the station
+  const availableFuelProducts = useMemo(() => {
+    // 1. Standard fuel products that actually exist in the station's tanks
+    const matchedStandard = ALL_FUEL_PRODUCTS.filter(product =>
+      tanks.some(tank => tank.fuelType === product)
+    );
 
-    const updatedLevel = Math.min(targetTank.capacity, targetTank.currentLevel + numQty);
+    // 2. Any additional custom fuel types present in tanks (excluding lubricants)
+    const customTypes = Array.from(new Set(
+      tanks
+        .map(t => t.fuelType)
+        .filter(ft => ft && ft !== 'Oil & Lubricants' && !ALL_FUEL_PRODUCTS.includes(ft))
+    )) as FuelType[];
 
-    // Update target tank current level locally
-    const updatedTanks = tanks.map(t => {
-      if (t.id === targetTank.id) {
-        return {
-          ...t,
-          currentLevel: updatedLevel
-        };
+    return [...matchedStandard, ...customTypes];
+  }, [tanks]);
+
+  // Backward-compatible alias for available fuel types
+  const fuelTypeOptions = availableFuelProducts;
+
+  // Auto-Select First Available Product if current selected product has no matching tanks
+  useEffect(() => {
+    if (availableFuelProducts.length > 0) {
+      const currentHasTanks = tanks.some(t => t.fuelType === deliveryFuelType);
+      if (!currentHasTanks || !availableFuelProducts.includes(deliveryFuelType)) {
+        setDeliveryFuelType(availableFuelProducts[0]);
+        setTankAllocations({});
       }
-      return t;
+    }
+  }, [availableFuelProducts, tanks, deliveryFuelType]);
+
+  // Matching tanks for the selected fuel type
+  const matchingFuelTanks = useMemo(() => {
+    return sortedTanks.filter(t => t.fuelType === deliveryFuelType);
+  }, [sortedTanks, deliveryFuelType]);
+
+  // Total free space across all matching tanks for this fuel type
+  const totalMatchingFreeSpace = useMemo(() => {
+    return matchingFuelTanks.reduce((sum, t) => sum + Math.max(0, t.capacity - t.currentLevel), 0);
+  }, [matchingFuelTanks]);
+
+  // Max single tank free space
+  const maxSingleTankFreeSpace = useMemo(() => {
+    if (matchingFuelTanks.length === 0) return 0;
+    return Math.max(...matchingFuelTanks.map(t => Math.max(0, t.capacity - t.currentLevel)));
+  }, [matchingFuelTanks]);
+
+  const numDeliveryQty = typeof deliveryQty === 'number' ? deliveryQty : parseFloat(deliveryQty) || 0;
+
+  // Total allocated across all matching tanks
+  const totalSplitAllocated = useMemo(() => {
+    return matchingFuelTanks.reduce((sum, t) => {
+      const val = tankAllocations[t.id];
+      const vol = typeof val === 'number' ? val : parseFloat(val || '') || 0;
+      return sum + (isNaN(vol) ? 0 : vol);
+    }, 0);
+  }, [matchingFuelTanks, tankAllocations]);
+
+  const remainingUnallocated = numDeliveryQty - totalSplitAllocated;
+  const isAllocationComplete = numDeliveryQty > 0 && Math.abs(remainingUnallocated) < 0.01;
+
+  // Check if any matching tank's allocated volume exceeds its free space
+  const tankCapacityErrors = useMemo(() => {
+    const errors: Record<string, string> = {};
+    matchingFuelTanks.forEach(t => {
+      const val = tankAllocations[t.id];
+      const vol = typeof val === 'number' ? val : parseFloat(val || '') || 0;
+      const freeSpace = Math.max(0, t.capacity - t.currentLevel);
+      if (vol > freeSpace) {
+        errors[t.id] = `Exceeds free space (${formatLiters(freeSpace)}) by ${(vol - freeSpace).toLocaleString()} L`;
+      }
     });
+    return errors;
+  }, [matchingFuelTanks, tankAllocations]);
+
+  const hasAnyCapacityExceeded = Object.keys(tankCapacityErrors).length > 0;
+  const canConfirmDelivery = isAllocationComplete && !hasAnyCapacityExceeded && numDeliveryQty > 0;
+
+  // Selected fuel unit price and estimated total delivery cost
+  const currentFuelUnitPrice = useMemo(() => {
+    const matched = tanks.find(t => t.fuelType === deliveryFuelType);
+    return matched?.pricePerLiter || 0;
+  }, [tanks, deliveryFuelType]);
+
+  const estimatedTotalDeliveryCost = useMemo(() => {
+    return Math.round(numDeliveryQty * currentFuelUnitPrice);
+  }, [numDeliveryQty, currentFuelUnitPrice]);
+
+  // Handle Delivery Quantity Input
+  const handleDeliveryQtyChange = (val: number | '') => {
+    setFuelModalError(null);
+    setDeliveryQty(val);
+    // Keep tank allocations clean and manual, without forcing auto-allocation on single keystrokes
+  };
+
+  // Open modal handler
+  const handleOpenFuelModal = useCallback(() => {
+    setFuelModalError(null);
+    setDeliveryQty('');
+    setDeliveryInvoiceNo('');
+    setDeliverySupplier('Ceylon Petroleum Corporation');
+    setDeliveryDate(new Date().toISOString().split('T')[0]);
+
+    const initialFuelType = availableFuelProducts[0] || sortedTanks[0]?.fuelType || 'Petrol 92';
+    setDeliveryFuelType(initialFuelType);
+    setTankAllocations({});
+    setIsFuelModalOpen(true);
+  }, [availableFuelProducts, sortedTanks]);
+
+  // Handle Fuel Type selection
+  const handleSelectDeliveryFuelType = (fType: FuelType) => {
+    setDeliveryFuelType(fType);
+    setFuelModalError(null);
+    setTankAllocations({});
+  };
+
+  // Update a single tank's allocated volume cleanly without mutating other tanks
+  const handleUpdateTankVolume = (targetTankId: string, rawVal: string | number) => {
+    setFuelModalError(null);
+    const newVol = rawVal === '' ? '' : Math.max(0, typeof rawVal === 'number' ? rawVal : Number(rawVal) || 0);
+
+    setTankAllocations(prev => ({
+      ...prev,
+      [targetTankId]: newVol
+    }));
+  };
+
+  // Helper: Set tank to its max free space
+  const handleSetMaxFreeForTank = (tankId: string) => {
+    const targetTank = matchingFuelTanks.find(t => t.id === tankId);
+    if (!targetTank) return;
+    const freeSpace = Math.max(0, targetTank.capacity - targetTank.currentLevel);
+    handleUpdateTankVolume(tankId, freeSpace);
+  };
+
+  // Helper: Fill remaining needed balance for tank
+  const handleFillRemainderForTank = (tankId: string) => {
+    const othersAllocated = matchingFuelTanks.filter(t => t.id !== tankId).reduce((sum, t) => {
+      const v = tankAllocations[t.id];
+      return sum + (typeof v === 'number' ? v : parseFloat(v || '') || 0);
+    }, 0);
+    const needed = Math.max(0, numDeliveryQty - othersAllocated);
+    handleUpdateTankVolume(tankId, needed);
+  };
+
+  // Helper: Clear a tank allocation
+  const handleClearTank = (tankId: string) => {
+    handleUpdateTankVolume(tankId, '');
+  };
+
+  // Handle Fuel Delivery Submit (Direct Multi-Tank Allocation)
+  const handleAddFuelDeliverySubmit = async () => {
+    const totalVolume = typeof deliveryQty === 'number' ? deliveryQty : parseFloat(deliveryQty) || 0;
+    if (totalVolume <= 0) {
+      setFuelModalError('Delivery volume must be a positive number greater than 0.');
+      return;
+    }
+
+    interface ValidAllocation {
+      tank: FuelTank;
+      volume: number;
+    }
+    const finalAllocations: ValidAllocation[] = [];
+    let allocatedSum = 0;
+
+    for (const tank of matchingFuelTanks) {
+      const val = tankAllocations[tank.id];
+      const vol = typeof val === 'number' ? val : parseFloat(val || '') || 0;
+      if (vol > 0) {
+        const freeSpace = Math.max(0, tank.capacity - tank.currentLevel);
+        if (vol > freeSpace) {
+          setFuelModalError(`Allocated volume for ${tank.name} (${vol.toLocaleString()} L) exceeds its available free space (${freeSpace.toLocaleString()} L)!`);
+          return;
+        }
+        allocatedSum += vol;
+        finalAllocations.push({ tank, volume: vol });
+      }
+    }
+
+    if (finalAllocations.length === 0) {
+      setFuelModalError('Please enter an unload volume under at least one storage tank.');
+      return;
+    }
+
+    if (Math.abs(allocatedSum - totalVolume) > 0.01) {
+      const diff = totalVolume - allocatedSum;
+      setFuelModalError(
+        `Total allocated volume (${allocatedSum.toLocaleString()} L) does not match total delivered bowser volume (${totalVolume.toLocaleString()} L). Difference: ${diff > 0 ? '+' : ''}${diff.toLocaleString()} L.`
+      );
+      return;
+    }
+
+    // 1. Increment current stock levels of ALL selected tanks
+    let updatedTanks = [...tanks];
+    const tankPayloads: any[] = [];
+
+    for (const alloc of finalAllocations) {
+      const updatedLevel = Math.min(alloc.tank.capacity, alloc.tank.currentLevel + alloc.volume);
+      updatedTanks = updatedTanks.map(t => {
+        if (t.id === alloc.tank.id) {
+          return {
+            ...t,
+            currentLevel: updatedLevel
+          };
+        }
+        return t;
+      });
+
+      tankPayloads.push({
+        id: alloc.tank.id,
+        name: alloc.tank.name,
+        fueltype: alloc.tank.fuelType,
+        capacity: alloc.tank.capacity,
+        currentlevel: updatedLevel,
+        priceperliter: alloc.tank.pricePerLiter
+      });
+    }
 
     setTanks(updatedTanks);
     try {
       localStorage.setItem('fms_tanks', JSON.stringify(updatedTanks));
     } catch (_) {}
 
-    const autoCost = Math.round(numQty * (targetTank.pricePerLiter || 0));
-    const deliveryId = deliveryInvoiceNo.trim() || `DEL-${Date.now().toString().slice(-6)}`;
+    // 2. Create single unified delivery purchase record with combined destination tanks
+    const baseInvoiceId = deliveryInvoiceNo.trim() || `DEL-${Date.now().toString().slice(-6)}`;
     const deliveryIsoDate = deliveryDate ? new Date(deliveryDate).toISOString() : new Date().toISOString();
     const supplierName = deliverySupplier.trim() || 'Ceylon Petroleum Corporation';
 
-    // Create delivery record with target tank details locally
-    const newDelivery: StockDelivery = {
-      id: deliveryId,
+    // Construct combined destination tank string
+    const combinedDestination = finalAllocations.length === 1
+      ? finalAllocations[0].tank.name
+      : finalAllocations.map(a => `${a.tank.name} (${a.volume.toLocaleString()} L)`).join(' + ');
+
+    const totalDeliveryCost = finalAllocations.reduce(
+      (sum, a) => sum + Math.round(a.volume * (a.tank.pricePerLiter || 0)),
+      0
+    );
+
+    const singleDeliveryRecord: StockDelivery = {
+      id: baseInvoiceId,
       date: deliveryIsoDate,
-      fuelType: targetTank.fuelType,
-      tankId: targetTank.id,
-      tankName: targetTank.name,
-      quantity: numQty,
+      fuelType: deliveryFuelType,
+      tankId: finalAllocations.length === 1 ? finalAllocations[0].tank.id : 'multi-tank',
+      tankName: combinedDestination,
+      destination_tank: combinedDestination,
+      quantity: totalVolume,
       supplier: supplierName,
-      cost: autoCost
+      cost: totalDeliveryCost
     };
 
-    const newDeliveriesList = [newDelivery, ...deliveries];
+    const newDeliveriesList = [singleDeliveryRecord, ...deliveries];
     setDeliveries(newDeliveriesList);
     try {
       localStorage.setItem('fms_deliveries', JSON.stringify(newDeliveriesList));
     } catch (_) {}
 
-    // Persist changes directly to Supabase tables
+    // 3. Persist single purchase record & updated tank stock levels to Supabase in background
     try {
-      // 1. Save purchase row to stock_deliveries strictly with valid columns
-      const deliveryPayload = {
-        id: deliveryId,
+      const dbDeliveryPayload = {
+        id: baseInvoiceId,
         date: deliveryIsoDate,
-        fueltype: targetTank.fuelType,
-        quantity: numQty,
+        fueltype: deliveryFuelType,
+        quantity: totalVolume,
         supplier: supplierName
       };
 
-      const { error: delErr } = await supabase.from('stock_deliveries').upsert([deliveryPayload]).select();
+      const { error: delErr } = await supabase.from('stock_deliveries').upsert([dbDeliveryPayload]).select();
       if (delErr) {
         console.warn('Purchase Save Notice:', delErr.message || delErr);
       }
-
-      // 2. Auto-increment tank level in fuel_tanks table in Supabase
-      const tankPayload = {
-        id: targetTank.id,
-        name: targetTank.name,
-        fueltype: targetTank.fuelType,
-        capacity: targetTank.capacity,
-        currentlevel: updatedLevel,
-        priceperliter: targetTank.pricePerLiter
-      };
-
-      const { error: tankErr } = await supabase.from(getTanksTableName()).upsert([tankPayload]);
-      if (tankErr) {
-        console.warn("Supabase fuel_tanks level auto-increment notice:", tankErr.message || tankErr);
+      if (tankPayloads.length > 0) {
+        const { error: tankErr } = await supabase.from(getTanksTableName()).upsert(tankPayloads);
+        if (tankErr) {
+          console.warn("Supabase fuel_tanks level auto-increment notice:", tankErr.message || tankErr);
+        }
       }
     } catch (err: any) {
       console.warn("Supabase purchase persistence notice:", err?.message || err);
     }
 
+    // 4. Success notification: "13,200 L successfully allocated across selected tanks"
+    showToast(`${totalVolume.toLocaleString()} L successfully allocated across selected tanks`);
+
+    // Reset form state & close modal
     setIsFuelModalOpen(false);
     setDeliveryQty('');
     setDeliveryInvoiceNo('');
     setDeliverySupplier('Ceylon Petroleum Corporation');
     setFuelModalError(null);
-    showToast(`Fuel Bowser Delivery received successfully: ${numQty.toLocaleString()} L of ${targetTank.fuelType} into ${targetTank.name}.`);
   };
 
   // -------------------------------------------------------------
@@ -823,24 +1055,645 @@ export default function PurchasesTab({
         </div>
       )}
 
-      {/* Main Header (Clean standard layout matching other tabs) */}
-      <div id="purchases-header-block" className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-        <div>
-          <h1 className="text-lg font-bold text-slate-900 tracking-tight font-sans">
-            Purchases
-          </h1>
-          <p className="text-xs text-slate-500 mt-0.5">
-            Manage fuel bowser deliveries and lubricant stock replenishment
-          </p>
-        </div>
+      {/* ========================================================================= */}
+      {/* 1. DEDICATED FULL PAGE VIEW: NEW FUEL BOWSER DELIVERY                     */}
+      {/* ========================================================================= */}
+      {isFuelModalOpen ? (
+        <div id="fuel-delivery-full-page-view" className="space-y-4 animate-fade-in">
+          {/* Top Header Bar (Compact & Sleek) */}
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 px-4 py-3 bg-white rounded-xl border border-slate-200 shadow-xs">
+            <div className="flex items-center gap-3">
+              <button
+                id="btn-back-to-purchases"
+                type="button"
+                onClick={() => {
+                  setIsFuelModalOpen(false);
+                  setFuelModalError(null);
+                }}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-lg border border-slate-200 transition-all cursor-pointer group shadow-2xs"
+              >
+                <ArrowLeft className="w-3.5 h-3.5 transition-transform group-hover:-translate-x-0.5 text-slate-600" />
+                <span>Back to Purchases</span>
+              </button>
 
-        {/* Quick Stats Summary */}
-        <div className="hidden sm:flex items-center gap-4 text-xs text-gray-500">
-          <span>Total Fuel Volume: <strong className="text-slate-900 tabular-nums">{formatLiters(totalFuelLiters)}</strong></span>
-          <span>&bull;</span>
-          <span>Total Value: <strong className="text-emerald-700 tabular-nums">{formatCurrency(totalFuelCost + totalLubeValue)}</strong></span>
+              <div className="h-4 w-px bg-slate-200" />
+
+              <div className="flex items-center gap-2">
+                <h1 className="text-sm sm:text-base font-black text-slate-900 tracking-tight font-sans">
+                  New Fuel Bowser Delivery
+                </h1>
+                <span className="hidden sm:inline-block px-2 py-0.5 bg-blue-50 text-blue-700 text-[10px] font-extrabold rounded-full border border-blue-200 uppercase tracking-wider">
+                  Full Page View
+                </span>
+              </div>
+            </div>
+
+            {/* Compact Step Progress Indicator */}
+            <div className="flex items-center gap-1 self-start sm:self-auto bg-slate-50 p-1 rounded-lg border border-slate-200 text-[11px] font-bold">
+              <div className={`flex items-center gap-1 px-2.5 py-0.5 rounded-md transition-all ${
+                numDeliveryQty > 0 ? 'bg-blue-600 text-white shadow-2xs' : 'bg-white text-slate-800 border border-slate-200 shadow-2xs'
+              }`}>
+                <span className="w-3.5 h-3.5 rounded-full bg-white/20 text-center text-[9px] leading-3.5 font-black">1</span>
+                <span>Product &amp; Volume</span>
+              </div>
+              <ChevronRight className="w-3 h-3 text-slate-400" />
+              <div className={`flex items-center gap-1 px-2.5 py-0.5 rounded-md transition-all ${
+                isAllocationComplete && !hasAnyCapacityExceeded
+                  ? 'bg-blue-600 text-white shadow-2xs'
+                  : numDeliveryQty > 0
+                    ? 'bg-white text-slate-800 border border-slate-200 shadow-2xs'
+                    : 'text-slate-400'
+              }`}>
+                <span className="w-3.5 h-3.5 rounded-full bg-slate-200 text-slate-700 text-center text-[9px] leading-3.5 font-black">2</span>
+                <span>Tank Allocation</span>
+              </div>
+              <ChevronRight className="w-3 h-3 text-slate-400" />
+              <div className={`flex items-center gap-1 px-2.5 py-0.5 rounded-md transition-all ${
+                canConfirmDelivery
+                  ? 'bg-emerald-600 text-white shadow-2xs'
+                  : 'text-slate-400'
+              }`}>
+                <span className="w-3.5 h-3.5 rounded-full bg-slate-200 text-slate-700 text-center text-[9px] leading-3.5 font-black">3</span>
+                <span>Confirm</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Error Alert */}
+          {fuelModalError && (
+            <div className="p-3 bg-rose-50 text-rose-800 rounded-xl text-xs flex items-center justify-between gap-3 border border-rose-200 font-semibold animate-shake shadow-xs">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 flex-shrink-0 text-rose-600" />
+                <span>{fuelModalError}</span>
+              </div>
+              <button 
+                type="button"
+                onClick={() => setFuelModalError(null)}
+                className="p-1 text-rose-500 hover:text-rose-800 hover:bg-rose-100 rounded-lg cursor-pointer transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
+          {/* 3-Column Responsive Grid Layout */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+            {/* ------------------------------------------------------------- */}
+            {/* LEFT PANEL (Col 1 - lg:col-span-4): Clean Inputs Only         */}
+            {/* ------------------------------------------------------------- */}
+            <div className="lg:col-span-4 bg-white rounded-2xl border border-slate-200/90 shadow-xs p-5 space-y-5">
+              {/* Fuel Product Selector Chips */}
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-xs font-bold text-slate-800">
+                    Select Fuel Product <span className="text-rose-500">*</span>
+                  </label>
+                  <span className="text-[10px] font-bold text-slate-400">
+                    {availableFuelProducts.length} Available
+                  </span>
+                </div>
+
+                {availableFuelProducts.length === 0 ? (
+                  <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 font-medium space-y-1">
+                    <p className="font-bold">No Active Storage Tanks Found</p>
+                    <p className="text-[11px] text-amber-700">Please configure fuel tanks in the Station Settings to record deliveries.</p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 gap-2">
+                    {availableFuelProducts.map((fType) => {
+                      const isSelected = deliveryFuelType === fType;
+                      const tankCount = sortedTanks.filter(t => t.fuelType === fType).length;
+                      return (
+                        <button
+                          key={fType}
+                          type="button"
+                          onClick={() => handleSelectDeliveryFuelType(fType)}
+                          className={`p-3 rounded-xl text-xs font-bold text-left transition-all border cursor-pointer flex flex-col justify-between gap-1.5 ${
+                            isSelected
+                              ? 'bg-blue-600 text-white border-blue-600 shadow-sm shadow-blue-500/20'
+                              : 'bg-slate-50 text-slate-700 border-slate-200 hover:border-blue-300 hover:bg-blue-50/30'
+                          }`}
+                        >
+                          <span className="truncate">{fType}</span>
+                          <div className="flex items-center justify-between text-[10px]">
+                            <span className={`font-normal ${isSelected ? 'text-blue-100' : 'text-slate-400'}`}>
+                              {tankCount} {tankCount === 1 ? 'Tank' : 'Tanks'}
+                            </span>
+                            {isSelected && <Check className="w-3.5 h-3.5 text-white" />}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Total Delivery Volume Input (Litres) */}
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                    Total Delivery Volume <span className="text-rose-500">*</span>
+                  </label>
+                  {numDeliveryQty > 0 && (
+                    <span className="text-xs font-bold text-blue-700 bg-blue-50 px-2 py-0.5 rounded-md border border-blue-200">
+                      {numDeliveryQty.toLocaleString()} Liters
+                    </span>
+                  )}
+                </div>
+                <div className="relative">
+                  <input
+                    id="purchase-delivery-qty"
+                    type="number"
+                    step="any"
+                    min="0"
+                    value={deliveryQty}
+                    onFocus={(e) => e.target.select()}
+                    onChange={(e) => {
+                      const val = e.target.value === '' ? '' : Number(e.target.value) || '';
+                      handleDeliveryQtyChange(val);
+                    }}
+                    placeholder="e.g. 13200"
+                    className="w-full px-4 py-3 bg-white border-2 border-blue-200 focus:border-blue-600 rounded-xl text-lg font-black text-slate-900 tabular-nums focus:outline-none focus:ring-4 focus:ring-blue-500/10 transition-all placeholder:text-gray-300 shadow-2xs"
+                  />
+                  <span className="absolute right-4 top-1/2 -translate-y-1/2 text-xs font-black text-slate-400 uppercase tracking-wider pointer-events-none">
+                    Liters
+                  </span>
+                </div>
+
+                {/* Quick Sri Lankan CPC Bowser Load Presets */}
+                <div className="mt-2.5">
+                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1.5">
+                    Quick Bowser Presets (CPC Standard)
+                  </span>
+                  <div className="grid grid-cols-4 gap-1.5">
+                    {[6600, 13200, 19800, 33000].map(vol => (
+                      <button
+                        key={vol}
+                        type="button"
+                        onClick={() => handleDeliveryQtyChange(vol)}
+                        className={`py-1.5 px-1 rounded-lg text-[10px] font-extrabold border transition-all cursor-pointer text-center ${
+                          numDeliveryQty === vol
+                            ? 'bg-blue-600 text-white border-blue-600 shadow-2xs'
+                            : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-blue-50 hover:border-blue-200'
+                        }`}
+                      >
+                        {(vol / 1000).toFixed(vol % 1000 === 0 ? 0 : 1)}k L
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* Free Space Dynamic Availability Banner */}
+              <div className="pt-2">
+                {matchingFuelTanks.length === 0 ? (
+                  <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 flex-shrink-0" />
+                    <span>No active storage tanks configured for <strong>{deliveryFuelType}</strong>. Please configure tanks.</span>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    <div className="p-3.5 rounded-xl border border-slate-200 bg-slate-50/70 space-y-2">
+                      <div className="flex items-center justify-between text-xs">
+                        <div className="flex items-center gap-1.5 text-slate-700 font-bold">
+                          <Database className="w-4 h-4 text-blue-600" />
+                          <span>Station Storage</span>
+                        </div>
+                        <span className="text-slate-500 font-medium">
+                          {matchingFuelTanks.length} {deliveryFuelType} {matchingFuelTanks.length === 1 ? 'Tank' : 'Tanks'}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between text-xs pt-1 border-t border-slate-200/60">
+                        <span className="text-slate-600">Combined Free Space:</span>
+                        <span className="font-extrabold text-slate-900 tabular-nums">
+                          {formatLiters(totalMatchingFreeSpace)}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="text-slate-600">Current Unit Rate:</span>
+                        <span className="font-bold text-slate-900 tabular-nums">
+                          {formatCurrency(currentFuelUnitPrice)} / L
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Dynamic Capacity Feedback */}
+                    {numDeliveryQty > 0 && (
+                      <div>
+                        {numDeliveryQty > totalMatchingFreeSpace ? (
+                          <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-800 space-y-1">
+                            <div className="flex items-center gap-1.5 font-bold">
+                              <AlertTriangle className="w-4 h-4 text-rose-600 flex-shrink-0" />
+                              <span>Insufficient Total Station Capacity</span>
+                            </div>
+                            <p className="text-[11px] leading-relaxed text-rose-700">
+                              Delivery volume ({numDeliveryQty.toLocaleString()} L) exceeds total station free capacity ({totalMatchingFreeSpace.toLocaleString()} L) by <strong>{(numDeliveryQty - totalMatchingFreeSpace).toLocaleString()} L</strong>.
+                            </p>
+                          </div>
+                        ) : numDeliveryQty > maxSingleTankFreeSpace && matchingFuelTanks.length > 1 ? (
+                          <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 space-y-1">
+                            <div className="flex items-center gap-1.5 font-bold">
+                              <Info className="w-4 h-4 text-amber-600 flex-shrink-0" />
+                              <span>Multi-Tank Load Required</span>
+                            </div>
+                            <p className="text-[11px] leading-relaxed text-amber-700">
+                              Largest single tank free space is {maxSingleTankFreeSpace.toLocaleString()} L. Allocate portions across the {matchingFuelTanks.length} tanks in Step 2.
+                            </p>
+                          </div>
+                        ) : (
+                          <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-800 flex items-center gap-2 font-semibold">
+                            <CheckCircle2 className="w-4 h-4 text-emerald-600 flex-shrink-0" />
+                            <span>Sufficient free space available ({totalMatchingFreeSpace.toLocaleString()} L total free).</span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* ----------------------------------------------------------------- */}
+            {/* CENTER PANEL (Col 2 - lg:col-span-5): Direct Tank Allocation Cards */}
+            {/* ----------------------------------------------------------------- */}
+            <div className="lg:col-span-5 bg-white rounded-2xl border border-slate-200/90 shadow-xs p-5 space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-100">
+                <span className="inline-flex items-center gap-1.5 text-[11px] font-black uppercase tracking-wider text-slate-800 bg-slate-100 px-2.5 py-1 rounded-lg border border-slate-200">
+                  <Layers className="w-3.5 h-3.5 text-blue-600" />
+                  Step 2: Storage Tank Allocation
+                </span>
+
+                {/* Live Balance Pill */}
+                <div className={`px-2.5 py-1 rounded-lg text-xs font-bold border flex items-center gap-1.5 self-start sm:self-auto ${
+                  isAllocationComplete
+                    ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                    : remainingUnallocated > 0
+                      ? 'bg-amber-50 text-amber-800 border-amber-200'
+                      : 'bg-rose-50 text-rose-800 border-rose-200'
+                }`}>
+                  <span>Allocated: <strong>{formatLiters(totalSplitAllocated)}</strong> / <strong>{numDeliveryQty > 0 ? formatLiters(numDeliveryQty) : '0 L'}</strong></span>
+                  {isAllocationComplete ? (
+                    <span className="text-[10px] px-1.5 py-0.5 bg-emerald-200 text-emerald-900 rounded font-black">✓ Match</span>
+                  ) : remainingUnallocated > 0 ? (
+                    <span className="text-[10px] px-1.5 py-0.5 bg-amber-200 text-amber-900 rounded font-black">{formatLiters(remainingUnallocated)} left</span>
+                  ) : (
+                    <span className="text-[10px] px-1.5 py-0.5 bg-rose-200 text-rose-900 rounded font-black">+{formatLiters(Math.abs(remainingUnallocated))} over</span>
+                  )}
+                </div>
+              </div>
+
+              {/* Tank Cards List with Direct Volume Inputs */}
+              <div className="space-y-3.5">
+                {matchingFuelTanks.length === 0 ? (
+                  <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl text-center text-xs text-slate-500">
+                    No active storage tanks configured for {deliveryFuelType}.
+                  </div>
+                ) : (
+                  matchingFuelTanks.map((tank) => {
+                    const freeSpace = Math.max(0, tank.capacity - tank.currentLevel);
+                    const rawVol = tankAllocations[tank.id];
+                    const vol = typeof rawVol === 'number' ? rawVol : parseFloat(rawVol || '') || 0;
+                    const isExceeded = vol > freeSpace;
+                    const currentPct = Math.min(100, Math.round((tank.currentLevel / tank.capacity) * 100));
+                    const projectedLevel = Math.min(tank.capacity, tank.currentLevel + vol);
+                    const projectedPct = Math.min(100, Math.round((projectedLevel / tank.capacity) * 100));
+
+                    return (
+                      <div
+                        key={tank.id}
+                        className={`p-4 rounded-xl border-2 transition-all space-y-3 ${
+                          isExceeded
+                            ? 'border-rose-300 bg-rose-50/40 shadow-xs'
+                            : vol > 0
+                              ? 'border-blue-500 bg-blue-50/20 shadow-xs'
+                              : 'border-slate-200 bg-white hover:border-slate-300'
+                        }`}
+                      >
+                        {/* Tank Header */}
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <div className="w-7 h-7 rounded-lg bg-blue-50 border border-blue-200 text-blue-700 font-black text-xs flex items-center justify-center">
+                              <Database className="w-3.5 h-3.5" />
+                            </div>
+                            <div>
+                              <h4 className="font-bold text-slate-900 text-xs">{tank.name}</h4>
+                              <span className="text-[10px] text-slate-500 font-medium">Capacity: {formatLiters(tank.capacity)}</span>
+                            </div>
+                          </div>
+
+                          {/* Free Space & Status Badge */}
+                          <div className="text-right">
+                            <span className="text-[10px] font-bold text-slate-500 block">Available Free Space</span>
+                            <span className="text-xs font-black text-emerald-700 tabular-nums">
+                              {formatLiters(freeSpace)}
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Gauge Progress Bar */}
+                        <div className="space-y-1">
+                          <div className="flex items-center justify-between text-[10px] text-slate-500">
+                            <span>Current: <strong>{formatLiters(tank.currentLevel)}</strong> ({currentPct}%)</span>
+                            {vol > 0 && !isExceeded && (
+                              <span className="text-blue-700 font-bold">
+                                Projected: {formatLiters(projectedLevel)} ({projectedPct}%)
+                              </span>
+                            )}
+                          </div>
+                          <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden relative">
+                            {/* Current level bar */}
+                            <div
+                              className="h-full bg-slate-400 rounded-full transition-all duration-300"
+                              style={{ width: `${currentPct}%` }}
+                            />
+                            {/* Projected addition bar overlay */}
+                            {vol > 0 && !isExceeded && (
+                              <div
+                                className="absolute top-0 bottom-0 bg-blue-500 transition-all duration-300 opacity-80"
+                                style={{
+                                  left: `${currentPct}%`,
+                                  width: `${Math.min(100 - currentPct, (vol / tank.capacity) * 100)}%`
+                                }}
+                              />
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Direct Volume Input Field */}
+                        <div className="pt-1 space-y-1.5">
+                          <div className="flex items-center justify-between">
+                            <label className="text-[11px] font-black uppercase tracking-wider text-slate-800">
+                              Unload Volume (Liters)
+                            </label>
+
+                            {/* Quick Fill Actions */}
+                            <div className="flex items-center gap-1">
+                              <button
+                                type="button"
+                                onClick={() => handleSetMaxFreeForTank(tank.id)}
+                                className="px-2 py-0.5 text-[10px] font-bold bg-slate-100 hover:bg-blue-100 hover:text-blue-700 text-slate-700 rounded transition-colors cursor-pointer"
+                                title="Fill available free space"
+                              >
+                                Max Free
+                              </button>
+                              {remainingUnallocated > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleFillRemainderForTank(tank.id)}
+                                  className="px-2 py-0.5 text-[10px] font-bold bg-blue-50 hover:bg-blue-100 text-blue-700 rounded transition-colors cursor-pointer"
+                                  title="Fill remaining balance of the bowser"
+                                >
+                                  + Remainder
+                                </button>
+                              )}
+                              {vol > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleClearTank(tank.id)}
+                                  className="px-1.5 py-0.5 text-[10px] font-bold text-slate-400 hover:text-rose-600 rounded transition-colors cursor-pointer"
+                                  title="Clear allocation"
+                                >
+                                  Clear
+                                </button>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="relative">
+                            <input
+                              id={`purchase-tank-alloc-${tank.id}`}
+                              type="number"
+                              step="any"
+                              min="0"
+                              value={rawVol ?? ''}
+                              onFocus={(e) => e.target.select()}
+                              onChange={(e) => {
+                                const val = e.target.value === '' ? '' : Number(e.target.value) || '';
+                                handleUpdateTankVolume(tank.id, val);
+                              }}
+                              placeholder="0"
+                              className={`w-full px-3.5 py-2.5 bg-white border-2 rounded-xl text-sm font-black tabular-nums focus:outline-none transition-all ${
+                                isExceeded
+                                  ? 'border-rose-400 text-rose-700 focus:ring-4 focus:ring-rose-500/10'
+                                  : vol > 0
+                                    ? 'border-blue-500 text-slate-900 focus:ring-4 focus:ring-blue-500/10'
+                                    : 'border-slate-200 text-slate-900 focus:border-blue-500 focus:ring-4 focus:ring-blue-500/10'
+                              }`}
+                            />
+                            <span className="absolute right-3.5 top-1/2 -translate-y-1/2 text-xs font-black text-slate-400 pointer-events-none">
+                              Liters
+                            </span>
+                          </div>
+
+                          {/* Dynamic Feedback Banner */}
+                          {isExceeded && (
+                            <p className="text-[11px] font-bold text-rose-600 flex items-center gap-1 pt-0.5">
+                              <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
+                              <span>Exceeds available free space ({formatLiters(freeSpace)}) by {(vol - freeSpace).toLocaleString()} L!</span>
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+
+              {/* Center bottom summary */}
+              {numDeliveryQty > 0 && (
+                <div className={`p-3 rounded-xl border text-xs font-semibold flex items-center gap-2 ${
+                  isAllocationComplete && !hasAnyCapacityExceeded
+                    ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                    : hasAnyCapacityExceeded
+                      ? 'bg-rose-50 text-rose-800 border-rose-200'
+                      : 'bg-amber-50 text-amber-800 border-amber-200'
+                }`}>
+                  {isAllocationComplete && !hasAnyCapacityExceeded ? (
+                    <>
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 flex-shrink-0" />
+                      <span>✓ Total {numDeliveryQty.toLocaleString()} L fully allocated with zero capacity overflow.</span>
+                    </>
+                  ) : hasAnyCapacityExceeded ? (
+                    <>
+                      <AlertTriangle className="w-4 h-4 text-rose-600 flex-shrink-0" />
+                      <span>One or more tanks exceed available free space. Adjust volumes to continue.</span>
+                    </>
+                  ) : (
+                    <>
+                      <Info className="w-4 h-4 text-amber-600 flex-shrink-0" />
+                      <span>Please allocate the remaining {remainingUnallocated.toLocaleString()} L across storage tanks.</span>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* ----------------------------------------------------------------- */}
+            {/* RIGHT PANEL (Col 3 - lg:col-span-3): Reference & Confirm Action   */}
+            {/* ----------------------------------------------------------------- */}
+            <div className="lg:col-span-3 bg-white rounded-2xl border border-slate-200/90 shadow-xs p-5 space-y-5 flex flex-col justify-between">
+              <div className="space-y-4">
+                <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+                  <span className="inline-flex items-center gap-1.5 text-[11px] font-black uppercase tracking-wider text-slate-800 bg-slate-100 px-2.5 py-1 rounded-lg border border-slate-200">
+                    <FileText className="w-3.5 h-3.5 text-blue-600" />
+                    Step 3: Reference &amp; Approval
+                  </span>
+                </div>
+
+                {/* Supplier Name */}
+                <div>
+                  <label className="text-xs font-bold text-slate-700 uppercase tracking-wider block mb-1.5">
+                    Supplier Name
+                  </label>
+                  <input
+                    id="purchase-supplier-name"
+                    type="text"
+                    value={deliverySupplier}
+                    onChange={(e) => setDeliverySupplier(e.target.value)}
+                    className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 text-xs font-medium focus:outline-none focus:border-blue-500 focus:bg-white shadow-2xs"
+                    placeholder="e.g. Ceylon Petroleum Corporation"
+                  />
+                </div>
+
+                {/* Invoice / Bowser Ref No */}
+                <div>
+                  <label className="text-xs font-bold text-slate-700 uppercase tracking-wider block mb-1.5">
+                    Invoice / Ref No
+                  </label>
+                  <input
+                    id="purchase-invoice-no"
+                    type="text"
+                    value={deliveryInvoiceNo}
+                    onChange={(e) => setDeliveryInvoiceNo(e.target.value)}
+                    className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 text-xs font-medium focus:outline-none focus:border-blue-500 focus:bg-white shadow-2xs"
+                    placeholder="e.g. INV-2026-8891"
+                  />
+                </div>
+
+                {/* Delivery Date */}
+                <div>
+                  <label className="text-xs font-bold text-slate-700 uppercase tracking-wider block mb-1.5">
+                    Delivery Date
+                  </label>
+                  <input
+                    id="purchase-delivery-date"
+                    type="date"
+                    value={deliveryDate}
+                    onChange={(e) => setDeliveryDate(e.target.value)}
+                    className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 text-xs font-medium focus:outline-none focus:border-blue-500 focus:bg-white shadow-2xs"
+                  />
+                </div>
+
+                {/* Real-time Order Summary Card */}
+                <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/70 space-y-3">
+                  <span className="text-[10px] font-black uppercase tracking-wider text-slate-500 block">
+                    Delivery Order Summary
+                  </span>
+
+                  <div className="space-y-1.5 text-xs">
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-600">Product:</span>
+                      <span className="font-bold text-blue-700">{deliveryFuelType}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-600">Total Volume:</span>
+                      <span className="font-extrabold text-slate-900 tabular-nums">
+                        {numDeliveryQty > 0 ? formatLiters(numDeliveryQty) : '0 L'}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-600">Unit Price:</span>
+                      <span className="font-bold text-slate-800 tabular-nums">
+                        {formatCurrency(currentFuelUnitPrice)} / L
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between pt-2 border-t border-slate-200">
+                      <span className="font-bold text-slate-800">Total Est. Value:</span>
+                      <span className="font-extrabold text-emerald-700 text-sm tabular-nums">
+                        {formatCurrency(estimatedTotalDeliveryCost)}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Target Tanks Destinations Summary */}
+                  <div className="pt-2 border-t border-slate-200/80 text-[11px] text-slate-500">
+                    <span className="font-semibold block text-slate-700 mb-1">Destinations:</span>
+                    {matchingFuelTanks.filter(t => {
+                      const v = tankAllocations[t.id];
+                      return (typeof v === 'number' ? v : parseFloat(v || '') || 0) > 0;
+                    }).length === 0 ? (
+                      <span className="italic text-slate-400">Enter volume in Step 2</span>
+                    ) : (
+                      <div className="space-y-1">
+                        {matchingFuelTanks.filter(t => {
+                          const v = tankAllocations[t.id];
+                          return (typeof v === 'number' ? v : parseFloat(v || '') || 0) > 0;
+                        }).map(t => {
+                          const v = typeof tankAllocations[t.id] === 'number' ? tankAllocations[t.id] : parseFloat(tankAllocations[t.id] || '') || 0;
+                          return (
+                            <div key={t.id} className="flex items-center justify-between">
+                              <span className="text-slate-700 font-medium">{t.name}:</span>
+                              <strong className="text-slate-900 tabular-nums">{formatLiters(v as number)}</strong>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Action Buttons Panel */}
+              <div className="pt-5 space-y-2 border-t border-slate-100">
+                <button
+                  id="btn-confirm-fuel-delivery"
+                  type="button"
+                  onClick={handleAddFuelDeliverySubmit}
+                  disabled={!canConfirmDelivery}
+                  className={`w-full py-3 px-4 rounded-xl font-bold text-xs transition-all flex items-center justify-center gap-2 ${
+                    canConfirmDelivery
+                      ? 'bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-700 hover:to-blue-600 text-white cursor-pointer shadow-sm shadow-blue-500/25'
+                      : 'bg-slate-200 text-slate-400 cursor-not-allowed border border-slate-300/60'
+                  }`}
+                >
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>Confirm Delivery &amp; Receive Stock</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsFuelModalOpen(false);
+                    setFuelModalError(null);
+                  }}
+                  className="w-full py-2.5 px-4 bg-transparent border border-slate-200 hover:bg-slate-50 text-slate-600 font-bold text-xs rounded-xl transition-colors cursor-pointer text-center"
+                >
+                  Cancel &amp; Return to Purchases
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
-      </div>
+      ) : (
+        <>
+          {/* Main Header (Clean standard layout matching other tabs) */}
+          <div id="purchases-header-block" className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div>
+              <h1 className="text-lg font-bold text-slate-900 tracking-tight font-sans">
+                Purchases
+              </h1>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Manage fuel bowser deliveries and lubricant stock replenishment
+              </p>
+            </div>
+
+            {/* Quick Stats Summary */}
+            <div className="hidden sm:flex items-center gap-4 text-xs text-gray-500">
+              <span>Total Fuel Volume: <strong className="text-slate-900 tabular-nums">{formatLiters(totalFuelLiters)}</strong></span>
+              <span>&bull;</span>
+              <span>Total Value: <strong className="text-emerald-700 tabular-nums">{formatCurrency(totalFuelCost + totalLubeValue)}</strong></span>
+            </div>
+          </div>
 
       {/* Top Category Filter Sub-Tabs with Action Button on Top Right */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-gray-200/80 pb-2">
@@ -901,13 +1754,7 @@ export default function PurchasesTab({
         {activeSubTab === 'fuel-bowser' && (
           <button
             id="btn-add-fuel-purchase-top"
-            onClick={() => {
-              setFuelModalError(null);
-              setDeliveryQty('');
-              setDeliveryInvoiceNo('');
-              setDeliverySupplier('Ceylon Petroleum Corporation');
-              setIsFuelModalOpen(true);
-            }}
+            onClick={handleOpenFuelModal}
             className="flex items-center gap-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs rounded-xl transition-all shadow-xs cursor-pointer flex-shrink-0 self-start sm:self-auto"
           >
             <Plus className="w-3.5 h-3.5" />
@@ -958,13 +1805,7 @@ export default function PurchasesTab({
                 <Fuel className="w-8 h-8 mx-auto text-gray-300" />
                 <p className="text-xs">No fuel bowser purchases logged yet.</p>
                 <button
-                  onClick={() => {
-                    setFuelModalError(null);
-                    setDeliveryQty('');
-                    setDeliveryInvoiceNo('');
-                    setDeliverySupplier('Ceylon Petroleum Corporation');
-                    setIsFuelModalOpen(true);
-                  }}
+                  onClick={handleOpenFuelModal}
                   className="inline-flex items-center gap-1.5 text-xs font-bold text-blue-600 hover:underline cursor-pointer"
                 >
                   <Plus className="w-3.5 h-3.5" />
@@ -1001,7 +1842,7 @@ export default function PurchasesTab({
                         supplier: del.supplier || 'Ceylon Petroleum Corporation',
                         invoiceNo: invoiceId,
                         description: `${del.fuelType} Bowser Delivery`,
-                        destination: del.tankName || matchedTank?.name || 'Underground Storage Tank',
+                        destination: del.destination_tank || del.tankName || matchedTank?.name || 'Underground Storage Tank',
                         quantity: del.quantity,
                         unitLabel: 'L',
                         unitPrice: unitRate,
@@ -1024,11 +1865,11 @@ export default function PurchasesTab({
                           </td>
                           <td className="py-3 px-4">
                             <div className="flex items-center gap-2">
-                              <span className="inline-flex px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-50 text-blue-700 border border-blue-200/50">
+                              <span className="inline-flex px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-50 text-blue-700 border border-blue-200/50 flex-shrink-0">
                                 {del.fuelType}
                               </span>
-                              <span className="font-medium text-slate-700 text-[11px]">
-                                {del.tankName || matchedTank?.name || 'Underground Tank'}
+                              <span className="font-medium text-slate-700 text-[11px] truncate max-w-[260px]" title={del.destination_tank || del.tankName || matchedTank?.name || 'Underground Tank'}>
+                                {del.destination_tank || del.tankName || matchedTank?.name || 'Underground Tank'}
                               </span>
                             </div>
                           </td>
@@ -1260,8 +2101,7 @@ export default function PurchasesTab({
                       <th className="py-3 px-4">Invoice No</th>
                       <th className="py-3 px-4">Supplier</th>
                       <th className="py-3 px-4">Cylinder Size</th>
-                      <th className="py-3 px-4 text-right">Full Qty</th>
-                      <th className="py-3 px-4 text-right">Empty Returned</th>
+                      <th className="py-3 px-4 text-right">Full Quantity</th>
                       <th className="py-3 px-4 text-right">Unit Rate (Rs.)</th>
                       <th className="py-3 px-4 text-right">Total Amount (Rs.)</th>
                     </tr>
@@ -1297,9 +2137,6 @@ export default function PurchasesTab({
                             <span className="font-bold text-slate-900">{del.full_quantity}</span>
                           </td>
                           <td className="py-3 px-4 text-right">
-                            <span className="font-medium text-gray-500">{del.empty_returned}</span>
-                          </td>
-                          <td className="py-3 px-4 text-right">
                             <span className="font-medium text-gray-600 text-[11px]">{formatCurrency(del.unit_price)}</span>
                           </td>
                           <td className="py-3 px-4 text-right">
@@ -1316,136 +2153,8 @@ export default function PurchasesTab({
         </div>
       )}
 
-      {/* ========================================================================= */}
-      {/* MODAL 1: FUEL BOWSER PURCHASE MODAL (EXACT EXISTING FORM STRUCTURE) */}
-      {/* ========================================================================= */}
-      {isFuelModalOpen && (
-        <div id="fuel-delivery-modal-overlay" className="fixed inset-0 bg-black/70 backdrop-blur-md flex items-center justify-center z-50 p-4 animate-fade-in">
-          <div id="fuel-delivery-modal-card" className="bg-white rounded-2xl max-w-md w-full shadow-2xl border border-gray-200 overflow-hidden">
-            <div className="px-6 py-4 border-b border-gray-100 bg-gray-50 flex items-center justify-between">
-              <h3 className="font-bold text-[#1C1C1C] text-lg flex items-center gap-2">
-                <ShoppingBag className="w-5 h-5 text-blue-600" />
-                <span>New Fuel Bowser Delivery</span>
-              </h3>
-              <button onClick={() => setIsFuelModalOpen(false)} className="text-gray-500 hover:text-[#1C1C1C] cursor-pointer">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <div className="p-6 space-y-4">
-              {fuelModalError && (
-                <div className="p-3 bg-red-500/10 text-red-600 rounded-xl text-xs flex items-start gap-2 border border-red-500/20">
-                  <AlertTriangle className="w-4 h-4 flex-shrink-0" />
-                  <span>{fuelModalError}</span>
-                </div>
-              )}
-
-              {/* Target Storage Tank Selector */}
-              <div>
-                <label className="text-xs font-bold text-gray-500 uppercase tracking-wider block mb-1.5 flex items-center justify-between">
-                  <span>Target Storage Tank</span>
-                  <span className="text-blue-600 text-[11px] font-bold">Required</span>
-                </label>
-                <select
-                  id="purchase-target-tank"
-                  value={selectedTankId || (sortedTanks[0]?.id || '')}
-                  onChange={(e) => {
-                    const tId = e.target.value;
-                    setSelectedTankId(tId);
-                    const tank = sortedTanks.find(t => t.id === tId);
-                    if (tank) setDeliveryFuelType(tank.fuelType);
-                  }}
-                  className="w-full px-3.5 py-2.5 bg-white border border-gray-200 rounded-xl text-[#1C1C1C] text-sm font-semibold focus:outline-none focus:border-blue-500 cursor-pointer"
-                >
-                  {sortedTanks.map((t) => {
-                    const freeSpace = Math.max(0, t.capacity - t.currentLevel);
-                    return (
-                      <option key={t.id} value={t.id}>
-                        {t.name} ({t.fuelType}) — Free Space: {formatLiters(freeSpace)}
-                      </option>
-                    );
-                  })}
-                </select>
-              </div>
-
-              {/* Volume Quantity to add */}
-              <div>
-                <label className="text-xs font-bold text-gray-500 uppercase tracking-wider block mb-1.5">
-                  Delivery Volume (Liters)
-                </label>
-                <input
-                  id="purchase-delivery-qty"
-                  type="number"
-                  step="0.01"
-                  value={deliveryQty}
-                  onFocus={(e) => e.target.select()}
-                  onChange={(e) => setDeliveryQty(e.target.value === '' ? '' : parseFloat(e.target.value) || 0)}
-                  placeholder="e.g. 5000"
-                  className="w-full px-3.5 py-2.5 bg-white border border-gray-200 rounded-xl text-[#1C1C1C] text-sm tabular-nums font-semibold focus:outline-none focus:border-blue-500"
-                />
-              </div>
-
-              {/* Supplier name */}
-              <div>
-                <label className="text-xs font-bold text-gray-500 uppercase tracking-wider block mb-1.5">
-                  Supplier Name
-                </label>
-                <input
-                  id="purchase-supplier-name"
-                  type="text"
-                  value={deliverySupplier}
-                  onChange={(e) => setDeliverySupplier(e.target.value)}
-                  className="w-full px-3.5 py-2.5 bg-white border border-gray-200 rounded-xl text-[#1C1C1C] text-sm focus:outline-none focus:border-blue-500"
-                  placeholder="e.g. Ceylon Petroleum Corporation"
-                />
-              </div>
-
-              {/* Invoice Number */}
-              <div>
-                <label className="text-xs font-bold text-gray-500 uppercase tracking-wider block mb-1.5">
-                  Invoice / Ref Number
-                </label>
-                <input
-                  id="purchase-invoice-no"
-                  type="text"
-                  value={deliveryInvoiceNo}
-                  onChange={(e) => setDeliveryInvoiceNo(e.target.value)}
-                  className="w-full px-3.5 py-2.5 bg-white border border-gray-200 rounded-xl text-[#1C1C1C] text-sm focus:outline-none focus:border-blue-500"
-                  placeholder="e.g. INV-2026-8891"
-                />
-              </div>
-
-              {/* Delivery Date */}
-              <div>
-                <label className="text-xs font-bold text-gray-500 uppercase tracking-wider block mb-1.5">
-                  Delivery Date
-                </label>
-                <input
-                  id="purchase-delivery-date"
-                  type="date"
-                  value={deliveryDate}
-                  onChange={(e) => setDeliveryDate(e.target.value)}
-                  className="w-full px-3.5 py-2.5 bg-white border border-gray-200 rounded-xl text-[#1C1C1C] text-sm focus:outline-none focus:border-blue-500"
-                />
-              </div>
-            </div>
-
-            <div className="px-6 py-4 bg-gray-50 border-t border-gray-100 flex items-center justify-end gap-3">
-              <button
-                onClick={() => setIsFuelModalOpen(false)}
-                className="px-4 py-2 bg-transparent border border-gray-200 text-gray-600 font-medium text-xs rounded-lg hover:bg-gray-100 cursor-pointer"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleAddFuelDeliverySubmit}
-                className="px-5 py-2 bg-gradient-to-r from-blue-600 to-blue-500 text-white font-bold text-xs rounded-lg hover:brightness-110 transition-all cursor-pointer shadow-sm"
-              >
-                Confirm Purchase &amp; Receive Stock
-              </button>
-            </div>
-          </div>
-        </div>
+      {/* Close subtabs main view fragment when isFuelModalOpen is false */}
+        </>
       )}
 
       {/* ========================================================================= */}
@@ -2146,33 +2855,18 @@ export default function PurchasesTab({
                 </select>
               </div>
 
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1.5 uppercase tracking-wide">
-                    Full Cylinders Received
-                  </label>
-                  <input 
-                    type="number"
-                    min="1"
-                    value={lpGasForm.fullQuantity}
-                    onChange={e => setLPGasForm({...lpGasForm, fullQuantity: e.target.value})}
-                    placeholder="E.g., 50"
-                    className="w-full px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-sm font-medium focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500 transition-all outline-none"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1.5 uppercase tracking-wide">
-                    Empty Cylinders Returned
-                  </label>
-                  <input 
-                    type="number"
-                    min="0"
-                    value={lpGasForm.emptyReturned}
-                    onChange={e => setLPGasForm({...lpGasForm, emptyReturned: e.target.value})}
-                    placeholder="E.g., 50"
-                    className="w-full px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-sm font-medium focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500 transition-all outline-none"
-                  />
-                </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5 uppercase tracking-wide">
+                  Full Cylinders Received (Quantity)
+                </label>
+                <input 
+                  type="number"
+                  min="1"
+                  value={lpGasForm.fullQuantity}
+                  onChange={e => setLPGasForm({...lpGasForm, fullQuantity: e.target.value})}
+                  placeholder="E.g., 50"
+                  className="w-full px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-sm font-medium focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500 transition-all outline-none"
+                />
               </div>
 
               <div>

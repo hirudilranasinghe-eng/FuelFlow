@@ -8,7 +8,8 @@ import {
   Search, Plus, Clock, Fuel, ArrowUpRight, DollarSign, 
   User, CheckCircle, AlertCircle, Sparkles, X, Download, RotateCcw,
   ShieldCheck, Check, Save, AlertTriangle, TrendingUp, RefreshCw,
-  Lock, Unlock, Edit2, ArrowLeft, Users, Package, ChevronDown, CheckSquare, Square, Calendar, Droplet
+  Lock, Unlock, Edit2, ArrowLeft, Users, Package, ChevronDown, CheckSquare, Square, Calendar, Droplet,
+  ArrowRightLeft
 } from 'lucide-react';
 import { supabase, saveCreditSale, saveCardSale, syncCreditAndCardSales, upsertPumpReadings } from '../lib/supabaseClient';
 import { Employee, FuelTank, OilTank, Pump, PumpMachine, PumpReading, Shift, FuelType, ChamberReading } from '../types';
@@ -149,11 +150,25 @@ export default function ShiftManagementTab({
     const defaultCash = netLiters * fuelPrice;
     setModalOutgoingCash(defaultCash);
     
-    setModalReplacementPumperId(reading.replacementPumperId || '');
+    // Find other active pumpers in current shift
+    const activeIds = new Set<string>();
+    draftReadings.forEach(r => {
+      if (r.assignedPumperId) activeIds.add(r.assignedPumperId);
+    });
+    selectedActivePumperIds.forEach(id => activeIds.add(id));
+    const activeReceivers = employees.filter(e => activeIds.has(e.id) && e.id !== reading.assignedPumperId);
+
+    if (reading.replacementPumperId) {
+      setModalReplacementPumperId(reading.replacementPumperId);
+    } else if (activeReceivers.length > 0) {
+      setModalReplacementPumperId(activeReceivers[0].id);
+    } else {
+      setModalReplacementPumperId('');
+    }
     setModalHandoverNotes(reading.handoverNotes || '');
   };
 
-  const handleConfirmHandover = () => {
+  const handleConfirmHandover = async () => {
     if (!handoverPumpModal || !activeShift) return;
 
     const hMeter = Number(modalHandoverMeter) || 0;
@@ -170,38 +185,81 @@ export default function ShiftManagementTab({
     }
 
     const outgoingCash = Number(modalOutgoingCash) || 0;
+    const outgoingPumpId = handoverPumpModal.pumpId;
+    const outgoingPumperId = handoverPumpModal.assignedPumperId;
 
+    // 1. Update outgoing pumper's reading for this pump: set endMeter = hMeter, lock their portion
     const updatedReadings = draftReadings.map(dr => {
-      if (dr.pumpId === handoverPumpModal.pumpId) {
+      const isTarget = handoverPumpModal.id 
+        ? dr.id === handoverPumpModal.id 
+        : (dr.pumpId === outgoingPumpId && dr.assignedPumperId === outgoingPumperId);
+
+      if (isTarget) {
         return {
           ...dr,
+          endMeter: hMeter,
           replacementPumperId: modalReplacementPumperId,
           handoverMeter: hMeter,
           initialPumperCash: outgoingCash,
           handoverNotes: modalHandoverNotes,
-          assignedPumperId: modalReplacementPumperId
+          isCardFinalized: true,
+          isLocked: true,
+          status: 'Completed' as const
         };
       }
       return dr;
     });
 
-    setDraftReadings(updatedReadings);
+    // 2. Append the transferred pump as a NEW separate pump entry under the receiving pumper's assignment list
+    const sourcePumpReading = draftReadings.find(dr => (
+      handoverPumpModal.id 
+        ? dr.id === handoverPumpModal.id 
+        : (dr.pumpId === outgoingPumpId && dr.assignedPumperId === outgoingPumperId)
+    )) || handoverPumpModal;
+    
+    const newTransferredReading: PumpReading = {
+      id: crypto.randomUUID ? crypto.randomUUID() : `transfer_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      pumpId: outgoingPumpId,
+      pumpName: handoverPumpModal.pumpName,
+      fuelType: handoverPumpModal.fuelType,
+      tankId: sourcePumpReading.tankId || '',
+      assignedPumperId: modalReplacementPumperId,
+      startMeter: hMeter,
+      endMeter: hMeter,
+      testingQty: 0,
+      status: 'Active' as const,
+      isLocked: false,
+      isStartSaved: true,
+      isCardFinalized: false,
+      unitPrice: sourcePumpReading.unitPrice || getPriceForFuelType(handoverPumpModal.fuelType),
+      creditSalesAmount: 0,
+      cardSalesAmount: 0,
+      oilSalesAmount: 0,
+      actualCash: 0
+    };
+
+    const finalReadings = [...updatedReadings, newTransferredReading];
+    setDraftReadings(finalReadings);
+
+    if (modalReplacementPumperId && !selectedActivePumperIds.includes(modalReplacementPumperId)) {
+      setSelectedActivePumperIds(prev => Array.from(new Set([...prev, modalReplacementPumperId])));
+    }
 
     let totalFuel = 0;
     let totalNet = 0;
     let totalSales = 0;
-
-    updatedReadings.forEach(dr => {
-      const fuel = Math.max(0, dr.endMeter - dr.startMeter);
-      const net = Math.max(0, fuel - dr.testingQty);
+    finalReadings.forEach(dr => {
+      const isOil = dr.pumpId === 'pump-oil-bay' || dr.fuelType === 'Oil & Lubricants' || dr.pumpName?.toLowerCase().includes('oil');
+      const fuel = isOil ? 0 : Math.max(0, dr.endMeter - dr.startMeter);
+      const net = isOil ? 0 : Math.max(0, fuel - dr.testingQty);
       totalFuel += fuel;
       totalNet += net;
-      totalSales += (net * getPriceForFuelType(dr.fuelType));
+      totalSales += (net * getPriceForFuelType(dr.fuelType)) + (dr.oilSalesAmount || 0);
     });
 
     setActiveShift({
       ...activeShift,
-      pumpReadings: updatedReadings,
+      pumpReadings: finalReadings,
       totalFuelSold: totalFuel,
       totalNetSold: totalNet,
       totalNetSales: totalSales,
@@ -209,8 +267,14 @@ export default function ShiftManagementTab({
       replacementPumperId: modalReplacementPumperId
     });
 
+    try {
+      await upsertPumpReadings(supabase, finalReadings, activeShift.id);
+    } catch (err) {
+      console.warn('Error syncing handover readings to Supabase:', err);
+    }
+
     const replacementPumperName = employees.find(e => e.id === modalReplacementPumperId)?.name || 'Replacement Pumper';
-    setToastMessage(`Mid-shift transfer recorded for ${handoverPumpModal.pumpName}! Replacement Pumper: ${replacementPumperName}`);
+    setToastMessage(`Mid-shift transfer recorded for ${handoverPumpModal.pumpName}! Appended to ${replacementPumperName}.`);
     setTimeout(() => setToastMessage(null), 4000);
 
     setHandoverPumpModal(null);
@@ -273,8 +337,14 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
 };
 
   // Sync draft states when activeShift changes
+  const lastSyncedShiftIdRef = React.useRef<string | null>(null);
+
   React.useEffect(() => {
     if (activeShift) {
+      if (lastSyncedShiftIdRef.current === activeShift.id) {
+        return;
+      }
+      lastSyncedShiftIdRef.current = activeShift.id;
       const availablePumpsList = pumps || [];
       const availablePumps = availablePumpsList.some(p => p.id === 'pump-oil-bay')
         ? availablePumpsList
@@ -393,6 +463,7 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       setLockedEndMeters(initialLockedEnds);
       setFinalizedPumperCards(initialFinalized);
     } else {
+      lastSyncedShiftIdRef.current = null;
       setDraftReadings([]);
       setDraftSupervisorId('');
       setDraftShiftName('');
@@ -406,7 +477,7 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       setLockedEndMeters({});
       setFinalizedPumperCards({});
     }
-  }, [activeShift, pumps, tanks, oilTanks]);
+  }, [activeShift?.id, pumps, tanks, oilTanks]);
 
   // Fetch latest recorded end meters for pumps from Supabase for automatic start meter carryover
   const [supabaseLatestMeters, setSupabaseLatestMeters] = React.useState<Record<string, number>>({});
@@ -496,7 +567,7 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
     };
 
     fetchClosedShiftsFromSupabase();
-  }, [activeShift, shiftHistory, employees]);
+  }, [shiftHistory, employees]);
 
   React.useEffect(() => {
     const fetchLatestReadingsFromSupabase = async () => {
@@ -919,12 +990,17 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
   const handleUpdateReading = (
     pumpId: string,
     field: 'assignedPumperId' | 'startMeter' | 'endMeter' | 'testingQty' | 'actualCash' | 'creditSalesAmount' | 'cardSalesAmount' | 'oilSalesAmount',
-    value: any
+    value: any,
+    targetReadingIdOrPumperId?: string
   ) => {
     if (!activeShift) return;
 
     const updatedReadings = draftReadings.map(r => {
-      if (r.pumpId === pumpId) {
+      const isTarget = targetReadingIdOrPumperId 
+        ? (r.id === targetReadingIdOrPumperId || (r.pumpId === pumpId && r.assignedPumperId === targetReadingIdOrPumperId))
+        : (r.pumpId === pumpId);
+
+      if (isTarget) {
         // Block editing if this entire pumper card is finalized
         if (r.assignedPumperId && finalizedPumperCards[r.assignedPumperId]) {
           return r;
@@ -1882,9 +1958,15 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
           .map(r => r.assignedPumperId)
           .filter((id): id is string => !!id)
       ));
-      setSelectedActivePumperIds(prev => Array.from(new Set([...prev, ...activePumperIds])));
+      setSelectedActivePumperIds(prev => {
+        const next = Array.from(new Set([...prev, ...activePumperIds]));
+        if (next.length === prev.length && next.every(id => prev.includes(id))) {
+          return prev;
+        }
+        return next;
+      });
     }
-  }, [activeShift, draftReadings]);
+  }, [activeShift?.id, draftReadings]);
 
   // Derive Pumper Cards Data
   const pumperCardsData = useMemo(() => {
@@ -2624,15 +2706,28 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                           </span>
                                         )}
                                       </div>
-                                      {!isPumperFinalized && (
-                                        <button
-                                          onClick={() => handleAssignPumpToPumper(r.pumpId, null)}
-                                          className="p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
-                                          title="Unassign Pump"
-                                        >
-                                          <X className="w-3.5 h-3.5" />
-                                        </button>
-                                      )}
+                                      <div className="flex items-center gap-1.5 shrink-0">
+                                        {!isPumperFinalized && !r.isCardFinalized && (
+                                          <button
+                                            type="button"
+                                            onClick={() => handleOpenHandoverModal(r)}
+                                            className="flex items-center gap-1 text-xs bg-amber-500 hover:bg-amber-600 text-white px-2 py-1 rounded transition-colors shadow-2xs font-semibold cursor-pointer"
+                                            title="Transfer / Handover Pump to another Pumper"
+                                          >
+                                            <ArrowRightLeft className="w-3 h-3" />
+                                            <span>Handover</span>
+                                          </button>
+                                        )}
+                                        {!isPumperFinalized && (
+                                          <button
+                                            onClick={() => handleAssignPumpToPumper(r.pumpId, null)}
+                                            className="p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
+                                            title="Unassign Pump"
+                                          >
+                                            <X className="w-3.5 h-3.5" />
+                                          </button>
+                                        )}
+                                      </div>
                                     </div>
 
                                     {/* Meter Inputs */}
@@ -3645,23 +3740,44 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                 />
               </div>
 
-              {/* Replacement Pumper Selection */}
+              {/* Replacement / Receiving Pumper Selection */}
               <div>
                 <label className="text-[10px] font-bold text-gray-500 uppercase tracking-wider block mb-1">
-                  Select Replacement Pumper (Incoming)
+                  Select Receiving Pumper (Active in Shift)
                 </label>
-                <select
-                  value={modalReplacementPumperId}
-                  onChange={(e) => setModalReplacementPumperId(e.target.value)}
-                  className="w-full px-3.5 py-2.5 bg-white border border-gray-300 rounded-xl text-xs font-bold text-[#1C1C1C] focus:outline-none focus:border-blue-500"
-                >
-                  <option value="">-- Select Replacement Pumper --</option>
-                  {pumpers.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name}
-                    </option>
-                  ))}
-                </select>
+                {(() => {
+                  const activeIds = new Set<string>();
+                  draftReadings.forEach(r => {
+                    if (r.assignedPumperId) activeIds.add(r.assignedPumperId);
+                  });
+                  selectedActivePumperIds.forEach(id => activeIds.add(id));
+                  const activeShiftReceivers = employees.filter(e => activeIds.has(e.id) && e.id !== handoverPumpModal.assignedPumperId);
+                  const availableOptions = activeShiftReceivers.length > 0
+                    ? activeShiftReceivers
+                    : pumpers.filter(p => p.id !== handoverPumpModal.assignedPumperId);
+
+                  return (
+                    <>
+                      <select
+                        value={modalReplacementPumperId}
+                        onChange={(e) => setModalReplacementPumperId(e.target.value)}
+                        className="w-full px-3.5 py-2.5 bg-white border border-gray-300 rounded-xl text-xs font-bold text-[#1C1C1C] focus:outline-none focus:border-blue-500"
+                      >
+                        <option value="">-- Select Receiving Pumper --</option>
+                        {availableOptions.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.name} {activeShiftReceivers.some(ar => ar.id === p.id) ? '(Active in Shift)' : ''}
+                          </option>
+                        ))}
+                      </select>
+                      {activeShiftReceivers.length === 0 && (
+                        <p className="text-[10px] text-amber-600 mt-1 font-medium">
+                          Note: No other active pumpers added to shift yet. Showing available staff.
+                        </p>
+                      )}
+                    </>
+                  );
+                })()}
               </div>
 
               {/* Handover / Reason Notes */}
