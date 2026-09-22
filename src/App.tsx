@@ -144,6 +144,9 @@ export default function App() {
     setUser(null);
     try {
       localStorage.removeItem('fms_user');
+      localStorage.removeItem('fuelflow_user');
+      localStorage.removeItem('supabase.auth.token');
+      sessionStorage.clear();
     } catch (_) {}
   };
 
@@ -1327,14 +1330,6 @@ export default function App() {
         initialpumpercash: shiftData.initialPumperCash || 0,
         replacementpumpercash: shiftData.replacementPumperCash || 0,
         totalphysicalcash: shiftData.totalPhysicalCash || 0,
-        credit_sales: shiftData.creditSales || (shiftData as any).credit_sales || 0,
-        card_sales: shiftData.cardSales || (shiftData as any).card_sales || 0,
-        touch_card_sales: shiftData.touchCardSales || (shiftData as any).touch_card_sales || 0,
-        voucher_sales: shiftData.voucherSales || (shiftData as any).voucher_sales || 0,
-        creditsales: shiftData.creditSales || (shiftData as any).credit_sales || 0,
-        cardsales: shiftData.cardSales || (shiftData as any).card_sales || 0,
-        touchcardsales: shiftData.touchCardSales || (shiftData as any).touch_card_sales || 0,
-        vouchersales: shiftData.voucherSales || (shiftData as any).voucher_sales || 0,
         cashvariance: shiftData.cashVariance || 0,
         cash_banked: cashBankedVal,
         cashbanked: cashBankedVal,

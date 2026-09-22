@@ -15,8 +15,9 @@ interface LoginPageProps {
 }
 
 export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
-  const [email, setEmail] = useState('admin@fuelflow.lk');
-  const [password, setPassword] = useState('admin123');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [rememberMe, setRememberMe] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -285,7 +286,7 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
           )}
 
           {/* Auth Form */}
-          <form onSubmit={handleLogin} className="space-y-4">
+          <form onSubmit={handleLogin} autoComplete="off" className="space-y-4">
             <div>
               <label className="block text-[11px] font-extrabold text-slate-700 mb-1.5 uppercase tracking-wider">
                 Username / Email
@@ -298,6 +299,11 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   placeholder="name@example.com"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                  name="user_email_field"
                   className="w-full pl-10 pr-4 py-3 bg-slate-50/70 border border-slate-200 focus:bg-white focus:border-emerald-600 focus:ring-2 focus:ring-emerald-500/20 rounded-xl text-sm font-semibold text-slate-900 outline-none transition-all"
                 />
               </div>
@@ -315,6 +321,8 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="••••••••"
+                  autoComplete="new-password"
+                  name="user_password_field"
                   className="w-full pl-10 pr-10 py-3 bg-slate-50/70 border border-slate-200 focus:bg-white focus:border-emerald-600 focus:ring-2 focus:ring-emerald-500/20 rounded-xl text-sm font-semibold text-slate-900 outline-none transition-all"
                 />
                 <button
@@ -332,7 +340,8 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
               <label className="flex items-center gap-2 cursor-pointer select-none text-slate-600 font-medium">
                 <input
                   type="checkbox"
-                  defaultChecked
+                  checked={rememberMe}
+                  onChange={(e) => setRememberMe(e.target.checked)}
                   className="w-4 h-4 rounded text-emerald-600 focus:ring-emerald-500/20 border-slate-300"
                 />
                 <span>Remember me</span>
