@@ -1,7 +1,44 @@
 import { supabase, getTanksTableName } from './supabase';
-import { PumpReading, FuelTank, OilTank, Customer, CustomerLedgerEntry } from '../types';
+import { PumpReading, FuelTank, OilTank, Customer, CustomerLedgerEntry, Shift } from '../types';
 
 export { supabase };
+
+/**
+ * Determines if a pump/nozzle was actively assigned to a pumper or had active usage during the shift.
+ * Unassigned nozzles with zero meter delta and zero sales/collections are considered inactive.
+ */
+export function isPumpReadingActiveOrAssigned(r: PumpReading): boolean {
+  if (!r) return false;
+  const hasAssignedPumper = Boolean(
+    r.assignedPumperId && 
+    typeof r.assignedPumperId === 'string' && 
+    r.assignedPumperId.trim() !== '' && 
+    r.assignedPumperId !== 'null' && 
+    r.assignedPumperId !== 'undefined'
+  );
+  const hasReplacementPumper = Boolean(
+    r.replacementPumperId && 
+    typeof r.replacementPumperId === 'string' && 
+    r.replacementPumperId.trim() !== '' && 
+    r.replacementPumperId !== 'null' && 
+    r.replacementPumperId !== 'undefined'
+  );
+  const endMeter = Number(r.endMeter) || 0;
+  const startMeter = Number(r.startMeter) || 0;
+  const testingQty = Number(r.testingQty) || 0;
+  const dispensed = Math.max(0, endMeter - startMeter - testingQty);
+  const hasMeterActivity = (endMeter > 0 && endMeter > startMeter) || testingQty > 0;
+  const hasSales = (Number(r.oilSalesAmount) || 0) > 0 ||
+                   (Number(r.creditSalesAmount) || 0) > 0 ||
+                   (Number(r.cardSalesAmount) || 0) > 0 ||
+                   (Number(r.touchCardSalesAmount) || 0) > 0 ||
+                   (Number(r.voucherSalesAmount) || 0) > 0;
+  const hasCash = (Number(r.actualCash) || 0) > 0 ||
+                  (Number(r.initialPumperCash) || 0) > 0 ||
+                  (Number(r.replacementPumperCash) || 0) > 0;
+
+  return hasAssignedPumper || hasReplacementPumper || dispensed > 0 || hasMeterActivity || hasSales || hasCash;
+}
 
 /**
  * Ensures a valid non-null UUID or string ID for pump readings.
@@ -49,7 +86,10 @@ export function formatPumpReadingSnakeCase(r: PumpReading, shiftId: string) {
   const totalGross = grossFuel + oilSales;
   const creditSales = r.creditSalesAmount || 0;
   const cardSales = r.cardSalesAmount || 0;
-  const netExpCash = Math.max(0, totalGross - (creditSales + cardSales));
+  const touchCardSales = r.touchCardSalesAmount || 0;
+  const voucherSales = r.voucherSalesAmount || 0;
+  const totalNonCash = creditSales + cardSales + touchCardSales + voucherSales;
+  const netExpCash = Math.max(0, totalGross - totalNonCash);
 
   return {
     id: getValidReadingId(r, shiftId),
@@ -73,6 +113,8 @@ export function formatPumpReadingSnakeCase(r: PumpReading, shiftId: string) {
     cash_variance: r.cashVariance || 0,
     credit_sales_amount: creditSales,
     card_sales_amount: cardSales,
+    touch_card_sales_amount: touchCardSales,
+    voucher_sales_amount: voucherSales,
     oil_sales_amount: oilSales,
     net_expected_cash: netExpCash
   };
@@ -89,7 +131,10 @@ export function formatPumpReadingLowerCase(r: PumpReading, shiftId: string) {
   const totalGross = grossFuel + oilSales;
   const creditSales = r.creditSalesAmount || 0;
   const cardSales = r.cardSalesAmount || 0;
-  const netExpCash = Math.max(0, totalGross - (creditSales + cardSales));
+  const touchCardSales = r.touchCardSalesAmount || 0;
+  const voucherSales = r.voucherSalesAmount || 0;
+  const totalNonCash = creditSales + cardSales + touchCardSales + voucherSales;
+  const netExpCash = Math.max(0, totalGross - totalNonCash);
 
   return {
     id: getValidReadingId(r, shiftId),
@@ -113,6 +158,8 @@ export function formatPumpReadingLowerCase(r: PumpReading, shiftId: string) {
     cashvariance: r.cashVariance || 0,
     creditsalesamount: creditSales,
     cardsalesamount: cardSales,
+    touchcardsalesamount: touchCardSales,
+    vouchersalesamount: voucherSales,
     oilsalesamount: oilSales,
     netexpectedcash: netExpCash
   };
@@ -137,6 +184,89 @@ export function formatPumpReadingMinimal(r: PumpReading, shiftId: string) {
     islocked: r.isLocked ?? false,
     unitprice: r.unitPrice || 0
   };
+}
+
+/**
+ * Inserts detailed shift log records ONLY for nozzles/dispensers that were actively assigned or used during the shift.
+ * Skips unassigned / inactive nozzles to prevent dummy records in 'shift_logs'.
+ */
+export async function saveShiftLogs(client: any, shift: Shift, readings: PumpReading[]) {
+  if (!readings || readings.length === 0 || !shift || !shift.id) return { data: null, error: null };
+
+  const activeReadings = readings.filter(isPumpReadingActiveOrAssigned);
+  if (activeReadings.length === 0) return { data: null, error: null };
+
+  const closedTime = shift.endTime || new Date().toISOString();
+
+  const shiftLogsToInsert = activeReadings.map(r => {
+    const fuel = Math.max(0, (r.endMeter || 0) - (r.startMeter || 0));
+    const net = Math.max(0, fuel - (r.testingQty || 0));
+    const rate = r.unitPrice || 0;
+    const grossFuelRev = net * rate;
+    const oilSales = r.oilSalesAmount || 0;
+    const totalGrossRev = grossFuelRev + oilSales;
+    const creditAmt = r.creditSalesAmount || 0;
+    const cardAmt = r.cardSalesAmount || 0;
+    const touchAmt = r.touchCardSalesAmount || 0;
+    const voucherAmt = r.voucherSalesAmount || 0;
+    const expectedCash = Math.max(0, totalGrossRev - (creditAmt + cardAmt + touchAmt + voucherAmt));
+    const actCash = r.actualCash || 0;
+    const pVariance = r.cashVariance ?? (actCash - expectedCash);
+
+    return {
+      id: `log_${shift.id}_${r.pumpId}_${Date.now()}`,
+      shift_id: shift.id,
+      shift_name: shift.name,
+      supervisor_id: shift.supervisorId,
+      pump_id: r.pumpId,
+      pump_name: r.pumpName,
+      fuel_type: r.fuelType,
+      assigned_pumper_id: r.assignedPumperId || null,
+      replacement_pumper_id: r.replacementPumperId || null,
+      start_meter: r.startMeter || 0,
+      end_meter: r.endMeter || 0,
+      testing_qty: r.testingQty || 0,
+      net_liters: net,
+      unit_price: rate,
+      gross_revenue: totalGrossRev,
+      oil_sales_amount: oilSales,
+      credit_sales_amount: creditAmt,
+      card_sales_amount: cardAmt,
+      touch_card_sales_amount: touchAmt,
+      voucher_sales_amount: voucherAmt,
+      expected_cash: expectedCash,
+      actual_cash: actCash,
+      cash_variance: pVariance,
+      closed_at: closedTime
+    };
+  });
+
+  try {
+    const { data, error } = await client.from('shift_logs').insert(shiftLogsToInsert);
+    if (error && (error.code === '42703' || error.message?.includes('column'))) {
+      const basicLogs = shiftLogsToInsert.map(log => ({
+        id: log.id,
+        shift_id: log.shift_id,
+        pump_id: log.pump_id,
+        pump_name: log.pump_name,
+        fuel_type: log.fuel_type,
+        start_meter: log.start_meter,
+        end_meter: log.end_meter,
+        testing_qty: log.testing_qty,
+        net_liters: log.net_liters,
+        unit_price: log.unit_price,
+        gross_revenue: log.gross_revenue,
+        expected_cash: log.expected_cash,
+        actual_cash: log.actual_cash,
+        cash_variance: log.cash_variance
+      }));
+      return await client.from('shift_logs').insert(basicLogs);
+    }
+    return { data, error };
+  } catch (err: any) {
+    console.warn("Supabase shift_logs insert notice:", err?.message || err);
+    return { data: null, error: err };
+  }
 }
 
 /**
@@ -166,8 +296,9 @@ export async function upsertPumpReadings(client: any, readings: PumpReading[], s
     }
   }
 
-  // Explicitly sync non-cash credit_sales and card_sales in parallel
+  // Explicitly sync non-cash credit_sales, card_sales, touch_card_sales, and voucher_sales in parallel
   syncCreditAndCardSales(client, readings, shiftId);
+  syncTouchCardAndVoucherSales(client, readings, shiftId);
 
   return { data, error };
 }
@@ -260,23 +391,6 @@ export async function saveCreditSale(client: any, payload: {
       }
     }
 
-    // Fallback 3: If credit_sales table missing in schema cache (PGRST205), use pumper_non_cash_sales
-    if (error.code === 'PGRST205' || error.message?.includes('schema cache') || error.message?.includes('Could not find')) {
-      const nonCashRecord: any = {
-        id: recordId,
-        shift_id: payload.shift_id,
-        pump_id: payload.pump_id,
-        payment_type: 'CREDIT',
-        amount: Number(payload.amount),
-        notes: payload.customer_name || 'Credit Sale'
-      };
-      const { data: d4, error: e4 } = await client.from('pumper_non_cash_sales').upsert([nonCashRecord], { onConflict: 'id' });
-      if (!e4) {
-        console.log("Credit Sale Saved Successfully (via non-cash sales table):", d4 || [nonCashRecord]);
-        return { data: d4, error: null };
-      }
-    }
-
     console.warn("Credit Sale Sync Notice (saved via pump_readings):", error.message || error);
     return { data: [fullRecord], error: null };
   } catch (err: any) {
@@ -316,38 +430,31 @@ export async function saveCardSale(client: any, payload: {
       return { data: data || [record], error: null };
     }
 
-    // Fallback 1: If column names differ or syntax error (22P02 / 42703)
-    if (error.code === '42703' || error.code === '22P02' || error.message?.includes('column') || error.message?.includes('syntax')) {
+    // Fallback 1: If column names differ or syntax error (22P02 / 42703 / PGRST204)
+    if (error.code === '42703' || error.code === '22P02' || error.code === 'PGRST204' || error.message?.includes('column') || error.message?.includes('syntax')) {
+      const minRecord: any = {
+        id: recordId,
+        shift_id: payload.shift_id,
+        pump_id: payload.pump_id,
+        amount: Number(payload.amount)
+      };
+      const { data: d1, error: e1 } = await client.from('card_sales').upsert([minRecord], { onConflict: 'id' });
+      if (!e1) {
+        console.log("Card Sale Saved Successfully (minimal schema):", d1 || [minRecord]);
+        return { data: d1 || [minRecord], error: null };
+      }
+
       const altRecord: any = {
         id: recordId,
         shift_id: payload.shift_id,
         pumpid: payload.pump_id,
         cardtype: cardType,
-        amount: Number(payload.amount),
-        status: payload.status || 'Settled'
+        amount: Number(payload.amount)
       };
       const { data: d2, error: e2 } = await client.from('card_sales').upsert([altRecord], { onConflict: 'id' });
       if (!e2) {
-        console.log("Card Sale Saved Successfully:", d2 || [altRecord]);
-        return { data: d2, error: null };
-      }
-    }
-
-    // Fallback 2: If card_sales table missing in schema cache (PGRST205), use pumper_non_cash_sales
-    if (error.code === 'PGRST205' || error.message?.includes('schema cache') || error.message?.includes('Could not find')) {
-      const nonCashRecord: any = {
-        id: recordId,
-        shift_id: payload.shift_id,
-        pump_id: payload.pump_id,
-        payment_type: 'CARD',
-        amount: Number(payload.amount),
-        reference_no: cardType,
-        notes: 'POS Card Sale'
-      };
-      const { data: d3, error: e3 } = await client.from('pumper_non_cash_sales').upsert([nonCashRecord], { onConflict: 'id' });
-      if (!e3) {
-        console.log("Card Sale Saved Successfully (via non-cash sales table):", d3 || [nonCashRecord]);
-        return { data: d3, error: null };
+        console.log("Card Sale Saved Successfully (alt schema):", d2 || [altRecord]);
+        return { data: d2 || [altRecord], error: null };
       }
     }
 
@@ -356,6 +463,293 @@ export async function saveCardSale(client: any, payload: {
   } catch (err: any) {
     console.warn("Card Sale Sync Notice (saved via pump_readings):", err?.message || err);
     return { data: [record], error: null };
+  }
+}
+
+/**
+ * Direct explicit upsert for a Touch Card Sale into Supabase 'touch_card_sales' table with schema fallback.
+ */
+export async function saveTouchCardSale(client: any, payload: {
+  id?: string;
+  shift_id: string;
+  pump_id: string;
+  pumper_id?: string | null;
+  card_type?: string;
+  amount: number;
+  status?: string;
+}) {
+  if (!payload.amount || payload.amount <= 0) return { data: null, error: null };
+  const recordId = getDeterministicUUID('touchcard', payload.shift_id, payload.pump_id, payload.id);
+  const cardType = payload.card_type || 'Touch Card';
+
+  // Primary record without 'status' (which does not exist on touch_card_sales)
+  const record: any = {
+    id: recordId,
+    shift_id: payload.shift_id,
+    pump_id: payload.pump_id,
+    amount: Number(payload.amount)
+  };
+  if (payload.pumper_id) record.pumper_id = payload.pumper_id;
+  if (cardType) record.card_type = cardType;
+
+  try {
+    const { data, error } = await client.from('touch_card_sales').upsert([record], { onConflict: 'id' });
+    if (!error) {
+      console.log("Touch Card Sale Saved Successfully:", data || [record]);
+      return { data: data || [record], error: null };
+    }
+
+    // Fallback 1: If card_type or pumper_id not in schema (PGRST204 / 42703), use minimal record
+    if (error.code === 'PGRST204' || error.code === '42703' || error.message?.includes('column')) {
+      const minRecord = {
+        id: recordId,
+        shift_id: payload.shift_id,
+        pump_id: payload.pump_id,
+        amount: Number(payload.amount)
+      };
+      const { data: d1, error: e1 } = await client.from('touch_card_sales').upsert([minRecord], { onConflict: 'id' });
+      if (!e1) {
+        console.log("Touch Card Sale Saved Successfully (minimal schema):", d1 || [minRecord]);
+        return { data: d1 || [minRecord], error: null };
+      }
+
+      // Fallback 2: lowercase column names if database uses unquoted lower case
+      const altRecord: any = {
+        id: recordId,
+        shift_id: payload.shift_id,
+        pumpid: payload.pump_id,
+        amount: Number(payload.amount)
+      };
+      const { data: d2, error: e2 } = await client.from('touch_card_sales').upsert([altRecord], { onConflict: 'id' });
+      if (!e2) {
+        console.log("Touch Card Sale Saved Successfully (alt schema):", d2 || [altRecord]);
+        return { data: d2 || [altRecord], error: null };
+      }
+    }
+
+    console.warn("Touch Card Sale Notice (saved via pump_readings):", error.message || error);
+    return { data: [record], error: null };
+  } catch (err: any) {
+    console.warn("Touch Card Sale Notice (saved via pump_readings):", err?.message || err);
+    return { data: [record], error: null };
+  }
+}
+
+/**
+ * Direct explicit upsert for a Voucher Sale into Supabase 'voucher_sales' table with schema fallback.
+ */
+export async function saveVoucherSale(client: any, payload: {
+  id?: string;
+  shift_id: string;
+  pump_id: string;
+  pumper_id?: string | null;
+  voucher_no?: string;
+  amount: number;
+  status?: string;
+}) {
+  if (!payload.amount || payload.amount <= 0) return { data: null, error: null };
+  const recordId = getDeterministicUUID('voucher', payload.shift_id, payload.pump_id, payload.id);
+  const voucherNo = payload.voucher_no || `VOUCH-${Date.now().toString().slice(-6)}`;
+
+  // Primary record without 'status' (which does not exist on voucher_sales)
+  const record: any = {
+    id: recordId,
+    shift_id: payload.shift_id,
+    pump_id: payload.pump_id,
+    amount: Number(payload.amount)
+  };
+  if (payload.pumper_id) record.pumper_id = payload.pumper_id;
+  if (voucherNo) record.voucher_no = voucherNo;
+
+  try {
+    const { data, error } = await client.from('voucher_sales').upsert([record], { onConflict: 'id' });
+    if (!error) {
+      console.log("Voucher Sale Saved Successfully:", data || [record]);
+      return { data: data || [record], error: null };
+    }
+
+    // Fallback 1: If voucher_no or pumper_id not in schema (PGRST204 / 42703), use minimal record
+    if (error.code === 'PGRST204' || error.code === '42703' || error.message?.includes('column')) {
+      const minRecord = {
+        id: recordId,
+        shift_id: payload.shift_id,
+        pump_id: payload.pump_id,
+        amount: Number(payload.amount)
+      };
+      const { data: d1, error: e1 } = await client.from('voucher_sales').upsert([minRecord], { onConflict: 'id' });
+      if (!e1) {
+        console.log("Voucher Sale Saved Successfully (minimal schema):", d1 || [minRecord]);
+        return { data: d1 || [minRecord], error: null };
+      }
+
+      // Fallback 2: lowercase column names if database uses unquoted lower case
+      const altRecord: any = {
+        id: recordId,
+        shift_id: payload.shift_id,
+        pumpid: payload.pump_id,
+        amount: Number(payload.amount)
+      };
+      const { data: d2, error: e2 } = await client.from('voucher_sales').upsert([altRecord], { onConflict: 'id' });
+      if (!e2) {
+        console.log("Voucher Sale Saved Successfully (alt schema):", d2 || [altRecord]);
+        return { data: d2 || [altRecord], error: null };
+      }
+    }
+
+    console.warn("Voucher Sale Notice (saved via pump_readings):", error.message || error);
+    return { data: [record], error: null };
+  } catch (err: any) {
+    console.warn("Voucher Sale Notice (saved via pump_readings):", err?.message || err);
+    return { data: [record], error: null };
+  }
+}
+
+/**
+ * Performs direct inserts into touch_card_sales and voucher_sales tables in Supabase for pump readings with Touch Card / Voucher entries.
+ */
+export async function syncTouchCardAndVoucherSales(client: any, readings: PumpReading[], shiftId: string) {
+  if (!readings || readings.length === 0 || !shiftId) return;
+
+  for (const r of readings) {
+    if ((r.touchCardSalesAmount || 0) > 0) {
+      await saveTouchCardSale(client, {
+        shift_id: shiftId,
+        pump_id: r.pumpId,
+        pumper_id: r.assignedPumperId,
+        amount: r.touchCardSalesAmount || 0,
+        card_type: 'Touch Card'
+      });
+    }
+
+    if ((r.voucherSalesAmount || 0) > 0) {
+      await saveVoucherSale(client, {
+        shift_id: shiftId,
+        pump_id: r.pumpId,
+        pumper_id: r.assignedPumperId,
+        amount: r.voucherSalesAmount || 0,
+        voucher_no: `VOUCH-${Date.now().toString().slice(-6)}`
+      });
+    }
+  }
+}
+
+/**
+ * Syncs all non-cash sales (credit, card, touch card, voucher) to their respective tables in Supabase.
+ */
+export async function syncAllNonCashSales(client: any, readings: PumpReading[], shiftId: string) {
+  await Promise.all([
+    syncCreditAndCardSales(client, readings, shiftId),
+    syncTouchCardAndVoucherSales(client, readings, shiftId)
+  ]);
+}
+
+/**
+ * Fetches credit sales for a given shift ID from Supabase.
+ */
+export async function fetchCreditSalesByShift(client: any, shiftId: string): Promise<any[]> {
+  if (!shiftId) return [];
+  try {
+    const { data, error } = await client
+      .from('credit_sales')
+      .select('*')
+      .eq('shift_id', shiftId);
+
+    if (!error && data && data.length > 0) return data;
+
+    const { data: altData, error: altErr } = await client
+      .from('credit_sales')
+      .select('*')
+      .eq('shiftid', shiftId);
+
+    if (!altErr && altData && altData.length > 0) return altData;
+
+    return [];
+  } catch (err) {
+    console.warn("Notice: Error fetching credit sales from Supabase:", err);
+    return [];
+  }
+}
+
+/**
+ * Fetches card sales for a given shift ID from Supabase.
+ */
+export async function fetchCardSalesByShift(client: any, shiftId: string): Promise<any[]> {
+  if (!shiftId) return [];
+  try {
+    const { data, error } = await client
+      .from('card_sales')
+      .select('*')
+      .eq('shift_id', shiftId);
+
+    if (!error && data && data.length > 0) return data;
+
+    const { data: altData, error: altErr } = await client
+      .from('card_sales')
+      .select('*')
+      .eq('shiftid', shiftId);
+
+    if (!altErr && altData && altData.length > 0) return altData;
+
+    return [];
+  } catch (err) {
+    console.warn("Notice: Error fetching card sales from Supabase:", err);
+    return [];
+  }
+}
+
+/**
+ * Fetches touch card sales for a given shift ID from Supabase.
+ */
+export async function fetchTouchCardSalesByShift(client: any, shiftId: string): Promise<any[]> {
+  if (!shiftId) return [];
+  try {
+    const { data, error } = await client
+      .from('touch_card_sales')
+      .select('*')
+      .eq('shift_id', shiftId);
+
+    if (!error && data && data.length > 0) return data;
+
+    // Fallback if column name is lowercase
+    const { data: altData, error: altErr } = await client
+      .from('touch_card_sales')
+      .select('*')
+      .eq('shiftid', shiftId);
+
+    if (!altErr && altData && altData.length > 0) return altData;
+
+    return [];
+  } catch (err) {
+    console.warn("Notice: Error fetching touch card sales from Supabase:", err);
+    return [];
+  }
+}
+
+/**
+ * Fetches voucher sales for a given shift ID from Supabase.
+ */
+export async function fetchVoucherSalesByShift(client: any, shiftId: string): Promise<any[]> {
+  if (!shiftId) return [];
+  try {
+    const { data, error } = await client
+      .from('voucher_sales')
+      .select('*')
+      .eq('shift_id', shiftId);
+
+    if (!error && data && data.length > 0) return data;
+
+    // Fallback if column name is lowercase
+    const { data: altData, error: altErr } = await client
+      .from('voucher_sales')
+      .select('*')
+      .eq('shiftid', shiftId);
+
+    if (!altErr && altData && altData.length > 0) return altData;
+
+    return [];
+  } catch (err) {
+    console.warn("Notice: Error fetching voucher sales from Supabase:", err);
+    return [];
   }
 }
 
@@ -792,5 +1186,151 @@ export async function saveCustomerLedgerEntry(client: any, entry: CustomerLedger
     return { data: null, error: err };
   }
 }
+
+/**
+ * Records a Shift Bank Deposit in Supabase 'shift_bank_deposits' table
+ * and updates the 'cash_banked' column in the 'shifts' table.
+ * Includes deduplication & upsert to prevent duplicate row insertions per shift.
+ */
+export async function recordShiftBankDeposit(
+  client: any,
+  payload: {
+    shift_id: string;
+    deposited_amount: number;
+    deposited_by: string;
+    notes?: string;
+    deposit_date?: string;
+  }
+) {
+  if (!client || !payload || !payload.shift_id) return { data: null, error: null };
+  const now = new Date().toISOString();
+  const amount = Number(payload.deposited_amount) || 0;
+  const supervisor = payload.deposited_by || 'Supervisor';
+
+  // 1. Check for existing deposit record or upsert into shift_bank_deposits table
+  try {
+    // Check if an existing deposit row exists for this shift_id to prevent duplicates
+    let existingDepositId: string | null = null;
+    try {
+      const { data: existingRows } = await client
+        .from('shift_bank_deposits')
+        .select('id, shift_id')
+        .eq('shift_id', payload.shift_id);
+      
+      if (existingRows && existingRows.length > 0) {
+        existingDepositId = existingRows[0].id;
+      }
+    } catch (checkErr) {
+      console.warn("shift_bank_deposits pre-check notice:", checkErr);
+    }
+
+    if (existingDepositId) {
+      // Update existing record rather than inserting a duplicate row
+      const updateRecord: any = {
+        deposited_amount: amount,
+        deposited_by: supervisor,
+        deposit_date: payload.deposit_date || now
+      };
+      if (payload.notes !== undefined) {
+        updateRecord.notes = payload.notes;
+      }
+
+      const { error: updateErr } = await client
+        .from('shift_bank_deposits')
+        .update(updateRecord)
+        .eq('id', existingDepositId);
+
+      if (updateErr) {
+        // Fallback update if columns differ
+        await client
+          .from('shift_bank_deposits')
+          .update({
+            deposited_amount: amount,
+            deposited_by: supervisor
+          })
+          .eq('id', existingDepositId);
+      }
+    } else {
+      // Record does not exist yet; perform upsert with onConflict: 'shift_id'
+      const primaryRecord: any = {
+        shift_id: payload.shift_id,
+        deposited_amount: amount,
+        deposited_by: supervisor,
+        deposit_date: payload.deposit_date || now,
+        created_at: now
+      };
+      if (payload.notes !== undefined) {
+        primaryRecord.notes = payload.notes;
+      }
+
+      const { error: upsertErr } = await client
+        .from('shift_bank_deposits')
+        .upsert([primaryRecord], { onConflict: 'shift_id' });
+
+      if (upsertErr) {
+        // If onConflict upsert fails (e.g. no unique constraint on shift_id), perform safe insert
+        const { error: insertErr } = await client
+          .from('shift_bank_deposits')
+          .insert([primaryRecord]);
+
+        if (insertErr) {
+          // Fallback with minimal payload: { shift_id, deposited_amount, deposited_by }
+          const minimalRecord = {
+            shift_id: payload.shift_id,
+            deposited_amount: amount,
+            deposited_by: supervisor
+          };
+
+          const { error: minErr } = await client
+            .from('shift_bank_deposits')
+            .insert([minimalRecord]);
+
+          if (minErr) {
+            // Fallback with alias amount: { shift_id, amount, deposited_by }
+            const aliasRecord = {
+              shift_id: payload.shift_id,
+              amount: amount,
+              deposited_by: supervisor
+            };
+            const { error: aliasErr } = await client
+              .from('shift_bank_deposits')
+              .insert([aliasRecord]);
+
+            if (aliasErr) {
+              console.warn("shift_bank_deposits insert notice:", aliasErr.message || aliasErr);
+            }
+          }
+        }
+      }
+    }
+  } catch (err: any) {
+    console.warn("shift_bank_deposits error:", err?.message || err);
+  }
+
+  // 2. Update cash_banked column in shifts table
+  try {
+    const { error: shiftError } = await client
+      .from('shifts')
+      .update({
+        cash_banked: amount,
+        cashbanked: amount
+      })
+      .eq('id', payload.shift_id);
+
+    if (shiftError && (shiftError.code === '42703' || shiftError.message?.includes('column'))) {
+      await client
+        .from('shifts')
+        .update({
+          cash_banked: amount
+        })
+        .eq('id', payload.shift_id);
+    }
+  } catch (err: any) {
+    console.warn("shifts cash_banked update notice:", err?.message || err);
+  }
+
+  return { success: true };
+}
+
 
 

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Flame, AlertTriangle, Info, Edit3, Plus, Minus, Check, X, Layers } from 'lucide-react';
+import { Flame, AlertTriangle, Info, Edit3, Plus, Minus, Check, X, Layers, Tag } from 'lucide-react';
 import { supabase } from '../lib/supabaseClient';
 import { LPGasItem } from '../types';
 
@@ -8,11 +8,24 @@ interface LPGasInventoryTabProps {
   onUpdateGasStock?: (items: LPGasItem[]) => void;
 }
 
+const getStoredGasPrice = (size: string, defaultPrice: number): number => {
+  try {
+    const stored = localStorage.getItem('fuel_flow_gas_prices');
+    if (stored) {
+      const prices = JSON.parse(stored);
+      if (size.includes('12.5') && prices['12.5kg']) return prices['12.5kg'];
+      if (size.includes('5.0') && prices['5kg']) return prices['5kg'];
+      if (size.includes('2.3') && prices['2.3kg']) return prices['2.3kg'];
+    }
+  } catch (_) {}
+  return defaultPrice;
+};
+
 const DEFAULT_GAS_ITEMS: LPGasItem[] = [
-  { id: 'gas-12.5kg', size: '12.5 kg', full_count: 0, empty_count: 0, last_updated: new Date().toISOString() },
-  { id: 'gas-37.5kg', size: '37.5 kg', full_count: 0, empty_count: 0, last_updated: new Date().toISOString() },
-  { id: 'gas-5.0kg', size: '5.0 kg', full_count: 0, empty_count: 0, last_updated: new Date().toISOString() },
-  { id: 'gas-2.3kg', size: '2.3 kg', full_count: 0, empty_count: 0, last_updated: new Date().toISOString() }
+  { id: 'gas-12.5kg', size: '12.5 kg', full_count: 0, empty_count: 0, selling_price: 3690, last_updated: new Date().toISOString() },
+  { id: 'gas-37.5kg', size: '37.5 kg', full_count: 0, empty_count: 0, selling_price: 11200, last_updated: new Date().toISOString() },
+  { id: 'gas-5.0kg', size: '5.0 kg', full_count: 0, empty_count: 0, selling_price: 1482, last_updated: new Date().toISOString() },
+  { id: 'gas-2.3kg', size: '2.3 kg', full_count: 0, empty_count: 0, selling_price: 694, last_updated: new Date().toISOString() }
 ];
 
 export default function LPGasInventoryTab({ gasStock, onUpdateGasStock }: LPGasInventoryTabProps) {
@@ -84,12 +97,19 @@ export default function LPGasInventoryTab({ gasStock, onUpdateGasStock }: LPGasI
       if (data && data.length > 0) {
         const merged = DEFAULT_GAS_ITEMS.map(def => {
           const found = data.find((d: any) => d.id === def.id || d.size === def.size);
+          const price = found?.selling_price || found?.unit_price || getStoredGasPrice(def.size, def.selling_price || 0);
           return found ? {
             ...def,
             ...found,
             full_count: Number(found.full_count) || 0,
-            empty_count: Number(found.empty_count) || 0
-          } : def;
+            empty_count: Number(found.empty_count) || 0,
+            selling_price: price,
+            unit_price: price
+          } : {
+            ...def,
+            selling_price: getStoredGasPrice(def.size, def.selling_price || 0),
+            unit_price: getStoredGasPrice(def.size, def.selling_price || 0)
+          };
         });
 
         setGasItems(merged);
@@ -108,7 +128,10 @@ export default function LPGasInventoryTab({ gasStock, onUpdateGasStock }: LPGasI
           }
         } catch (_) {}
 
-        const itemsToUse = localItems.length > 0 ? localItems : DEFAULT_GAS_ITEMS;
+        const itemsToUse = (localItems.length > 0 ? localItems : DEFAULT_GAS_ITEMS).map(item => ({
+          ...item,
+          selling_price: item.selling_price || getStoredGasPrice(item.size, 0)
+        }));
         setGasItems(itemsToUse);
         localStorage.setItem('fuel_flow_gas_stock', JSON.stringify(itemsToUse));
         localStorage.setItem('fuel_flow_gas_inventory', JSON.stringify(itemsToUse));
@@ -233,19 +256,29 @@ export default function LPGasInventoryTab({ gasStock, onUpdateGasStock }: LPGasI
           <div key={item.id} className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden flex flex-col hover:border-orange-200 transition-all">
             <div className="p-5 border-b border-gray-100 bg-gradient-to-r from-orange-50/50 to-white">
               <div className="flex justify-between items-start mb-1">
-                <h3 className="text-lg font-bold text-gray-900">{item.size}</h3>
-                {item.full_count < 15 && (
-                  <div className="flex items-center gap-1 text-[11px] font-semibold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-md border border-amber-200">
-                    <AlertTriangle className="w-3 h-3" />
-                    Low Full Stock
-                  </div>
-                )}
+                <div>
+                  <h3 className="text-lg font-bold text-gray-900">{item.size}</h3>
+                  <p className="text-xs text-gray-500">
+                    {item.size === '12.5 kg' ? 'Standard Household' : 
+                     item.size === '37.5 kg' ? 'Commercial Industrial' :
+                     item.size === '5.0 kg' ? 'Buddy' : 'Portable'}
+                  </p>
+                </div>
+                <div className="flex flex-col items-end gap-1">
+                  {(item.selling_price || getStoredGasPrice(item.size, 0)) > 0 && (
+                    <span className="inline-flex items-center gap-1 text-[11px] font-extrabold text-orange-950 bg-orange-100/80 px-2 py-0.5 rounded-md border border-orange-200">
+                      <Tag className="w-2.5 h-2.5 text-orange-600" />
+                      Rs. {(item.selling_price || getStoredGasPrice(item.size, 0)).toLocaleString()}
+                    </span>
+                  )}
+                  {item.full_count < 15 && (
+                    <div className="flex items-center gap-1 text-[10px] font-semibold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-md border border-amber-200">
+                      <AlertTriangle className="w-2.5 h-2.5" />
+                      Low Full Stock
+                    </div>
+                  )}
+                </div>
               </div>
-              <p className="text-xs text-gray-500">
-                {item.size === '12.5 kg' ? 'Standard Household' : 
-                 item.size === '37.5 kg' ? 'Commercial Industrial' :
-                 item.size === '5.0 kg' ? 'Buddy' : 'Portable'}
-              </p>
             </div>
             
             <div className="p-5 flex-1 flex flex-col gap-4">

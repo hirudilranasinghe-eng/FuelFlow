@@ -144,7 +144,7 @@ export default function CustomerAdjustmentModal({
               rows={2}
               value={reason}
               onChange={(e) => setReason(e.target.value)}
-              placeholder="e.g. Disputed chitty correction approved by manager"
+              placeholder="e.g. Disputed invoice correction approved by manager"
               className="w-full px-3 py-2 text-xs rounded-xl border border-gray-200 focus:ring-2 focus:ring-slate-900 focus:outline-none resize-none"
               required
             />

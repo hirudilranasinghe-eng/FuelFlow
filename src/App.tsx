@@ -29,7 +29,7 @@ import PriceManagementTab from './components/PriceManagementTab';
 import LoginPage from './components/LoginPage';
 import { AuthUser, Employee, FuelTank, OilTank, Pump, PumpMachine, Shift, StockDelivery, PriceSchedule, Customer, CreditTransaction, CreditPayment, LPGasItem, resolveUserRole } from './types';
 import { supabase, getTanksTableName, setTanksTableName } from './lib/supabase';
-import { upsertPumpReadings, syncCreditAndCardSales, updateNozzleMeterCarryover, saveOilTank } from './lib/supabaseClient';
+import { upsertPumpReadings, syncCreditAndCardSales, syncAllNonCashSales, updateNozzleMeterCarryover, saveOilTank, recordShiftBankDeposit, isPumpReadingActiveOrAssigned, saveShiftLogs } from './lib/supabaseClient';
 
 export const defaultPumpMachines: PumpMachine[] = [];
 export const defaultPumps: Pump[] = [];
@@ -590,53 +590,82 @@ export default function App() {
           setPumps([]);
         }
 
-        // Fetch shifts with pump readings
+        // Fetch shifts with pump readings and bank deposits
         const { data: shiftsData, error: shiftError } = await supabase.from('shifts').select(`
           *,
           pumpReadings:pump_readings(*)
         `).order('starttime', { ascending: false });
         if (shiftError) handleSupabaseError(shiftError);
 
+        // Fetch shift bank deposits to accurately calculate banked cash per shift
+        let appDepositsByShift: Record<string, number> = {};
+        try {
+          const { data: depositsData } = await supabase
+            .from('shift_bank_deposits')
+            .select('shift_id, deposited_amount');
+          if (depositsData && Array.isArray(depositsData)) {
+            depositsData.forEach((d: any) => {
+              const sId = d.shift_id || d.shiftId;
+              const amt = Number(d.deposited_amount || d.depositedAmount || d.amount) || 0;
+              if (sId) {
+                appDepositsByShift[sId] = (appDepositsByShift[sId] || 0) + amt;
+              }
+            });
+          }
+        } catch (depErr) {
+          console.warn('Notice loading shift_bank_deposits in App.tsx:', depErr);
+        }
+
         if (shiftsData) {
-          const mappedShifts = shiftsData.map(s => ({
-            id: s.id,
-            name: s.name,
-            supervisorId: s.supervisorid,
-            startTime: s.starttime,
-            endTime: s.endtime,
-            isActive: s.isactive,
-            totalFuelSold: Number(s.totalfuelsold) || 0,
-            totalNetSold: Number(s.totalnetsold) || 0,
-            totalNetSales: Number(s.totalnetsales) || 0,
-            initialPumperCash: Number(s.initialpumpercash || s.initialPumperCash) || 0,
-            replacementPumperCash: Number(s.replacementpumpercash || s.replacementPumperCash) || 0,
-            totalPhysicalCash: Number(s.totalphysicalcash || s.totalPhysicalCash) || 0,
-            cashVariance: s.cashvariance,
-            handoverNotes: s.handovernotes || '',
-            replacementPumperId: s.replacementpumperid || '',
-            pumpReadings: (s.pumpReadings || []).map((r: any) => ({
-              pumpId: r.pump_id || r.pumpid || r.pumpId,
-              pumpName: r.pump_name || r.pumpname || r.pumpName,
-              fuelType: r.fuel_type || r.fueltype || r.fuelType,
-              tankId: r.tank_id || r.tankid || r.tankId || (r.fueltype === 'Petrol 92' ? 'tank-petrol92' : r.fueltype === 'Petrol 95' ? 'tank-petrol95' : r.fueltype === 'Auto Diesel' ? 'tank-autodiesel' : 'tank-superdiesel'),
-              assignedPumperId: r.assigned_pumper_id || r.assignedpumperid || r.assignedPumperId || null,
-              replacementPumperId: r.replacement_pumper_id || r.replacementpumperid || r.replacementPumperId || null,
-              initialPumperCash: Number(r.initial_pumper_cash || r.initialpumpercash || r.initialPumperCash) || 0,
-              handoverMeter: Number(r.handover_meter !== undefined ? r.handover_meter : r.handovermeter !== undefined ? r.handovermeter : r.handoverMeter) || 0,
-              handoverNotes: r.handover_notes || r.handovernotes || r.handoverNotes || '',
-              startMeter: Number(r.start_meter !== undefined ? r.start_meter : r.startmeter !== undefined ? r.startmeter : r.startMeter) || 0,
-              endMeter: Number(r.end_meter !== undefined ? r.end_meter : r.endmeter !== undefined ? r.endmeter : r.endMeter) || 0,
-              testingQty: Number(r.testing_qty !== undefined ? r.testing_qty : r.testingqty !== undefined ? r.testingqty : r.testingQty) || 0,
-              status: r.status || 'Idle',
-              isLocked: r.is_locked !== undefined ? r.is_locked : r.islocked !== undefined ? r.islocked : r.isLocked,
-              unitPrice: Number(r.unit_price || r.unitprice || r.unitPrice) || 0,
-              actualCash: Number(r.actual_cash ?? r.actualcash ?? r.actualCash) || 0,
-              cashVariance: Number(r.cash_variance ?? r.cashvariance ?? r.cashVariance) || 0,
-              creditSalesAmount: Number(r.credit_sales_amount ?? r.creditsalesamount ?? r.creditSalesAmount) || 0,
-              cardSalesAmount: Number(r.card_sales_amount ?? r.cardsalesamount ?? r.cardSalesAmount) || 0,
-              oilSalesAmount: Number(r.oil_sales_amount ?? r.oilsalesamount ?? r.oilSalesAmount) || 0
-            }))
-          }));
+          const mappedShifts = shiftsData.map(s => {
+            const bankedAmount = appDepositsByShift[s.id] !== undefined
+              ? appDepositsByShift[s.id]
+              : Number(s.cash_banked ?? s.cashbanked ?? s.cashBanked) || 0;
+
+            return {
+              id: s.id,
+              name: s.name,
+              supervisorId: s.supervisorid,
+              startTime: s.starttime,
+              endTime: s.endtime,
+              isActive: s.isactive,
+              totalFuelSold: Number(s.totalfuelsold) || 0,
+              totalNetSold: Number(s.totalnetsold) || 0,
+              totalNetSales: Number(s.totalnetsales) || 0,
+              initialPumperCash: Number(s.initialpumpercash || s.initialPumperCash) || 0,
+              replacementPumperCash: Number(s.replacementpumpercash || s.replacementPumperCash) || 0,
+              totalPhysicalCash: Number(s.totalphysicalcash || s.totalPhysicalCash) || 0,
+              cashVariance: s.cashvariance,
+              cashBanked: bankedAmount,
+              cash_banked: bankedAmount,
+              handoverNotes: s.handovernotes || '',
+              replacementPumperId: s.replacementpumperid || '',
+              pumpReadings: (s.pumpReadings || []).map((r: any) => ({
+                pumpId: r.pump_id || r.pumpid || r.pumpId,
+                pumpName: r.pump_name || r.pumpname || r.pumpName,
+                fuelType: r.fuel_type || r.fueltype || r.fuelType,
+                tankId: r.tank_id || r.tankid || r.tankId || (r.fueltype === 'Petrol 92' ? 'tank-petrol92' : r.fueltype === 'Petrol 95' ? 'tank-petrol95' : r.fueltype === 'Auto Diesel' ? 'tank-autodiesel' : 'tank-superdiesel'),
+                assignedPumperId: r.assigned_pumper_id || r.assignedpumperid || r.assignedPumperId || null,
+                replacementPumperId: r.replacement_pumper_id || r.replacementpumperid || r.replacementPumperId || null,
+                initialPumperCash: Number(r.initial_pumper_cash || r.initialpumpercash || r.initialPumperCash) || 0,
+                handoverMeter: Number(r.handover_meter !== undefined ? r.handover_meter : r.handovermeter !== undefined ? r.handovermeter : r.handoverMeter) || 0,
+                handoverNotes: r.handover_notes || r.handovernotes || r.handoverNotes || '',
+                startMeter: Number(r.start_meter !== undefined ? r.start_meter : r.startmeter !== undefined ? r.startmeter : r.startMeter) || 0,
+                endMeter: Number(r.end_meter !== undefined ? r.end_meter : r.endmeter !== undefined ? r.endmeter : r.endMeter) || 0,
+                testingQty: Number(r.testing_qty !== undefined ? r.testing_qty : r.testingqty !== undefined ? r.testingqty : r.testingQty) || 0,
+                status: r.status || 'Idle',
+                isLocked: r.is_locked !== undefined ? r.is_locked : r.islocked !== undefined ? r.islocked : r.isLocked,
+                unitPrice: Number(r.unit_price || r.unitprice || r.unitPrice) || 0,
+                actualCash: Number(r.actual_cash ?? r.actualcash ?? r.actualCash) || 0,
+                cashVariance: Number(r.cash_variance ?? r.cashvariance ?? r.cashVariance) || 0,
+                creditSalesAmount: Number(r.credit_sales_amount ?? r.creditsalesamount ?? r.creditSalesAmount) || 0,
+                cardSalesAmount: Number(r.card_sales_amount ?? r.cardsalesamount ?? r.cardSalesAmount) || 0,
+                touchCardSalesAmount: Number(r.touch_card_sales_amount ?? r.touchcardsalesamount ?? r.touchCardSalesAmount) || 0,
+                voucherSalesAmount: Number(r.voucher_sales_amount ?? r.vouchersalesamount ?? r.voucherSalesAmount) || 0,
+                oilSalesAmount: Number(r.oil_sales_amount ?? r.oilsalesamount ?? r.oilSalesAmount) || 0
+              }))
+            };
+          });
 
           const dbActive = mappedShifts.find(s => s.isActive);
           const history = mappedShifts.filter(s => !s.isActive);
@@ -834,46 +863,72 @@ export default function App() {
                 pumpReadings:pump_readings(*)
               `).order('starttime', { ascending: false });
 
+              let realtimeDeposits: Record<string, number> = {};
+              try {
+                const { data: depositsData } = await supabase
+                  .from('shift_bank_deposits')
+                  .select('shift_id, deposited_amount');
+                if (depositsData && Array.isArray(depositsData)) {
+                  depositsData.forEach((d: any) => {
+                    const sId = d.shift_id || d.shiftId;
+                    const amt = Number(d.deposited_amount || d.depositedAmount || d.amount) || 0;
+                    if (sId) {
+                      realtimeDeposits[sId] = (realtimeDeposits[sId] || 0) + amt;
+                    }
+                  });
+                }
+              } catch (_) {}
+
               if (updatedShifts) {
-                const mappedShifts = updatedShifts.map(s => ({
-                  id: s.id,
-                  name: s.name,
-                  supervisorId: s.supervisorid,
-                  startTime: s.starttime,
-                  endTime: s.endtime,
-                  isActive: s.isactive,
-                  totalFuelSold: Number(s.totalfuelsold) || 0,
-                  totalNetSold: Number(s.totalnetsold) || 0,
-                  totalNetSales: Number(s.totalnetsales) || 0,
-                  initialPumperCash: Number(s.initialpumpercash || s.initialPumperCash) || 0,
-                  replacementPumperCash: Number(s.replacementpumpercash || s.replacementPumperCash) || 0,
-                  totalPhysicalCash: Number(s.totalphysicalcash || s.totalPhysicalCash) || 0,
-                  cashVariance: s.cashvariance,
-                  handoverNotes: s.handovernotes || '',
-                  replacementPumperId: s.replacementpumperid || '',
-                  pumpReadings: (s.pumpReadings || []).map((r: any) => ({
-                    pumpId: r.pump_id || r.pumpid || r.pumpId,
-                    pumpName: r.pump_name || r.pumpname || r.pumpName,
-                    fuelType: r.fuel_type || r.fueltype || r.fuelType,
-                    tankId: r.tank_id || r.tankid || r.tankId || (r.fueltype === 'Petrol 92' ? 'tank-petrol92' : r.fueltype === 'Petrol 95' ? 'tank-petrol95' : r.fueltype === 'Auto Diesel' ? 'tank-autodiesel' : 'tank-superdiesel'),
-                    assignedPumperId: r.assigned_pumper_id || r.assignedpumperid || r.assignedPumperId || null,
-                    replacementPumperId: r.replacement_pumper_id || r.replacementpumperid || r.replacementPumperId || null,
-                    initialPumperCash: Number(r.initial_pumper_cash || r.initialpumpercash || r.initialPumperCash) || 0,
-                    handoverMeter: Number(r.handover_meter !== undefined ? r.handover_meter : r.handovermeter !== undefined ? r.handovermeter : r.handoverMeter) || 0,
-                    handoverNotes: r.handover_notes || r.handovernotes || r.handoverNotes || '',
-                    startMeter: Number(r.start_meter !== undefined ? r.start_meter : r.startmeter !== undefined ? r.startmeter : r.startMeter) || 0,
-                    endMeter: Number(r.end_meter !== undefined ? r.end_meter : r.endmeter !== undefined ? r.endmeter : r.endMeter) || 0,
-                    testingQty: Number(r.testing_qty !== undefined ? r.testing_qty : r.testingqty !== undefined ? r.testingqty : r.testingQty) || 0,
-                    status: r.status || 'Idle',
-                    isLocked: r.is_locked !== undefined ? r.is_locked : r.islocked !== undefined ? r.islocked : r.isLocked,
-                    unitPrice: Number(r.unit_price || r.unitprice || r.unitPrice) || 0,
-                    actualCash: Number(r.actual_cash ?? r.actualcash ?? r.actualCash) || 0,
-                    cashVariance: Number(r.cash_variance ?? r.cashvariance ?? r.cashVariance) || 0,
-                    creditSalesAmount: Number(r.credit_sales_amount ?? r.creditsalesamount ?? r.creditSalesAmount) || 0,
-                    cardSalesAmount: Number(r.card_sales_amount ?? r.cardsalesamount ?? r.cardSalesAmount) || 0,
-                    oilSalesAmount: Number(r.oil_sales_amount ?? r.oilsalesamount ?? r.oilSalesAmount) || 0
-                  }))
-                }));
+                const mappedShifts = updatedShifts.map(s => {
+                  const bankedAmount = realtimeDeposits[s.id] !== undefined
+                    ? realtimeDeposits[s.id]
+                    : Number(s.cash_banked ?? s.cashbanked ?? s.cashBanked) || 0;
+
+                  return {
+                    id: s.id,
+                    name: s.name,
+                    supervisorId: s.supervisorid,
+                    startTime: s.starttime,
+                    endTime: s.endtime,
+                    isActive: s.isactive,
+                    totalFuelSold: Number(s.totalfuelsold) || 0,
+                    totalNetSold: Number(s.totalnetsold) || 0,
+                    totalNetSales: Number(s.totalnetsales) || 0,
+                    initialPumperCash: Number(s.initialpumpercash || s.initialPumperCash) || 0,
+                    replacementPumperCash: Number(s.replacementpumpercash || s.replacementPumperCash) || 0,
+                    totalPhysicalCash: Number(s.totalphysicalcash || s.totalPhysicalCash) || 0,
+                    cashVariance: s.cashvariance,
+                    cashBanked: bankedAmount,
+                    cash_banked: bankedAmount,
+                    handoverNotes: s.handovernotes || '',
+                    replacementPumperId: s.replacementpumperid || '',
+                    pumpReadings: (s.pumpReadings || []).map((r: any) => ({
+                      pumpId: r.pump_id || r.pumpid || r.pumpId,
+                      pumpName: r.pump_name || r.pumpname || r.pumpName,
+                      fuelType: r.fuel_type || r.fueltype || r.fuelType,
+                      tankId: r.tank_id || r.tankid || r.tankId || (r.fueltype === 'Petrol 92' ? 'tank-petrol92' : r.fueltype === 'Petrol 95' ? 'tank-petrol95' : r.fueltype === 'Auto Diesel' ? 'tank-autodiesel' : 'tank-superdiesel'),
+                      assignedPumperId: r.assigned_pumper_id || r.assignedpumperid || r.assignedPumperId || null,
+                      replacementPumperId: r.replacement_pumper_id || r.replacementpumperid || r.replacementPumperId || null,
+                      initialPumperCash: Number(r.initial_pumper_cash || r.initialpumpercash || r.initialPumperCash) || 0,
+                      handoverMeter: Number(r.handover_meter !== undefined ? r.handover_meter : r.handovermeter !== undefined ? r.handovermeter : r.handoverMeter) || 0,
+                      handoverNotes: r.handover_notes || r.handovernotes || r.handoverNotes || '',
+                      startMeter: Number(r.start_meter !== undefined ? r.start_meter : r.startmeter !== undefined ? r.startmeter : r.startMeter) || 0,
+                      endMeter: Number(r.end_meter !== undefined ? r.end_meter : r.endmeter !== undefined ? r.endmeter : r.endMeter) || 0,
+                      testingQty: Number(r.testing_qty !== undefined ? r.testing_qty : r.testingqty !== undefined ? r.testingqty : r.testingQty) || 0,
+                      status: r.status || 'Idle',
+                      isLocked: r.is_locked !== undefined ? r.is_locked : r.islocked !== undefined ? r.islocked : r.isLocked,
+                      unitPrice: Number(r.unit_price || r.unitprice || r.unitPrice) || 0,
+                      actualCash: Number(r.actual_cash ?? r.actualcash ?? r.actualCash) || 0,
+                      cashVariance: Number(r.cash_variance ?? r.cashvariance ?? r.cashVariance) || 0,
+                      creditSalesAmount: Number(r.credit_sales_amount ?? r.creditsalesamount ?? r.creditSalesAmount) || 0,
+                      cardSalesAmount: Number(r.card_sales_amount ?? r.cardsalesamount ?? r.cardSalesAmount) || 0,
+                      touchCardSalesAmount: Number(r.touch_card_sales_amount ?? r.touchcardsalesamount ?? r.touchCardSalesAmount) || 0,
+                      voucherSalesAmount: Number(r.voucher_sales_amount ?? r.vouchersalesamount ?? r.voucherSalesAmount) || 0,
+                      oilSalesAmount: Number(r.oil_sales_amount ?? r.oilsalesamount ?? r.oilSalesAmount) || 0
+                    }))
+                  };
+                });
 
                 const dbActive = mappedShifts.find(s => s.isActive);
                 const history = mappedShifts.filter(s => !s.isActive);
@@ -1251,10 +1306,14 @@ export default function App() {
     setShiftHistory(updatedHistory);
 
     // Explicitly update closed shift and completed pump readings in Supabase
-    if (isConfigured && !dbError && !isRlsActive) {
+    if (isConfigured) {
       const { pumpReadings, ...shiftData } = closedShift;
       const closedTime = shiftData.endTime || new Date().toISOString();
       
+      const supervisorObj = employees.find(e => e.id === shiftData.supervisorId);
+      const supervisorName = supervisorObj ? supervisorObj.name : 'Supervisor';
+      const cashBankedVal = Number(shiftData.cashBanked ?? (shiftData as any).cash_banked) || 0;
+
       supabase.from('shifts').upsert({
         id: shiftData.id,
         name: shiftData.name,
@@ -1268,12 +1327,22 @@ export default function App() {
         initialpumpercash: shiftData.initialPumperCash || 0,
         replacementpumpercash: shiftData.replacementPumperCash || 0,
         totalphysicalcash: shiftData.totalPhysicalCash || 0,
+        credit_sales: shiftData.creditSales || (shiftData as any).credit_sales || 0,
+        card_sales: shiftData.cardSales || (shiftData as any).card_sales || 0,
+        touch_card_sales: shiftData.touchCardSales || (shiftData as any).touch_card_sales || 0,
+        voucher_sales: shiftData.voucherSales || (shiftData as any).voucher_sales || 0,
+        creditsales: shiftData.creditSales || (shiftData as any).credit_sales || 0,
+        cardsales: shiftData.cardSales || (shiftData as any).card_sales || 0,
+        touchcardsales: shiftData.touchCardSales || (shiftData as any).touch_card_sales || 0,
+        vouchersales: shiftData.voucherSales || (shiftData as any).voucher_sales || 0,
         cashvariance: shiftData.cashVariance || 0,
+        cash_banked: cashBankedVal,
+        cashbanked: cashBankedVal,
         handovernotes: shiftData.handoverNotes || '',
         replacementpumperid: shiftData.replacementPumperId || null
       }).then(async ({ error: sErr }) => {
         if (sErr && (sErr.code === '42703' || sErr.message?.includes('column'))) {
-          await supabase.from('shifts').upsert({
+          const { error: retryErr } = await supabase.from('shifts').upsert({
             id: shiftData.id,
             name: shiftData.name,
             supervisorid: shiftData.supervisorId,
@@ -1282,84 +1351,58 @@ export default function App() {
             isactive: false,
             totalfuelsold: shiftData.totalFuelSold || 0,
             totalnetsold: shiftData.totalNetSold || 0,
-            totalnetsales: shiftData.totalNetSales || 0
+            totalnetsales: shiftData.totalNetSales || 0,
+            cash_banked: cashBankedVal
           });
+          if (retryErr && (retryErr.code === '42703' || retryErr.message?.includes('column'))) {
+            await supabase.from('shifts').upsert({
+              id: shiftData.id,
+              name: shiftData.name,
+              supervisorid: shiftData.supervisorId,
+              starttime: shiftData.startTime,
+              endtime: closedTime,
+              isactive: false,
+              totalfuelsold: shiftData.totalFuelSold || 0,
+              totalnetsold: shiftData.totalNetSold || 0,
+              totalnetsales: shiftData.totalNetSales || 0
+            });
+          }
         } else if (sErr) {
           console.warn("Supabase shift close notice:", sErr?.message || sErr);
         }
       });
 
-      if (pumpReadings && pumpReadings.length > 0) {
-        const completedReadings = pumpReadings.map(r => ({ ...r, status: 'Completed' as const, isLocked: true }));
-        upsertPumpReadings(supabase, completedReadings, closedShift.id).then(({ error: prErr }) => {
-          if (prErr) console.warn("Supabase pump_readings close notice:", prErr?.message || prErr);
-        });
-
-        // Explicit direct inserts into credit_sales and card_sales tables
-        syncCreditAndCardSales(supabase, pumpReadings, closedShift.id);
-
-        // Save detailed shift logs entry per pump
-        const shiftLogsToInsert = pumpReadings.map(r => {
-          const fuel = Math.max(0, (r.endMeter || 0) - (r.startMeter || 0));
-          const net = Math.max(0, fuel - (r.testingQty || 0));
-          const rate = r.unitPrice || 0;
-          const grossFuelRev = net * rate;
-          const oilSales = r.oilSalesAmount || 0;
-          const totalGrossRev = grossFuelRev + oilSales;
-          const creditAmt = r.creditSalesAmount || 0;
-          const cardAmt = r.cardSalesAmount || 0;
-          const expectedCash = Math.max(0, totalGrossRev - (creditAmt + cardAmt));
-          const actCash = r.actualCash || 0;
-          const pVariance = r.cashVariance ?? (actCash - expectedCash);
-
-          return {
-            id: `log_${closedShift.id}_${r.pumpId}_${Date.now()}`,
+      // Record detailed shift bank deposit in shift_bank_deposits table
+      if (cashBankedVal > 0) {
+        try {
+          recordShiftBankDeposit(supabase, {
             shift_id: closedShift.id,
-            shift_name: closedShift.name,
-            supervisor_id: closedShift.supervisorId,
-            pump_id: r.pumpId,
-            pump_name: r.pumpName,
-            fuel_type: r.fuelType,
-            assigned_pumper_id: r.assignedPumperId || null,
-            start_meter: r.startMeter || 0,
-            end_meter: r.endMeter || 0,
-            testing_qty: r.testingQty || 0,
-            net_liters: net,
-            unit_price: rate,
-            gross_revenue: totalGrossRev,
-            oil_sales_amount: oilSales,
-            credit_sales_amount: creditAmt,
-            card_sales_amount: cardAmt,
-            expected_cash: expectedCash,
-            actual_cash: actCash,
-            cash_variance: pVariance,
-            closed_at: closedTime
-          };
-        });
+            deposited_amount: cashBankedVal,
+            deposited_by: supervisorName,
+            deposit_date: new Date().toISOString(),
+            notes: `End of shift deposit for ${closedShift.name || closedShift.id}`
+          });
+        } catch (depErr) {
+          console.warn('shift_bank_deposits error in App.tsx:', depErr);
+        }
+      }
 
-        supabase.from('shift_logs').insert(shiftLogsToInsert).then(async ({ error: logErr }) => {
-          if (logErr && (logErr.code === '42703' || logErr.message?.includes('column'))) {
-            const basicLogs = shiftLogsToInsert.map(log => ({
-              id: log.id,
-              shift_id: log.shift_id,
-              pump_id: log.pump_id,
-              pump_name: log.pump_name,
-              fuel_type: log.fuel_type,
-              start_meter: log.start_meter,
-              end_meter: log.end_meter,
-              testing_qty: log.testing_qty,
-              net_liters: log.net_liters,
-              unit_price: log.unit_price,
-              gross_revenue: log.gross_revenue,
-              expected_cash: log.expected_cash,
-              actual_cash: log.actual_cash,
-              cash_variance: log.cash_variance
-            }));
-            await supabase.from('shift_logs').insert(basicLogs);
-          } else if (logErr) {
-            console.warn("Supabase shift_logs insert notice:", logErr?.message || logErr);
-          }
-        });
+      if (pumpReadings && pumpReadings.length > 0) {
+        // Filter out unassigned and inactive nozzles to prevent dummy records in shift_logs and pump_readings
+        const activePumpReadings = pumpReadings.filter(isPumpReadingActiveOrAssigned);
+        const completedReadings = activePumpReadings.map(r => ({ ...r, status: 'Completed' as const, isLocked: true }));
+
+        if (completedReadings.length > 0) {
+          upsertPumpReadings(supabase, completedReadings, closedShift.id).then(({ error: prErr }) => {
+            if (prErr) console.warn("Supabase pump_readings close notice:", prErr?.message || prErr);
+          });
+
+          // Explicit direct inserts into credit_sales, card_sales, touch_card_sales, voucher_sales tables
+          syncAllNonCashSales(supabase, activePumpReadings, closedShift.id);
+
+          // Save detailed shift logs entry ONLY for active / assigned pumps
+          saveShiftLogs(supabase, closedShift, activePumpReadings);
+        }
       }
     }
 

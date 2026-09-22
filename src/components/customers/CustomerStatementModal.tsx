@@ -33,14 +33,13 @@ export default function CustomerStatementModal({
   const [searchQuery, setSearchQuery] = useState('');
   const [dateFilter, setDateFilter] = useState<'ALL' | '30DAYS' | 'THIS_MONTH'>('ALL');
 
-  if (!isOpen || !customer) return null;
+  const isDeposit = customer?.customerType === 'Deposit';
 
-  const isDeposit = customer.customerType === 'Deposit';
-
-  // Filter entries for this specific customer
+  // Filter entries for this specific customer (always run hooks unconditionally)
   const customerEntries = useMemo(() => {
+    if (!customer) return [];
     return ledgerEntries.filter(e => e.customerId === customer.id);
-  }, [ledgerEntries, customer.id]);
+  }, [ledgerEntries, customer?.id]);
 
   // Sort descending by date
   const sortedEntries = useMemo(() => {
@@ -91,6 +90,8 @@ export default function CustomerStatementModal({
 
     return list;
   }, [sortedEntries, filterType, dateFilter, searchQuery]);
+
+  if (!isOpen || !customer) return null;
 
   // Financial aggregates
   const totalDebits = customerEntries.reduce((sum, e) => sum + (Number(e.debit) || 0), 0);
@@ -253,7 +254,7 @@ export default function CustomerStatementModal({
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search reference, vehicle, chitty #..."
+              placeholder="Search reference, vehicle, invoice #..."
               className="w-full pl-8 pr-3 py-1.5 text-xs bg-white rounded-xl border border-gray-200 focus:outline-none focus:ring-2 focus:ring-slate-900"
             />
           </div>
@@ -322,7 +323,7 @@ export default function CustomerStatementModal({
                   <tr className="bg-slate-50/90 border-b border-gray-200 text-gray-600 font-bold uppercase tracking-wider text-[10px]">
                     <th className="py-2.5 px-3">Date & Time</th>
                     <th className="py-2.5 px-3">Type</th>
-                    <th className="py-2.5 px-3">Reference / Chitty</th>
+                    <th className="py-2.5 px-3">Reference / Invoice</th>
                     <th className="py-2.5 px-3">Vehicle</th>
                     <th className="py-2.5 px-3">Description / Fuel</th>
                     <th className="py-2.5 px-3 text-right">Debit (Rs.)</th>

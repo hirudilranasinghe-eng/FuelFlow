@@ -155,8 +155,6 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
   // Open Bowser Delivery Unload Dip Modal
   const handleOpenBowserDipModal = () => {
     const defaultTank = availableTanks[0];
-    const initialPreLiters = defaultTank ? Math.round(defaultTank.currentLevel) : 0;
-    const initialPreMm = defaultTank ? estimateDipMm(initialPreLiters, defaultTank.capacity) : 0;
     
     setBowserForm({
       date: new Date().toISOString().slice(0, 10),
@@ -172,8 +170,8 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
       density: defaultTank?.fuelType.toLowerCase().includes('diesel') ? '0.835' : '0.745',
       temperature: '29.5',
       remarks: '',
-      preDipMm: initialPreMm > 0 ? initialPreMm.toString() : '',
-      preDipLiters: initialPreLiters > 0 ? initialPreLiters.toString() : '',
+      preDipMm: '',
+      preDipLiters: '',
       postDipMm: '',
       postDipLiters: '',
     });
@@ -181,17 +179,13 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
     setIsBowserDipModalOpen(true);
   };
 
-  // When Bowser Tank changes, update pre-dip suggestions and density default
+  // When Bowser Tank changes, update tank selection without pre-filling dip inputs
   const handleBowserTankChange = (newTankId: string) => {
     const targetTank = availableTanks.find(t => t.id === newTankId);
     if (targetTank) {
-      const currentL = Math.round(targetTank.currentLevel);
-      const estMm = estimateDipMm(currentL, targetTank.capacity);
       setBowserForm(prev => ({
         ...prev,
         tankId: newTankId,
-        preDipMm: estMm > 0 ? estMm.toString() : prev.preDipMm,
-        preDipLiters: currentL > 0 ? currentL.toString() : prev.preDipLiters,
         density: targetTank.fuelType.toLowerCase().includes('diesel') ? '0.835' : '0.745',
       }));
     } else {
@@ -450,17 +444,22 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
       ? parseFloat(bowserForm.postDipLiters) || 0 
       : (postMm > 0 ? calculateDipVolume(postMm, maxCapacity) : 0);
 
-    const actualReceived = Math.max(0, postLiters - preLiters);
-    const varianceLiters = actualReceived - invoicedVol;
-    const variancePercentage = invoicedVol > 0 ? (varianceLiters / invoicedVol) * 100 : 0;
+    const hasReadings = (bowserForm.preDipMm !== '' || bowserForm.preDipLiters !== '') &&
+                        (bowserForm.postDipMm !== '' || bowserForm.postDipLiters !== '');
+
+    const actualReceived = hasReadings ? Math.max(0, postLiters - preLiters) : 0;
+    const varianceLiters = hasReadings ? (actualReceived - invoicedVol) : 0;
+    const variancePercentage = (hasReadings && invoicedVol > 0) ? (varianceLiters / invoicedVol) * 100 : 0;
 
     let status: 'Exact Match' | 'Excess' | 'Shortage' = 'Exact Match';
-    if (Math.abs(varianceLiters) < 0.5) {
-      status = 'Exact Match';
-    } else if (varianceLiters > 0.5) {
-      status = 'Excess';
-    } else {
-      status = 'Shortage';
+    if (hasReadings) {
+      if (Math.abs(varianceLiters) < 0.5) {
+        status = 'Exact Match';
+      } else if (varianceLiters > 0.5) {
+        status = 'Excess';
+      } else {
+        status = 'Shortage';
+      }
     }
 
     return {
@@ -471,6 +470,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
       varianceLiters,
       variancePercentage,
       status,
+      hasReadings,
       preMm,
       postMm,
       maxCapacity,
@@ -750,7 +750,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
         ['Tank', b.tankName],
         ['Fuel Grade', b.fuelType],
         ['Bowser Vehicle No', b.bowserNo || 'N/A'],
-        ['Invoice / Chitty No', b.invoiceNo || 'N/A'],
+        ['Invoice / Ref No', b.invoiceNo || 'N/A'],
         ['Invoiced Bowser Volume (L)', b.invoicedVolume.toFixed(2)],
         ['Pre-Unload Dip (mm)', b.preDipMm.toString()],
         ['Pre-Unload Volume (L)', b.preDipLiters.toFixed(2)],
@@ -830,43 +830,38 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
           </p>
         </div>
 
-        <div className="flex items-center gap-2.5 self-start sm:self-auto flex-wrap">
-          <button
-            onClick={fetchDipSessions}
-            className="p-2 bg-white hover:bg-gray-50 text-gray-700 border border-gray-200 rounded-xl text-xs font-bold transition-all cursor-pointer shadow-2xs"
-            title="Refresh from Database"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
-          </button>
-
+        <div className="flex flex-col sm:flex-row sm:items-center gap-2.5 self-start sm:self-auto w-full sm:w-auto justify-end">
           <button
             onClick={exportMasterCSV}
             disabled={sessions.length === 0}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-white hover:bg-gray-50 disabled:opacity-50 text-gray-700 border border-gray-200 rounded-xl text-xs font-bold transition-all cursor-pointer shadow-2xs"
+            className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 bg-white hover:bg-gray-50 disabled:opacity-50 text-gray-700 border border-gray-200 rounded-xl text-xs font-bold transition-all cursor-pointer shadow-2xs"
           >
             <Download className="w-3.5 h-3.5 text-gray-600" />
             <span>Export CSV</span>
           </button>
 
-          {/* Button 1: Record Daily Dip Audit */}
-          <button
-            id="btn-add-daily-dip"
-            onClick={handleOpenDailyDipModal}
-            className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-sm hover:shadow-md active:scale-95"
-          >
-            <Plus className="w-4 h-4" />
-            <span>+ Record Daily Dip Audit</span>
-          </button>
+          {/* Grouped Dip Audit Buttons Side-by-Side */}
+          <div className="flex flex-row items-center gap-2.5 sm:gap-3">
+            {/* Button 1: Record Daily Dip Audit */}
+            <button
+              id="btn-add-daily-dip"
+              onClick={handleOpenDailyDipModal}
+              className="inline-flex items-center justify-center gap-1.5 px-3.5 sm:px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-xs hover:shadow-sm active:scale-95 whitespace-nowrap"
+            >
+              <Plus className="w-4 h-4" />
+              <span>+ Record Daily Dip Audit</span>
+            </button>
 
-          {/* Button 2: Bowser Unload Dip Audit */}
-          <button
-            id="btn-add-bowser-dip"
-            onClick={handleOpenBowserDipModal}
-            className="inline-flex items-center gap-2 px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-sm hover:shadow-md active:scale-95"
-          >
-            <Truck className="w-4 h-4" />
-            <span>+ Bowser Unload Dip Audit</span>
-          </button>
+            {/* Button 2: Bowser Unload Dip Audit */}
+            <button
+              id="btn-add-bowser-dip"
+              onClick={handleOpenBowserDipModal}
+              className="inline-flex items-center justify-center gap-1.5 px-3.5 sm:px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-xs hover:shadow-sm active:scale-95 whitespace-nowrap"
+            >
+              <Truck className="w-4 h-4" />
+              <span>+ Bowser Unload Dip Audit</span>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -1520,30 +1515,6 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                 </div>
               </div>
 
-              {/* Optional Ref (Bowser / Invoice No) */}
-              <div className="grid grid-cols-2 gap-3 text-xs">
-                <div>
-                  <label className="block text-[11px] font-medium text-gray-500 mb-1">Bowser No (Optional)</label>
-                  <input
-                    type="text"
-                    placeholder="e.g. WP-LI-4589"
-                    value={bowserForm.bowserNo}
-                    onChange={(e) => setBowserForm(p => ({ ...p, bowserNo: e.target.value }))}
-                    className="w-full px-3 py-1.5 bg-white border border-gray-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-amber-500/20"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[11px] font-medium text-gray-500 mb-1">Invoice / Chitty No (Optional)</label>
-                  <input
-                    type="text"
-                    placeholder="e.g. INV-88219"
-                    value={bowserForm.invoiceNo}
-                    onChange={(e) => setBowserForm(p => ({ ...p, invoiceNo: e.target.value }))}
-                    className="w-full px-3 py-1.5 bg-white border border-gray-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-amber-500/20"
-                  />
-                </div>
-              </div>
-
               {/* 2. Before & After Dip Reading Inputs (Side-by-Side) */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 {/* BEFORE UNLOAD */}
@@ -1651,7 +1622,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                   <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
                     Live Audit Result
                   </span>
-                  {bowserAuditCalculations.invoicedVol > 0 && (
+                  {bowserAuditCalculations.hasReadings && bowserAuditCalculations.invoicedVol > 0 && (
                     <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg text-xs font-bold ${
                       bowserAuditCalculations.status === 'Shortage'
                         ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
@@ -1816,7 +1787,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                         <div>
                           <span className="text-[10px] text-slate-400 uppercase font-bold block">Invoiced Bowser Vol</span>
                           <span className="font-extrabold text-white text-sm tabular-nums block mt-0.5">{b.invoicedVolume.toLocaleString()} L</span>
-                          <span className="text-[10px] text-slate-400">Supplier Chitty</span>
+                          <span className="text-[10px] text-slate-400">Supplier Invoice</span>
                         </div>
 
                         <div>
@@ -1874,7 +1845,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                           <span className="font-bold text-slate-800">{b.bowserNo || 'Not Logged'}</span>
                         </div>
                         <div>
-                          <span className="text-[10px] text-gray-400 font-bold block uppercase">Invoice / Chitty</span>
+                          <span className="text-[10px] text-gray-400 font-bold block uppercase">Invoice / Ref</span>
                           <span className="font-bold text-slate-800">{b.invoiceNo || 'Not Logged'}</span>
                         </div>
                         <div>

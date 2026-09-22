@@ -39,6 +39,8 @@ export interface LPGasItem {
   size: '12.5 kg' | '37.5 kg' | '5.0 kg' | '2.3 kg';
   full_count: number;
   empty_count: number;
+  selling_price?: number; // Retail selling price in Rs.
+  unit_price?: number;
   last_updated?: string;
 }
 
@@ -141,6 +143,20 @@ export interface PumperOilAllocation {
   notes?: string;
 }
 
+export interface PumperAssignment {
+  id?: string;
+  pumper_id: string;
+  pumper_name?: string;
+  pump_ids?: string[];
+  actual_cash?: number;
+  credit_sales?: number;
+  card_sales?: number;
+  touch_card_sales?: number;
+  voucher_sales?: number;
+  oil_sales?: number;
+  variance?: number;
+}
+
 export interface PumpMachine {
   id: string;
   name: string;
@@ -185,8 +201,42 @@ export interface PumpReading {
   cashVariance?: number; // (actualCash - netExpectedCash)
   creditSalesAmount?: number; // Credit / Chitty sales amount
   cardSalesAmount?: number; // Card / POS sales amount
+  touchCardSalesAmount?: number; // Touch Card sales amount
+  voucherSalesAmount?: number; // Voucher sales amount
   oilSalesAmount?: number; // Engine oil / lubricant sales amount
   chamberReadings?: ChamberReading[]; // Forecourt 4-Chamber dispenser readings
+}
+
+export interface ShiftGasSale {
+  gasItemId: string; // e.g. 'gas-12.5kg'
+  size: string; // '12.5 kg', '5.0 kg', etc.
+  type?: string; // backward-compatibility alias e.g. '12.5kg'
+  quantity: number;
+  unitPrice: number;
+  totalAmount: number;
+}
+
+export interface ShiftLubeSale {
+  id: string; // Item ID e.g. 'lube-01'
+  itemId?: string; // Alias for id
+  name: string;
+  itemName?: string;
+  packSize: string;
+  packageSize?: string;
+  quantity: number;
+  quantitySold?: number;
+  unitPrice: number;
+  totalAmount: number;
+}
+
+export interface ShiftCounterSales {
+  gasSales: ShiftGasSale[];
+  lubeSales: ShiftLubeSale[];
+  totalGasSales?: number;
+  totalGasRevenue?: number;
+  totalLubeSales?: number;
+  totalLubeRevenue?: number;
+  totalCounterRevenue: number;
 }
 
 export interface Shift {
@@ -200,13 +250,34 @@ export interface Shift {
   totalFuelSold: number;
   totalNetSold: number;
   totalNetSales: number;
+  counterSales?: ShiftCounterSales;
   // Mid-shift handover & cash reconciliation
   initialPumperCash?: number;
   replacementPumperCash?: number;
   totalPhysicalCash?: number;
   cashVariance?: number;
+  cashBanked?: number;
+  cash_banked?: number;
+  creditSales?: number;
+  cardSales?: number;
+  touchCardSales?: number;
+  voucherSales?: number;
+  credit_sales?: number;
+  card_sales?: number;
+  touch_card_sales?: number;
+  voucher_sales?: number;
   handoverNotes?: string;
   replacementPumperId?: string;
+}
+
+export interface ShiftBankDeposit {
+  id?: string;
+  shift_id: string;
+  deposited_amount: number;
+  deposited_by: string; // supervisor name
+  created_at?: string;
+  deposit_date?: string;
+  notes?: string;
 }
 
 export interface StockDelivery {

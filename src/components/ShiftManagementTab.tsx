@@ -3,16 +3,33 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Search, Plus, Clock, Fuel, ArrowUpRight, DollarSign, 
   User, CheckCircle, AlertCircle, Sparkles, X, Download, RotateCcw,
   ShieldCheck, Check, Save, AlertTriangle, TrendingUp, RefreshCw,
   Lock, Unlock, Edit2, ArrowLeft, Users, Package, ChevronDown, CheckSquare, Square, Calendar, Droplet,
-  ArrowRightLeft
+  ArrowRightLeft, Flame, ShoppingBag, Trash2, Landmark, Loader2,
+  CreditCard, Receipt, Tag
 } from 'lucide-react';
-import { supabase, saveCreditSale, saveCardSale, syncCreditAndCardSales, upsertPumpReadings } from '../lib/supabaseClient';
-import { Employee, FuelTank, OilTank, Pump, PumpMachine, PumpReading, Shift, FuelType, ChamberReading } from '../types';
+import { 
+  supabase, 
+  saveCreditSale, 
+  saveCardSale, 
+  saveTouchCardSale, 
+  saveVoucherSale, 
+  syncCreditAndCardSales, 
+  syncTouchCardAndVoucherSales, 
+  syncAllNonCashSales,
+  fetchCreditSalesByShift,
+  fetchCardSalesByShift,
+  fetchTouchCardSalesByShift,
+  fetchVoucherSalesByShift,
+  upsertPumpReadings,
+  isPumpReadingActiveOrAssigned
+} from '../lib/supabaseClient';
+import { Employee, FuelTank, OilTank, Pump, PumpMachine, PumpReading, Shift, FuelType, ChamberReading, ShiftCounterSales, ShiftGasSale, ShiftLubeSale, PackagedOilItem } from '../types';
+import { deductPackagedStock, fetchPackagedLubricants } from '../lib/lubricantsClient';
 
 interface ShiftManagementTabProps {
   employees: Employee[];
@@ -65,7 +82,21 @@ export default function ShiftManagementTab({
   
   // Modals state
   const [isCloseConfirmOpen, setIsCloseConfirmOpen] = useState(false);
+  const [isClosingShift, setIsClosingShift] = useState(false);
   const [isStartShiftOpen, setIsStartShiftOpen] = useState(false);
+  const [cashBankedInput, setCashBankedInput] = useState<string>('');
+  const [physicalCashHandedOverInput, setPhysicalCashHandedOverInput] = useState<string>('');
+  const [varianceAllocations, setVarianceAllocations] = useState<{
+    card: number;
+    credit: number;
+    touchCard: number;
+    voucher: number;
+  }>({
+    card: 0,
+    credit: 0,
+    touchCard: 0,
+    voucher: 0
+  });
   
   // New Shift Setup Form State
   const [newShiftTemplate, setNewShiftTemplate] = useState<'Morning' | 'Evening' | 'Night' | 'Custom'>('Morning');
@@ -130,6 +161,209 @@ export default function ShiftManagementTab({
   const [replacementPumperCash, setReplacementPumperCash] = useState<number | ''>(0);
   const [replacementPumperId, setReplacementPumperId] = useState<string>('');
   const [handoverNotes, setHandoverNotes] = useState<string>('');
+
+  // Helper to get active gas prices from localStorage
+  const getActiveGasPrices = (): { [key: string]: number } => {
+    try {
+      const stored = localStorage.getItem('fuel_flow_gas_prices');
+      if (stored) return JSON.parse(stored);
+      const storedInv = localStorage.getItem('fuel_flow_gas_stock') || localStorage.getItem('fuel_flow_gas_inventory');
+      if (storedInv) {
+        const parsed = JSON.parse(storedInv);
+        if (Array.isArray(parsed)) {
+          const pMap: { [key: string]: number } = {};
+          parsed.forEach((item: any) => {
+            if (item.size === '12.5 kg' || item.id === 'gas-12.5kg') pMap['12.5kg'] = item.selling_price || item.unit_price || 3690;
+            if (item.size === '5.0 kg' || item.id === 'gas-5.0kg' || item.id === 'gas-5kg') pMap['5kg'] = item.selling_price || item.unit_price || 1482;
+            if (item.size === '2.3 kg' || item.id === 'gas-2.3kg') pMap['2.3kg'] = item.selling_price || item.unit_price || 694;
+          });
+          return {
+            '12.5kg': pMap['12.5kg'] || 3690,
+            '5kg': pMap['5kg'] || 1482,
+            '2.3kg': pMap['2.3kg'] || 694
+          };
+        }
+      }
+    } catch (_) {}
+    return {
+      '12.5kg': 3690,
+      '5kg': 1482,
+      '2.3kg': 694
+    };
+  };
+
+  // Listen for live LP Gas price updates from Admin Tariff tab
+  useEffect(() => {
+    const handleGasPriceChange = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      const prices = customEvent.detail?.updatedPrices || getActiveGasPrices();
+      
+      setDraftCounterSales(prev => {
+        const updatedGas = (prev.gasSales || []).map(item => {
+          let newPrice = item.unitPrice;
+          if (item.type === '12.5kg' || item.size?.includes('12.5')) newPrice = prices['12.5kg'] || newPrice;
+          if (item.type === '5kg' || item.size?.includes('5.0') || item.size?.includes('5kg')) newPrice = prices['5kg'] || newPrice;
+          if (item.type === '2.3kg' || item.size?.includes('2.3')) newPrice = prices['2.3kg'] || newPrice;
+          return {
+            ...item,
+            unitPrice: newPrice,
+            totalAmount: (item.quantity || 0) * newPrice
+          };
+        });
+        const totalGas = updatedGas.reduce((s, g) => s + (g.totalAmount || 0), 0);
+        const totalLube = prev.totalLubeSales || 0;
+        return {
+          ...prev,
+          gasSales: updatedGas,
+          totalGasSales: totalGas,
+          totalCounterRevenue: totalGas + totalLube
+        };
+      });
+    };
+
+    window.addEventListener('gas-prices-updated', handleGasPriceChange);
+    window.addEventListener('storage', handleGasPriceChange);
+
+    return () => {
+      window.removeEventListener('gas-prices-updated', handleGasPriceChange);
+      window.removeEventListener('storage', handleGasPriceChange);
+    };
+  }, []);
+  const getDefaultGasSales = (): ShiftGasSale[] => {
+    const prices = getActiveGasPrices();
+    return [
+      { gasItemId: 'gas-12.5kg', size: '12.5 kg', type: '12.5kg', quantity: 0, unitPrice: prices['12.5kg'] || 3690, totalAmount: 0 },
+      { gasItemId: 'gas-5kg', size: '5.0 kg', type: '5kg', quantity: 0, unitPrice: prices['5kg'] || 1482, totalAmount: 0 },
+      { gasItemId: 'gas-2.3kg', size: '2.3 kg', type: '2.3kg', quantity: 0, unitPrice: prices['2.3kg'] || 694, totalAmount: 0 }
+    ];
+  };
+
+  const defaultGasSales: ShiftGasSale[] = getDefaultGasSales();
+
+  // Gas & Lubricant Counter Sales State (Independent from pumper nozzles)
+  const [draftCounterSales, setDraftCounterSales] = useState<ShiftCounterSales>({
+    gasSales: getDefaultGasSales(),
+    lubeSales: [],
+    totalGasSales: 0,
+    totalLubeSales: 0,
+    totalCounterRevenue: 0
+  });
+  const [committedCounterSales, setCommittedCounterSales] = useState<ShiftCounterSales | null>(null);
+  const [isCounterSalesSaving, setIsCounterSalesSaving] = useState<boolean>(false);
+  const [availablePackagedLubes, setAvailablePackagedLubes] = useState<PackagedOilItem[]>([]);
+  const [selectedAddLubeId, setSelectedAddLubeId] = useState<string>('');
+
+  // Function to save and commit counter sales
+  const handleSaveCounterSales = async () => {
+    if (!activeShift) return;
+    setIsCounterSalesSaving(true);
+    try {
+      // 1. Calculate delta to deduct if already saved previously in this session
+      const prevSaved = committedCounterSales || {
+        gasSales: defaultGasSales,
+        lubeSales: [],
+        totalGasSales: 0,
+        totalLubeSales: 0,
+        totalCounterRevenue: 0
+      };
+
+      // Deduct LP Gas inventory (delta)
+      const gasKey = 'fuelflow_lpgas_inventory';
+      const storedGas = localStorage.getItem(gasKey);
+      if (storedGas && draftCounterSales.gasSales) {
+        let gasList = JSON.parse(storedGas);
+        draftCounterSales.gasSales.forEach(gs => {
+          const prevQty = prevSaved.gasSales?.find(p => p.type === gs.type || p.gasItemId === gs.gasItemId)?.quantity || 0;
+          const deltaQty = gs.quantity - prevQty;
+          if (deltaQty !== 0) {
+            gasList = gasList.map((g: any) => {
+              if (g.type === gs.type || g.id === gs.gasItemId) {
+                const newFull = Math.max(0, (g.full_count || 0) - deltaQty);
+                const newEmpty = Math.max(0, (g.empty_count || 0) + deltaQty);
+                return { ...g, full_count: newFull, empty_count: newEmpty };
+              }
+              return g;
+            });
+          }
+        });
+        localStorage.setItem(gasKey, JSON.stringify(gasList));
+      }
+
+      // Deduct Packaged Lubricants stock (delta)
+      if (draftCounterSales.lubeSales && draftCounterSales.lubeSales.length > 0) {
+        for (const ls of draftCounterSales.lubeSales) {
+          const prevQty = prevSaved.lubeSales?.find(p => p.id === ls.id)?.quantity || 0;
+          const deltaQty = ls.quantity - prevQty;
+          if (deltaQty > 0) {
+            await deductPackagedStock(ls.id, deltaQty);
+          }
+        }
+      }
+
+      // 2. Persist to activeShift state and LocalStorage
+      const updatedActiveShift: Shift = {
+        ...activeShift,
+        counterSales: draftCounterSales
+      };
+      setActiveShift(updatedActiveShift);
+      setCommittedCounterSales(JSON.parse(JSON.stringify(draftCounterSales)));
+      localStorage.setItem(`fuelflow_counter_sales_${activeShift.id}`, JSON.stringify(draftCounterSales));
+      localStorage.setItem(`fuelflow_counter_committed_${activeShift.id}`, JSON.stringify(draftCounterSales));
+
+      // 3. Persist to Supabase shifts table if available
+      try {
+        await supabase
+          .from('shifts')
+          .update({
+            counter_sales: JSON.stringify(draftCounterSales)
+          })
+          .eq('id', activeShift.id);
+      } catch (sbErr) {
+        console.warn('Supabase counter sales sync notice:', sbErr);
+      }
+
+      // Refresh available packaged lubes
+      fetchPackagedLubricants()
+        .then(lubes => setAvailablePackagedLubes(lubes))
+        .catch(() => {});
+
+      setToastMessage('✓ Counter Sales Saved Successfully!');
+      setTimeout(() => setToastMessage(null), 3500);
+    } catch (err) {
+      console.error('Error saving counter sales:', err);
+      setToastMessage('Error saving counter sales');
+      setTimeout(() => setToastMessage(null), 3500);
+    } finally {
+      setIsCounterSalesSaving(false);
+    }
+  };
+
+  // Determine if there are unsaved/uncommitted changes in counter sales
+  const hasUnsavedCounterSales = useMemo(() => {
+    if (!committedCounterSales) {
+      const currentQty = (draftCounterSales.gasSales || []).reduce((s, g) => s + (g.quantity || 0), 0) +
+        (draftCounterSales.lubeSales || []).reduce((s, l) => s + (l.quantity || 0), 0);
+      return currentQty > 0;
+    }
+
+    // Compare Gas Sales quantities
+    const gasUnsaved = (draftCounterSales.gasSales || []).some(g => {
+      const comm = (committedCounterSales.gasSales || []).find(cg => (cg.type === g.type || cg.gasItemId === g.gasItemId));
+      return (g.quantity || 0) !== (comm?.quantity || 0);
+    });
+    if (gasUnsaved) return true;
+
+    // Compare Lube Sales items & quantities
+    const draftLubes = draftCounterSales.lubeSales || [];
+    const commLubes = committedCounterSales.lubeSales || [];
+    if (draftLubes.length !== commLubes.length) return true;
+
+    const lubeUnsaved = draftLubes.some(dl => {
+      const cl = commLubes.find(c => c.id === dl.id);
+      return !cl || (dl.quantity || 0) !== (cl.quantity || 0);
+    });
+    return lubeUnsaved;
+  }, [draftCounterSales, committedCounterSales]);
 
   // Pump Transfer / Handover Modal State
   const [handoverPumpModal, setHandoverPumpModal] = useState<PumpReading | null>(null);
@@ -459,9 +693,95 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       const stored = localStorage.getItem(`fuelflow_settled_pumpers_${activeShift.id}`);
       setSettledPumperIds(stored ? JSON.parse(stored) : {});
 
+      // Sync Counter Sales
+      let initialCounter: ShiftCounterSales = {
+        gasSales: defaultGasSales,
+        lubeSales: [],
+        totalGasSales: 0,
+        totalLubeSales: 0,
+        totalCounterRevenue: 0
+      };
+
+      if (activeShift.counterSales) {
+        initialCounter = activeShift.counterSales;
+      } else {
+        const storedCounterSales = localStorage.getItem(`fuelflow_counter_sales_${activeShift.id}`);
+        if (storedCounterSales) {
+          try {
+            initialCounter = JSON.parse(storedCounterSales);
+          } catch (_) {}
+        }
+      }
+      setDraftCounterSales(initialCounter);
+
+      const storedCommitted = localStorage.getItem(`fuelflow_counter_committed_${activeShift.id}`);
+      if (storedCommitted) {
+        try {
+          setCommittedCounterSales(JSON.parse(storedCommitted));
+        } catch (_) {
+          setCommittedCounterSales(activeShift.counterSales || null);
+        }
+      } else {
+        setCommittedCounterSales(activeShift.counterSales || null);
+      }
+
+      // Load available packaged lubricants
+      fetchPackagedLubricants()
+        .then(lubes => setAvailablePackagedLubes(lubes))
+        .catch(err => console.warn('Error loading packaged lubes for shift:', err));
+
       setLockedStartMeters(initialLockedStarts);
       setLockedEndMeters(initialLockedEnds);
       setFinalizedPumperCards(initialFinalized);
+
+      // Load saved Credit, Card POS, Touch Card & Voucher sales from Supabase for this active shift
+      const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
+      if (isConfigured && activeShift?.id) {
+        Promise.all([
+          fetchCreditSalesByShift(supabase, activeShift.id),
+          fetchCardSalesByShift(supabase, activeShift.id),
+          fetchTouchCardSalesByShift(supabase, activeShift.id),
+          fetchVoucherSalesByShift(supabase, activeShift.id)
+        ]).then(([cData, cardData, tcData, vData]) => {
+          if ((cData && cData.length > 0) || (cardData && cardData.length > 0) || (tcData && tcData.length > 0) || (vData && vData.length > 0)) {
+            setDraftReadings(prev => {
+              if (!prev || prev.length === 0) return prev;
+              let hasChanges = false;
+              const updated = prev.map(r => {
+                const cMatch = cData?.find((c: any) => (c.pump_id || c.pumpid) === r.pumpId || (r.assignedPumperId && (c.pumper_id || c.pumperid) === r.assignedPumperId));
+                const cardMatch = cardData?.find((cd: any) => (cd.pump_id || cd.pumpid) === r.pumpId || (r.assignedPumperId && (cd.pumper_id || cd.pumperid) === r.assignedPumperId));
+                const tcMatch = tcData?.find((t: any) => (t.pump_id || t.pumpid) === r.pumpId || (r.assignedPumperId && (t.pumper_id || t.pumperid) === r.assignedPumperId));
+                const vMatch = vData?.find((v: any) => (v.pump_id || v.pumpid) === r.pumpId || (r.assignedPumperId && (v.pumper_id || v.pumperid) === r.assignedPumperId));
+
+                const cAmount = cMatch ? Number(cMatch.amount || cMatch.credit_amount || cMatch.total_amount) : r.creditSalesAmount;
+                const cardAmount = cardMatch ? Number(cardMatch.amount || cardMatch.card_amount || cardMatch.total_amount) : r.cardSalesAmount;
+                const tcAmount = tcMatch ? Number(tcMatch.amount || tcMatch.touch_card_amount || tcMatch.total_amount) : r.touchCardSalesAmount;
+                const vAmount = vMatch ? Number(vMatch.amount || vMatch.voucher_amount || vMatch.total_amount) : r.voucherSalesAmount;
+
+                if (
+                  (cAmount !== undefined && cAmount !== r.creditSalesAmount) ||
+                  (cardAmount !== undefined && cardAmount !== r.cardSalesAmount) ||
+                  (tcAmount !== undefined && tcAmount !== r.touchCardSalesAmount) ||
+                  (vAmount !== undefined && vAmount !== r.voucherSalesAmount)
+                ) {
+                  hasChanges = true;
+                  return {
+                    ...r,
+                    creditSalesAmount: cAmount ?? r.creditSalesAmount,
+                    cardSalesAmount: cardAmount ?? r.cardSalesAmount,
+                    touchCardSalesAmount: tcAmount ?? r.touchCardSalesAmount,
+                    voucherSalesAmount: vAmount ?? r.voucherSalesAmount
+                  };
+                }
+                return r;
+              });
+              return hasChanges ? updated : prev;
+            });
+          }
+        }).catch(err => {
+          console.warn("Notice: Error loading non-cash sales for active shift:", err);
+        });
+      }
     } else {
       lastSyncedShiftIdRef.current = null;
       setDraftReadings([]);
@@ -476,6 +796,14 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       setLockedStartMeters({});
       setLockedEndMeters({});
       setFinalizedPumperCards({});
+      setDraftCounterSales({
+        gasSales: defaultGasSales,
+        lubeSales: [],
+        totalGasSales: 0,
+        totalLubeSales: 0,
+        totalCounterRevenue: 0
+      });
+      setCommittedCounterSales(null);
     }
   }, [activeShift?.id, pumps, tanks, oilTanks]);
 
@@ -494,6 +822,7 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
 
       if (isConfigured) {
         try {
+          // Fetch closed shifts
           const { data, error } = await supabase
             .from('shifts')
             .select(`
@@ -503,71 +832,167 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
             .eq('isactive', false)
             .order('starttime', { ascending: false });
 
+          // Fetch bank deposits and non-cash sales
+          let ledgerDeposits: Record<string, number> = {};
+          let creditByShift: Record<string, number> = {};
+          let cardByShift: Record<string, number> = {};
+          let touchCardByShift: Record<string, number> = {};
+          let voucherByShift: Record<string, number> = {};
+
+          try {
+            const { data: depData } = await supabase
+              .from('shift_bank_deposits')
+              .select('shift_id, deposited_amount');
+            if (depData && Array.isArray(depData)) {
+              depData.forEach((d: any) => {
+                const sId = d.shift_id || d.shiftId;
+                const amt = Number(d.deposited_amount || d.depositedAmount || d.amount) || 0;
+                if (sId) {
+                  ledgerDeposits[sId] = (ledgerDeposits[sId] || 0) + amt;
+                }
+              });
+            }
+          } catch (_) {}
+
+          try {
+            const { data: creditData } = await supabase
+              .from('credit_transactions')
+              .select('shift_id, amount');
+            if (creditData && Array.isArray(creditData)) {
+              creditData.forEach((c: any) => {
+                const sId = c.shift_id;
+                const amt = Number(c.amount) || 0;
+                if (sId) creditByShift[sId] = (creditByShift[sId] || 0) + amt;
+              });
+            }
+          } catch (_) {}
+
+          try {
+            const { data: csData } = await supabase
+              .from('credit_sales')
+              .select('shift_id, amount, credit_amount, total_amount');
+            if (csData && Array.isArray(csData)) {
+              csData.forEach((c: any) => {
+                const sId = c.shift_id || c.shiftId;
+                const amt = Number(c.amount || c.credit_amount || c.total_amount) || 0;
+                if (sId) creditByShift[sId] = Math.max(creditByShift[sId] || 0, amt);
+              });
+            }
+          } catch (_) {}
+
+          try {
+            const { data: cardData } = await supabase
+              .from('card_sales')
+              .select('shift_id, amount, card_amount, total_amount');
+            if (cardData && Array.isArray(cardData)) {
+              cardData.forEach((c: any) => {
+                const sId = c.shift_id || c.shiftId;
+                const amt = Number(c.amount || c.card_amount || c.total_amount) || 0;
+                if (sId) cardByShift[sId] = (cardByShift[sId] || 0) + amt;
+              });
+            }
+          } catch (_) {}
+
+          try {
+            const { data: tcData } = await supabase
+              .from('touch_card_sales')
+              .select('shift_id, amount, touch_card_amount, total_amount');
+            if (tcData && Array.isArray(tcData)) {
+              tcData.forEach((c: any) => {
+                const sId = c.shift_id || c.shiftId;
+                const amt = Number(c.amount || c.touch_card_amount || c.total_amount) || 0;
+                if (sId) touchCardByShift[sId] = (touchCardByShift[sId] || 0) + amt;
+              });
+            }
+          } catch (_) {}
+
+          try {
+            const { data: vData } = await supabase
+              .from('voucher_sales')
+              .select('shift_id, amount, voucher_amount, total_amount');
+            if (vData && Array.isArray(vData)) {
+              vData.forEach((c: any) => {
+                const sId = c.shift_id || c.shiftId;
+                const amt = Number(c.amount || c.voucher_amount || c.total_amount) || 0;
+                if (sId) voucherByShift[sId] = (voucherByShift[sId] || 0) + amt;
+              });
+            }
+          } catch (_) {}
+
           if (data && !error && data.length > 0) {
-            fetched = data.map((s: any) => ({
-              id: s.id,
-              name: s.name,
-              supervisorId: s.supervisorid,
-              supervisorName: employees.find(e => e.id === s.supervisorid)?.name || 'Unassigned',
-              startTime: s.starttime,
-              endTime: s.endtime,
-              isActive: s.isactive,
-              totalFuelSold: s.totalfuelsold || 0,
-              totalNetSold: s.totalnetsold || 0,
-              totalNetSales: s.totalnetsales || 0,
-              initialPumperCash: s.initialpumpercash || s.initialPumperCash || 0,
-              replacementPumperCash: s.replacementpumpercash || s.replacementPumperCash || 0,
-              totalPhysicalCash: s.totalphysicalcash || s.totalPhysicalCash || 0,
-              cashVariance: s.cashvariance !== undefined ? s.cashvariance : s.cashVariance,
-              handoverNotes: s.handovernotes || s.handoverNotes || '',
-              replacementPumperId: s.replacementpumperid || s.replacementPumperId || '',
-              pumpReadings: (s.pumpReadings || []).map((r: any) => ({
-                pumpId: r.pump_id || r.pumpid,
-                pumpName: r.pump_name || r.pumpname,
-                fuelType: r.fuel_type || r.fueltype,
-                tankId: r.tank_id || r.tankid,
-                assignedPumperId: r.assigned_pumper_id || r.assignedpumperid,
-                startMeter: Number(r.start_meter !== undefined ? r.start_meter : r.startmeter) || 0,
-                endMeter: Number(r.end_meter !== undefined ? r.end_meter : r.endmeter) || 0,
-                testingQty: Number(r.testing_qty !== undefined ? r.testing_qty : r.testingqty) || 0,
-                status: r.status,
-                isLocked: r.is_locked !== undefined ? r.is_locked : r.islocked,
-                unitPrice: Number(r.unit_price || r.unitprice) || 0,
-                actualCash: Number(r.actual_cash ?? r.actualcash) || 0,
-                cashVariance: Number(r.cash_variance ?? r.cashvariance) || 0,
-                creditSalesAmount: Number(r.credit_sales_amount ?? r.creditsalesamount) || 0,
-                cardSalesAmount: Number(r.card_sales_amount ?? r.cardsalesamount) || 0,
-                oilSalesAmount: Number(r.oil_sales_amount ?? r.oilsalesamount) || 0,
-                totalDispensed: Math.max(0, (Number(r.end_meter ?? r.endmeter) || 0) - (Number(r.start_meter ?? r.startmeter) || 0)),
-                netSales: Math.max(0, ((Number(r.end_meter ?? r.endmeter) || 0) - (Number(r.start_meter ?? r.startmeter) || 0) - (Number(r.testing_qty ?? r.testingqty) || 0))) * (Number(r.unit_price || r.unitprice) || 0)
-              }))
-            }));
+            fetched = data.map((s: any) => {
+              const bankedAmt = ledgerDeposits[s.id] !== undefined
+                ? ledgerDeposits[s.id]
+                : Number(s.cash_banked ?? s.cashbanked ?? s.cashBanked) || 0;
+
+              const shiftCredit = creditByShift[s.id] || Number(s.credit_sales ?? s.creditsales ?? s.creditSales ?? s.total_credit_sales) || 0;
+              const shiftCard = cardByShift[s.id] || Number(s.card_sales ?? s.cardsales ?? s.cardSales ?? s.total_card_sales) || 0;
+              const shiftTouch = touchCardByShift[s.id] || Number(s.touch_card_sales ?? s.touchcardsales ?? s.touchCardSales ?? s.total_touch_card_sales) || 0;
+              const shiftVoucher = voucherByShift[s.id] || Number(s.voucher_sales ?? s.vouchersales ?? s.voucherSales ?? s.total_voucher_sales) || 0;
+
+              return {
+                id: s.id,
+                name: s.name,
+                supervisorId: s.supervisorid,
+                supervisorName: employees.find(e => e.id === s.supervisorid)?.name || 'Unassigned',
+                startTime: s.starttime,
+                endTime: s.endtime,
+                isActive: s.isactive,
+                totalFuelSold: s.totalfuelsold || 0,
+                totalNetSold: s.totalnetsold || 0,
+                totalNetSales: s.totalnetsales || 0,
+                initialPumperCash: s.initialpumpercash || s.initialPumperCash || 0,
+                replacementPumperCash: s.replacementpumpercash || s.replacementPumperCash || 0,
+                totalPhysicalCash: s.totalphysicalcash || s.totalPhysicalCash || 0,
+                cashVariance: s.cashvariance !== undefined ? s.cashvariance : s.cashVariance,
+                cashBanked: bankedAmt,
+                cash_banked: bankedAmt,
+                credit_sales: shiftCredit,
+                card_sales: shiftCard,
+                touch_card_sales: shiftTouch,
+                voucher_sales: shiftVoucher,
+                creditSales: shiftCredit,
+                cardSales: shiftCard,
+                touchCardSales: shiftTouch,
+                voucherSales: shiftVoucher,
+                handoverNotes: s.handovernotes || s.handoverNotes || '',
+                replacementPumperId: s.replacementpumperid || s.replacementPumperId || '',
+                pumpReadings: (s.pumpReadings || []).map((r: any) => ({
+                  pumpId: r.pump_id || r.pumpid,
+                  pumpName: r.pump_name || r.pumpname,
+                  fuelType: r.fuel_type || r.fueltype,
+                  tankId: r.tank_id || r.tankid,
+                  assignedPumperId: r.assigned_pumper_id || r.assignedpumperid,
+                  startMeter: Number(r.start_meter !== undefined ? r.start_meter : r.startmeter) || 0,
+                  endMeter: Number(r.end_meter !== undefined ? r.end_meter : r.endmeter) || 0,
+                  testingQty: Number(r.testing_qty !== undefined ? r.testing_qty : r.testingqty) || 0,
+                  status: r.status,
+                  isLocked: r.is_locked !== undefined ? r.is_locked : r.islocked,
+                  unitPrice: Number(r.unit_price || r.unitprice) || 0,
+                  actualCash: Number(r.actual_cash ?? r.actualcash) || 0,
+                  cashVariance: Number(r.cash_variance ?? r.cashvariance) || 0,
+                  creditSalesAmount: Number(r.credit_sales_amount ?? r.creditsalesamount ?? r.creditSalesAmount) || 0,
+                  cardSalesAmount: Number(r.card_sales_amount ?? r.cardsalesamount ?? r.cardSalesAmount) || 0,
+                  touchCardSalesAmount: Number(r.touch_card_sales_amount ?? r.touchcardsalesamount ?? r.touchCardSalesAmount) || 0,
+                  voucherSalesAmount: Number(r.voucher_sales_amount ?? r.vouchersalesamount ?? r.voucherSalesAmount) || 0,
+                  oilSalesAmount: Number(r.oil_sales_amount ?? r.oilsalesamount ?? r.oilSalesAmount) || 0,
+                  totalDispensed: Math.max(0, (Number(r.end_meter ?? r.endmeter) || 0) - (Number(r.start_meter ?? r.startmeter) || 0)),
+                  netSales: Math.max(0, ((Number(r.end_meter ?? r.endmeter) || 0) - (Number(r.start_meter ?? r.startmeter) || 0) - (Number(r.testing_qty ?? r.testingqty) || 0))) * (Number(r.unit_price || r.unitprice) || 0)
+                }))
+              };
+            });
           }
         } catch (err) {
           console.warn("Notice: Error loading closed shifts from Supabase:", err);
         }
       }
 
-      const combinedMap = new Map<string, any>();
-      (shiftHistory || []).forEach(s => {
-        if (!s.isActive) combinedMap.set(s.id, s);
-      });
-      fetched.forEach(s => {
-        combinedMap.set(s.id, s);
-      });
-
-      const list = Array.from(combinedMap.values()).sort((a, b) => {
-        const tA = new Date(b.startTime || b.endTime || 0).getTime();
-        const tB = new Date(a.startTime || a.endTime || 0).getTime();
-        return tA - tB;
-      });
-
-      setClosedLedgerShifts(list);
+      setClosedLedgerShifts(fetched);
       setIsLoadingLedger(false);
     };
 
     fetchClosedShiftsFromSupabase();
-  }, [shiftHistory, employees]);
+  }, [employees]);
 
   React.useEffect(() => {
     const fetchLatestReadingsFromSupabase = async () => {
@@ -707,7 +1132,25 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
   // Running totals calculations based on draftReadings (enables live calculation feedback)
   const stats = useMemo(() => {
     if (!activeShift || draftReadings.length === 0) {
-      return { runningPumps: 0, totalFuelSold: 0, totalNetSold: 0, totalFuelSales: 0, totalOilSales: 0, totalNetSales: 0 };
+      return {
+        runningPumps: 0,
+        totalFuelSold: 0,
+        totalNetSold: 0,
+        totalFuelSales: 0,
+        totalOilSales: 0,
+        totalCreditSales: 0,
+        totalCardSales: 0,
+        totalTouchCardSales: 0,
+        totalVoucherSales: 0,
+        totalNonCashSales: 0,
+        totalExpectedCash: 0,
+        totalActualCash: 0,
+        totalCashVariance: 0,
+        totalCounterRevenue: 0,
+        totalGasSales: 0,
+        totalLubeSales: 0,
+        totalNetSales: 0
+      };
     }
     
     let runningPumps = 0;
@@ -715,6 +1158,11 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
     let totalNetSold = 0;
     let totalFuelSales = 0;
     let totalOilSales = 0;
+    let totalCreditSales = 0;
+    let totalCardSales = 0;
+    let totalTouchCardSales = 0;
+    let totalVoucherSales = 0;
+    let totalActualCash = 0;
 
     draftReadings.forEach(r => {
       if (r.assignedPumperId) {
@@ -730,9 +1178,25 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       totalNetSold += netSold;
       totalFuelSales += fuelRev;
       totalOilSales += oilRev;
+      totalCreditSales += (r.creditSalesAmount || 0);
+      totalCardSales += (r.cardSalesAmount || 0);
+      totalTouchCardSales += (r.touchCardSalesAmount || 0);
+      totalVoucherSales += (r.voucherSalesAmount || 0);
+      totalActualCash += (r.actualCash || 0);
     });
 
-    const totalNetSales = totalFuelSales + totalOilSales;
+    const totalGasSales = draftCounterSales.totalGasSales !== undefined 
+      ? draftCounterSales.totalGasSales 
+      : (draftCounterSales.gasSales || []).reduce((sum, g) => sum + (Number(g.totalAmount) || 0), 0);
+    const totalLubeSales = draftCounterSales.totalLubeSales !== undefined 
+      ? draftCounterSales.totalLubeSales 
+      : (draftCounterSales.lubeSales || []).reduce((sum, l) => sum + (Number(l.totalAmount) || 0), 0);
+    const totalCounterRevenue = totalGasSales + totalLubeSales;
+    const totalGrossSales = totalFuelSales + totalOilSales + totalGasSales + totalLubeSales;
+    const totalNetSales = totalGrossSales;
+    const totalNonCashSales = totalCreditSales + totalCardSales + totalTouchCardSales + totalVoucherSales;
+    const totalExpectedCash = Math.max(0, totalGrossSales - totalNonCashSales);
+    const totalCashVariance = totalActualCash - totalExpectedCash;
 
     return {
       runningPumps,
@@ -740,9 +1204,25 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       totalNetSold,
       totalFuelSales,
       totalOilSales,
+      totalGasSales,
+      totalLubeSales,
+      totalPackagedLubeSales: totalLubeSales,
+      totalCreditSales,
+      totalCardSales,
+      totalTouchCardSales,
+      totalVoucherSales,
+      totalNonCashSales,
+      totalExpectedCash,
+      expectedCash: totalExpectedCash,
+      totalActualCash,
+      actualCash: totalActualCash,
+      totalCashVariance,
+      cashVariance: totalCashVariance,
+      totalCounterRevenue,
+      totalGrossSales,
       totalNetSales
     };
-  }, [activeShift, draftReadings, tanks]);
+  }, [activeShift, draftReadings, tanks, draftCounterSales]);
 
   // Liters categorized by fuel type based on draftReadings
   const fuelTypeTotals = useMemo(() => {
@@ -768,6 +1248,43 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
 
     return totals;
   }, [activeShift, draftReadings, tanks]);
+
+  // LP Gas sales totals (volume / cylinders & revenue)
+  const gasTotals = useMemo(() => {
+    const gasItems = draftCounterSales.gasSales || defaultGasSales;
+    const totalCylinders = gasItems.reduce((sum, g) => sum + (Number(g.quantity) || 0), 0);
+    const totalKg = gasItems.reduce((sum, g) => {
+      const qty = Number(g.quantity) || 0;
+      const sizeStr = (g.size || g.type || '').toLowerCase();
+      let kgPerUnit = 12.5;
+      if (sizeStr.includes('5')) kgPerUnit = 5.0;
+      else if (sizeStr.includes('2.3')) kgPerUnit = 2.3;
+      else if (sizeStr.includes('37.5')) kgPerUnit = 37.5;
+      else if (sizeStr.includes('12.5')) kgPerUnit = 12.5;
+      return sum + (qty * kgPerUnit);
+    }, 0);
+    const totalSales = draftCounterSales.totalGasSales ?? gasItems.reduce((sum, g) => sum + (Number(g.totalAmount) || 0), 0);
+    return { totalCylinders, totalKg, totalSales };
+  }, [draftCounterSales, defaultGasSales]);
+
+  // Oil & Lubricants sales totals (units & revenue)
+  const oilTotals = useMemo(() => {
+    const lubeItems = draftCounterSales.lubeSales || [];
+    const totalUnits = lubeItems.reduce((sum, l) => sum + (Number(l.quantity) || 0), 0);
+    const totalLiters = lubeItems.reduce((sum, l) => {
+      const qty = Number(l.quantity) || 0;
+      const sizeStr = (l.packSize || l.packageSize || '').toLowerCase();
+      let litersPerPack = 1;
+      if (sizeStr.includes('500ml') || sizeStr.includes('0.5l')) litersPerPack = 0.5;
+      else if (sizeStr.includes('4l') || sizeStr.includes('4 l')) litersPerPack = 4;
+      else if (sizeStr.includes('5l') || sizeStr.includes('5 l')) litersPerPack = 5;
+      else if (sizeStr.includes('20l') || sizeStr.includes('20 l')) litersPerPack = 20;
+      else if (sizeStr.includes('1l') || sizeStr.includes('1 l')) litersPerPack = 1;
+      return sum + (qty * litersPerPack);
+    }, 0);
+    const totalSales = (stats.totalOilSales || 0) + (stats.totalLubeSales || 0);
+    return { totalUnits, totalLiters, totalSales };
+  }, [draftCounterSales, stats.totalOilSales, stats.totalLubeSales]);
 
   // Fuel badge color helper function
   const getFuelBadgeStyles = (fuelType: string) => {
@@ -844,6 +1361,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       let totalNetLiters = 0;
       let totalCreditSales = 0;
       let totalCardSales = 0;
+      let totalTouchCardSales = 0;
+      let totalVoucherSales = 0;
       let totalActualCash = 0;
 
       pumper.readings.forEach(r => {
@@ -856,6 +1375,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         const grossTotalRev = grossFuelRev + oilSales;
         const creditVal = r.creditSalesAmount || 0;
         const cardVal = r.cardSalesAmount || 0;
+        const touchCardVal = r.touchCardSalesAmount || 0;
+        const voucherVal = r.voucherSalesAmount || 0;
         const actCash = r.actualCash || 0;
 
         totalFuelRevenue += grossFuelRev;
@@ -864,10 +1385,12 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         totalNetLiters += netSold;
         totalCreditSales += creditVal;
         totalCardSales += cardVal;
+        totalTouchCardSales += touchCardVal;
+        totalVoucherSales += voucherVal;
         totalActualCash += actCash;
       });
 
-      const totalNonCash = totalCreditSales + totalCardSales;
+      const totalNonCash = totalCreditSales + totalCardSales + totalTouchCardSales + totalVoucherSales;
       const totalNetExpCash = Math.max(0, totalGrossRevenue - totalNonCash);
       const totalCashVariance = totalActualCash - totalNetExpCash;
 
@@ -880,6 +1403,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         totalNonCash,
         totalCreditSales,
         totalCardSales,
+        totalTouchCardSales,
+        totalVoucherSales,
         totalNetExpCash,
         totalActualCash,
         totalCashVariance,
@@ -909,12 +1434,15 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       const grossTotalRev = grossFuelRev + oilSales;
       const creditVal = r.creditSalesAmount || 0;
       const cardVal = r.cardSalesAmount || 0;
-      const rawNetExpCash = grossTotalRev - (creditVal + cardVal);
-      return { pumpId: r.pumpId, grossTotalRev, creditVal, cardVal, rawNetExpCash, status: r.status };
+      const touchCardVal = r.touchCardSalesAmount || 0;
+      const voucherVal = r.voucherSalesAmount || 0;
+      const totalPumpNonCash = creditVal + cardVal + touchCardVal + voucherVal;
+      const rawNetExpCash = grossTotalRev - totalPumpNonCash;
+      return { pumpId: r.pumpId, grossTotalRev, creditVal, cardVal, touchCardVal, voucherVal, totalPumpNonCash, rawNetExpCash, status: r.status };
     });
 
     const totalGrossRevenue = pumpData.reduce((acc, p) => acc + p.grossTotalRev, 0);
-    const totalNonCash = pumpData.reduce((acc, p) => acc + p.creditVal + p.cardVal, 0);
+    const totalNonCash = pumpData.reduce((acc, p) => acc + p.totalPumpNonCash, 0);
     const totalNetExpCash = Math.max(0, totalGrossRevenue - totalNonCash);
 
     let allocatedSoFar = 0;
@@ -949,7 +1477,10 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         const grossTotalRev = grossFuelRev + oilSales;
         const creditVal = r.creditSalesAmount || 0;
         const cardVal = r.cardSalesAmount || 0;
-        const rawNet = grossTotalRev - (creditVal + cardVal);
+        const touchCardVal = r.touchCardSalesAmount || 0;
+        const voucherVal = r.voucherSalesAmount || 0;
+        const totalPumpNonCash = creditVal + cardVal + touchCardVal + voucherVal;
+        const rawNet = grossTotalRev - totalPumpNonCash;
         const netExpCash = (rawNet < 0 && pumperHasExcessRevenue) ? rawNet : Math.max(0, rawNet);
         const computedVariance = actCash - netExpCash;
 
@@ -989,7 +1520,7 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
   // Handle live updates to a specific pump's readings in local draft state
   const handleUpdateReading = (
     pumpId: string,
-    field: 'assignedPumperId' | 'startMeter' | 'endMeter' | 'testingQty' | 'actualCash' | 'creditSalesAmount' | 'cardSalesAmount' | 'oilSalesAmount',
+    field: 'assignedPumperId' | 'startMeter' | 'endMeter' | 'testingQty' | 'actualCash' | 'creditSalesAmount' | 'cardSalesAmount' | 'touchCardSalesAmount' | 'voucherSalesAmount' | 'oilSalesAmount',
     value: any,
     targetReadingIdOrPumperId?: string
   ) => {
@@ -1020,6 +1551,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         const testQ = field === 'testingQty' ? (parseFloat(value) || 0) : r.testingQty;
         const creditVal = field === 'creditSalesAmount' ? (parseFloat(value) || 0) : (r.creditSalesAmount ?? 0);
         const cardVal = field === 'cardSalesAmount' ? (parseFloat(value) || 0) : (r.cardSalesAmount ?? 0);
+        const touchCardVal = field === 'touchCardSalesAmount' ? (parseFloat(value) || 0) : (r.touchCardSalesAmount ?? 0);
+        const voucherVal = field === 'voucherSalesAmount' ? (parseFloat(value) || 0) : (r.voucherSalesAmount ?? 0);
         const oilVal = field === 'oilSalesAmount' ? (parseFloat(value) || 0) : (r.oilSalesAmount ?? 0);
         const actCash = field === 'actualCash' ? (parseFloat(value) || 0) : (r.actualCash ?? 0);
 
@@ -1027,7 +1560,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         const netSold = Math.max(0, fuelSold - testQ);
         const grossFuelRevenue = netSold * fuelPrice;
         const totalGrossRevenue = grossFuelRevenue + oilVal;
-        const rawNetExpCash = totalGrossRevenue - (creditVal + cardVal);
+        const totalNonCash = creditVal + cardVal + touchCardVal + voucherVal;
+        const rawNetExpCash = totalGrossRevenue - totalNonCash;
         let netExpectedCash = rawNetExpCash;
         if (rawNetExpCash < 0) {
           const otherPumpsExcess = draftReadings
@@ -1038,7 +1572,7 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
               const oSold = oIsOil ? 0 : Math.max(0, dr.endMeter - dr.startMeter);
               const oNet = oIsOil ? 0 : Math.max(0, oSold - dr.testingQty);
               const oGross = (oNet * oPrice) + (dr.oilSalesAmount || 0);
-              const oNonCash = (dr.creditSalesAmount || 0) + (dr.cardSalesAmount || 0);
+              const oNonCash = (dr.creditSalesAmount || 0) + (dr.cardSalesAmount || 0) + (dr.touchCardSalesAmount || 0) + (dr.voucherSalesAmount || 0);
               return sum + Math.max(0, oGross - oNonCash);
             }, 0);
 
@@ -1053,6 +1587,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
           [field]: value,
           creditSalesAmount: creditVal,
           cardSalesAmount: cardVal,
+          touchCardSalesAmount: touchCardVal,
+          voucherSalesAmount: voucherVal,
           oilSalesAmount: oilVal,
           actualCash: actCash,
           cashVariance: computedVariance
@@ -1087,7 +1623,29 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
             });
           }
 
-          // Direct fallback write to pump_readings table so card_sales_amount & credit_sales_amount are updated
+          if (field === 'touchCardSalesAmount' && touchCardVal > 0) {
+            saveTouchCardSale(supabase, {
+              shift_id: activeShift.id,
+              pump_id: pumpId,
+              pumper_id: r.assignedPumperId,
+              card_type: 'Touch Card',
+              amount: Number(touchCardVal),
+              status: 'Settled'
+            });
+          }
+
+          if (field === 'voucherSalesAmount' && voucherVal > 0) {
+            saveVoucherSale(supabase, {
+              shift_id: activeShift.id,
+              pump_id: pumpId,
+              pumper_id: r.assignedPumperId,
+              voucher_no: `VOUCH-${Date.now().toString().slice(-6)}`,
+              amount: Number(voucherVal),
+              status: 'Redeemed'
+            });
+          }
+
+          // Direct write to pump_readings table so all non-cash fields are updated
           upsertPumpReadings(supabase, [updated], activeShift.id);
         }, 500);
         
@@ -1156,8 +1714,11 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         const totalOilSales = updatedChambers.reduce((sum, ch) => sum + ch.totalAmount, 0);
         const creditVal = r.creditSalesAmount || 0;
         const cardVal = r.cardSalesAmount || 0;
+        const touchCardVal = r.touchCardSalesAmount || 0;
+        const voucherVal = r.voucherSalesAmount || 0;
         const actCash = r.actualCash || 0;
-        const netExpectedCash = Math.max(0, totalOilSales - (creditVal + cardVal));
+        const totalPumpNonCash = creditVal + cardVal + touchCardVal + voucherVal;
+        const netExpectedCash = Math.max(0, totalOilSales - totalPumpNonCash);
         const computedVariance = actCash - netExpectedCash;
 
         const updatedReading: PumpReading = {
@@ -1240,8 +1801,11 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         const totalOilSales = updatedChambers.reduce((sum, ch) => sum + ch.totalAmount, 0);
         const creditVal = r.creditSalesAmount || 0;
         const cardVal = r.cardSalesAmount || 0;
+        const touchCardVal = r.touchCardSalesAmount || 0;
+        const voucherVal = r.voucherSalesAmount || 0;
         const actCash = r.actualCash || 0;
-        const netExpectedCash = Math.max(0, totalOilSales - (creditVal + cardVal));
+        const totalPumpNonCash = creditVal + cardVal + touchCardVal + voucherVal;
+        const netExpectedCash = Math.max(0, totalOilSales - totalPumpNonCash);
         const computedVariance = actCash - netExpectedCash;
 
         const updatedReading: PumpReading = {
@@ -1422,11 +1986,12 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
     });
     setDraftReadings(updatedDraftReadings);
 
-    // Save pump readings to Supabase
+    // Save pump readings and all non-cash sales (credit, card, touch card, voucher) to Supabase
     try {
       await upsertPumpReadings(supabase, updatedDraftReadings.filter(r => r.assignedPumperId === pumperId), activeShift.id);
+      await syncAllNonCashSales(supabase, updatedDraftReadings.filter(r => r.assignedPumperId === pumperId), activeShift.id);
     } catch (err) {
-      console.warn('Pump readings sync note:', err);
+      console.warn('Pump readings & non-cash sync note:', err);
     }
 
     // Save pumper assignment & handed over cash summary to Supabase shift_pumper_assignments
@@ -1789,7 +2354,10 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         const grossRev = net * price;
         const creditVal = dr.creditSalesAmount ?? 0;
         const cardVal = dr.cardSalesAmount ?? 0;
-        const netExpCash = Math.max(0, grossRev - (creditVal + cardVal));
+        const touchCardVal = dr.touchCardSalesAmount ?? 0;
+        const voucherVal = dr.voucherSalesAmount ?? 0;
+        const totalPumpNonCash = creditVal + cardVal + touchCardVal + voucherVal;
+        const netExpCash = Math.max(0, grossRev - totalPumpNonCash);
         const actCash = dr.actualCash ?? 0;
         const pVariance = dr.cashVariance ?? (actCash - netExpCash);
 
@@ -1800,6 +2368,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
           unitPrice: price,
           creditSalesAmount: creditVal,
           cardSalesAmount: cardVal,
+          touchCardSalesAmount: touchCardVal,
+          voucherSalesAmount: voucherVal,
           actualCash: actCash,
           cashVariance: pVariance
         };
@@ -1991,6 +2561,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       let totalNetLiters = 0;
       let totalCreditSales = 0;
       let totalCardSales = 0;
+      let totalTouchCardSales = 0;
+      let totalVoucherSales = 0;
       let totalActualCash = 0;
 
       assignedReadings.forEach(r => {
@@ -2003,6 +2575,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         const grossTotalRev = grossFuelRev + oilSales;
         const creditVal = r.creditSalesAmount || 0;
         const cardVal = r.cardSalesAmount || 0;
+        const touchCardVal = r.touchCardSalesAmount || 0;
+        const voucherVal = r.voucherSalesAmount || 0;
         const actCash = r.actualCash || 0;
 
         totalFuelRevenue += grossFuelRev;
@@ -2011,10 +2585,12 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         totalNetLiters += netSold;
         totalCreditSales += creditVal;
         totalCardSales += cardVal;
+        totalTouchCardSales += touchCardVal;
+        totalVoucherSales += voucherVal;
         totalActualCash += actCash;
       });
 
-      const totalNonCash = totalCreditSales + totalCardSales;
+      const totalNonCash = totalCreditSales + totalCardSales + totalTouchCardSales + totalVoucherSales;
       const totalExpectedCash = Math.max(0, totalGrossRevenue - totalNonCash);
       const cashVariance = totalActualCash - totalExpectedCash;
 
@@ -2028,6 +2604,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         totalNonCash,
         totalCreditSales,
         totalCardSales,
+        totalTouchCardSales,
+        totalVoucherSales,
         totalExpectedCash,
         totalActualCash,
         cashVariance
@@ -2111,6 +2689,58 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
     setIsStartShiftOpen(false);
   };
 
+  // Real-time computed values for Shift Closing Modal
+  const modalPhysicalCashVal = parseFloat(physicalCashHandedOverInput) || 0;
+  const totalAllocatedNonCash = (varianceAllocations.card || 0) + (varianceAllocations.credit || 0) + (varianceAllocations.touchCard || 0) + (varianceAllocations.voucher || 0);
+  const effectiveModalNonCashSales = (stats.totalNonCashSales || 0) + totalAllocatedNonCash;
+  const effectiveModalGrossSales = stats.totalGrossSales || stats.totalNetSales || 0;
+  const effectiveModalExpectedCash = Math.max(0, effectiveModalGrossSales - effectiveModalNonCashSales);
+
+  // Dynamic Shift Cash Variance: (Physical Cash Handed Over + Non-Cash Sales) - Total Gross Revenue
+  const modalCashVariance = (modalPhysicalCashVal + effectiveModalNonCashSales) - effectiveModalGrossSales;
+  const baseShortageAmount = Math.max(0, effectiveModalGrossSales - (modalPhysicalCashVal + (stats.totalNonCashSales || 0)));
+
+  const handleQuickAllocateAll = (category: 'card' | 'credit' | 'touchCard' | 'voucher') => {
+    const unallocated = Math.max(0, -modalCashVariance);
+    if (unallocated > 0) {
+      setVarianceAllocations(prev => ({
+        ...prev,
+        [category]: Number(((prev[category] || 0) + unallocated).toFixed(2))
+      }));
+    } else if (baseShortageAmount > 0) {
+      setVarianceAllocations({
+        card: category === 'card' ? baseShortageAmount : 0,
+        credit: category === 'credit' ? baseShortageAmount : 0,
+        touchCard: category === 'touchCard' ? baseShortageAmount : 0,
+        voucher: category === 'voucher' ? baseShortageAmount : 0,
+      });
+    }
+  };
+
+  const handleToggleCategory = (category: 'card' | 'credit' | 'touchCard' | 'voucher', isChecked: boolean) => {
+    if (!isChecked) {
+      setVarianceAllocations(prev => ({ ...prev, [category]: 0 }));
+    } else {
+      const remainingShortage = Math.max(0, effectiveModalGrossSales - (modalPhysicalCashVal + (stats.totalNonCashSales || 0) + (totalAllocatedNonCash - (varianceAllocations[category] || 0))));
+      setVarianceAllocations(prev => ({
+        ...prev,
+        [category]: remainingShortage > 0 ? Number(remainingShortage.toFixed(2)) : 0
+      }));
+    }
+  };
+
+  const handleCustomCategoryAmountChange = (category: 'card' | 'credit' | 'touchCard' | 'voucher', valStr: string) => {
+    const val = parseFloat(valStr) || 0;
+    setVarianceAllocations(prev => ({
+      ...prev,
+      [category]: Math.max(0, val)
+    }));
+  };
+
+  const handleResetAllocations = () => {
+    setVarianceAllocations({ card: 0, credit: 0, touchCard: 0, voucher: 0 });
+  };
+
   // Perform validation check and open closing modal
   const handleEndShiftClick = () => {
     if (!activeShift) return;
@@ -2144,82 +2774,201 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
     } else {
       setValidationErrors([]);
       setShowValidationOverlay(false);
+      
+      const currentActualCash = stats.totalActualCash > 0 ? stats.totalActualCash : 0;
+      setPhysicalCashHandedOverInput(currentActualCash > 0 ? String(currentActualCash) : (stats.totalExpectedCash > 0 ? String(stats.totalExpectedCash) : '0'));
+      setVarianceAllocations({ card: 0, credit: 0, touchCard: 0, voucher: 0 });
       setIsCloseConfirmOpen(true);
     }
   };
 
   // Close shift permanently and lock ledger
-  const handleConfirmCloseShift = () => {
-    if (!activeShift) return;
+  const handleConfirmCloseShift = async () => {
+    if (!activeShift || isClosingShift) return;
+    setIsClosingShift(true);
     
-    let totalFuel = 0;
-    let totalNet = 0;
-    let totalSales = 0;
-    let totalPumpsActualCash = 0;
+    try {
+      let totalFuel = 0;
+      let totalNet = 0;
+      let totalSales = 0;
+      let totalPumpsActualCash = 0;
 
-    const finalReadings = draftReadings.map(r => {
-      const fuel = Math.max(0, r.endMeter - r.startMeter);
-      const net = Math.max(0, fuel - r.testingQty);
-      const price = getPriceForFuelType(r.fuelType);
-      const grossFuelRev = net * price;
-      const oilSales = r.oilSalesAmount ?? 0;
-      const totalGrossRev = grossFuelRev + oilSales;
-      const creditVal = r.creditSalesAmount ?? 0;
-      const cardVal = r.cardSalesAmount ?? 0;
-      const netExpCash = Math.max(0, totalGrossRev - (creditVal + cardVal));
-      const actCash = r.actualCash ?? 0;
-      const pVariance = r.cashVariance ?? (actCash - netExpCash);
+      const userPhysicalCash = parseFloat(physicalCashHandedOverInput) || 0;
+      const allocatedCard = varianceAllocations.card || 0;
+      const allocatedCredit = varianceAllocations.credit || 0;
+      const allocatedTouchCard = varianceAllocations.touchCard || 0;
+      const allocatedVoucher = varianceAllocations.voucher || 0;
 
-      totalFuel += fuel;
-      totalNet += net;
-      totalSales += totalGrossRev;
-      totalPumpsActualCash += actCash;
-      
-      return {
-        ...r,
-        status: 'Completed' as const,
-        unitPrice: r.unitPrice || price,
-        oilSalesAmount: oilSales,
-        creditSalesAmount: creditVal,
-        cardSalesAmount: cardVal,
-        actualCash: actCash,
-        cashVariance: pVariance
+      // Identify active readings for distributing non-cash allocations
+      const activeIndices = draftReadings
+        .map((r, idx) => (isPumpReadingActiveOrAssigned(r) ? idx : -1))
+        .filter(idx => idx !== -1);
+      const targetAllocationIdx = activeIndices.length > 0 ? activeIndices[0] : 0;
+
+      const finalReadings = draftReadings.map((r, idx) => {
+        const fuel = Math.max(0, r.endMeter - r.startMeter);
+        const net = Math.max(0, fuel - r.testingQty);
+        const price = getPriceForFuelType(r.fuelType);
+        const grossFuelRev = net * price;
+        const oilSales = r.oilSalesAmount ?? 0;
+        const totalGrossRev = grossFuelRev + oilSales;
+
+        // Apply quick-tagged non-cash adjustments to the pump reading so Supabase sync records them
+        const addCard = idx === targetAllocationIdx ? allocatedCard : 0;
+        const addCredit = idx === targetAllocationIdx ? allocatedCredit : 0;
+        const addTouchCard = idx === targetAllocationIdx ? allocatedTouchCard : 0;
+        const addVoucher = idx === targetAllocationIdx ? allocatedVoucher : 0;
+
+        const creditVal = (r.creditSalesAmount ?? 0) + addCredit;
+        const cardVal = (r.cardSalesAmount ?? 0) + addCard;
+        const touchCardVal = (r.touchCardSalesAmount ?? 0) + addTouchCard;
+        const voucherVal = (r.voucherSalesAmount ?? 0) + addVoucher;
+
+        const netExpCash = Math.max(0, totalGrossRev - (creditVal + cardVal + touchCardVal + voucherVal));
+        const actCash = r.actualCash ?? 0;
+        const pVariance = actCash - netExpCash;
+
+        totalFuel += fuel;
+        totalNet += net;
+        totalSales += totalGrossRev;
+        totalPumpsActualCash += actCash;
+        
+        return {
+          ...r,
+          status: 'Completed' as const,
+          unitPrice: r.unitPrice || price,
+          oilSalesAmount: oilSales,
+          creditSalesAmount: creditVal,
+          cardSalesAmount: cardVal,
+          touchCardSalesAmount: touchCardVal,
+          voucherSalesAmount: voucherVal,
+          actualCash: actCash,
+          cashVariance: pVariance
+        };
+      });
+
+      const initCash = Number(initialPumperCash) || 0;
+      const replCash = Number(replacementPumperCash) || 0;
+      const counterRevenue = draftCounterSales.totalCounterRevenue || 0;
+      const totalShiftGrossSales = totalSales + counterRevenue;
+
+      let totalCreditSum = 0;
+      let totalCardSum = 0;
+      let totalTouchCardSum = 0;
+      let totalVoucherSum = 0;
+      finalReadings.forEach(r => {
+        totalCreditSum += (r.creditSalesAmount || 0);
+        totalCardSum += (r.cardSalesAmount || 0);
+        totalTouchCardSum += (r.touchCardSalesAmount || 0);
+        totalVoucherSum += (r.voucherSalesAmount || 0);
+      });
+      const totalNonCashSales = totalCreditSum + totalCardSum + totalTouchCardSum + totalVoucherSum;
+
+      const effectivePhysicalCash = userPhysicalCash > 0
+        ? userPhysicalCash
+        : (totalPumpsActualCash > 0 ? (totalPumpsActualCash + counterRevenue) : (initCash + replCash + counterRevenue));
+
+      // Dynamic Shift Cash Variance: (Physical Cash Handed Over + Non-Cash Sales) - Total Gross Revenue
+      const variance = (effectivePhysicalCash + totalNonCashSales) - totalShiftGrossSales;
+      const rawBanked = typeof cashBankedInput === 'string' ? cashBankedInput.trim() : String(cashBankedInput ?? '');
+      const parsedBanked = parseFloat(rawBanked || '0');
+      const cashBankedVal = !isNaN(parsedBanked) && parsedBanked >= 0 ? Number(parsedBanked) : 0;
+
+      const activeReadings = finalReadings.filter(isPumpReadingActiveOrAssigned);
+
+      const closedShift: Shift = {
+        ...activeShift,
+        supervisorId: draftSupervisorId,
+        name: draftShiftName,
+        startTime: draftStartTime,
+        isActive: false,
+        endTime: new Date().toISOString(),
+        pumpReadings: activeReadings.length > 0 ? activeReadings : finalReadings,
+        totalFuelSold: totalFuel,
+        totalNetSold: totalNet,
+        totalNetSales: totalShiftGrossSales,
+        counterSales: draftCounterSales,
+        initialPumperCash: initCash,
+        replacementPumperCash: replCash,
+        totalPhysicalCash: effectivePhysicalCash,
+        credit_sales: totalCreditSum,
+        card_sales: totalCardSum,
+        touch_card_sales: totalTouchCardSum,
+        voucher_sales: totalVoucherSum,
+        creditSales: totalCreditSum,
+        cardSales: totalCardSum,
+        touchCardSales: totalTouchCardSum,
+        voucherSales: totalVoucherSum,
+        cashVariance: variance,
+        cashBanked: cashBankedVal,
+        cash_banked: cashBankedVal,
+        handoverNotes: handoverNotes,
+        replacementPumperId: replacementPumperId
       };
-    });
 
-    const initCash = Number(initialPumperCash) || 0;
-    const replCash = Number(replacementPumperCash) || 0;
-    const physCash = totalPumpsActualCash > 0 ? totalPumpsActualCash : (initCash + replCash);
-    const variance = physCash - totalSales;
+      // Deduct remaining Gas and Packaged Lubricants inventory (if not already committed)
+      try {
+        const prevSaved = committedCounterSales || {
+          gasSales: defaultGasSales,
+          lubeSales: [],
+          totalGasSales: 0,
+          totalLubeSales: 0,
+          totalCounterRevenue: 0
+        };
 
-    const closedShift: Shift = {
-      ...activeShift,
-      supervisorId: draftSupervisorId,
-      name: draftShiftName,
-      startTime: draftStartTime,
-      isActive: false,
-      endTime: new Date().toISOString(),
-      pumpReadings: finalReadings,
-      totalFuelSold: totalFuel,
-      totalNetSold: totalNet,
-      totalNetSales: totalSales,
-      initialPumperCash: initCash,
-      replacementPumperCash: replCash,
-      totalPhysicalCash: physCash,
-      cashVariance: variance,
-      handoverNotes: handoverNotes,
-      replacementPumperId: replacementPumperId
-    };
+        // 1. Deduct LP Gas Cylinders from local storage / inventory (delta)
+        const gasKey = 'fuelflow_lpgas_inventory';
+        const storedGas = localStorage.getItem(gasKey);
+        if (storedGas && draftCounterSales.gasSales) {
+          let gasList = JSON.parse(storedGas);
+          draftCounterSales.gasSales.forEach(gs => {
+            const prevQty = prevSaved.gasSales?.find(p => p.type === gs.type || p.gasItemId === gs.gasItemId)?.quantity || 0;
+            const deltaQty = gs.quantity - prevQty;
+            if (deltaQty !== 0) {
+              gasList = gasList.map((g: any) => {
+                if (g.type === gs.type || g.id === gs.gasItemId) {
+                  const newFull = Math.max(0, (g.full_count || 0) - deltaQty);
+                  const newEmpty = Math.max(0, (g.empty_count || 0) + deltaQty);
+                  return { ...g, full_count: newFull, empty_count: newEmpty };
+                }
+                return g;
+              });
+            }
+          });
+          localStorage.setItem(gasKey, JSON.stringify(gasList));
+        }
 
-    syncCreditAndCardSales(supabase, finalReadings, closedShift.id);
+        // 2. Deduct Packaged Lubricants bottles (delta)
+        if (draftCounterSales.lubeSales && draftCounterSales.lubeSales.length > 0) {
+          draftCounterSales.lubeSales.forEach(ls => {
+            const prevQty = prevSaved.lubeSales?.find(p => p.id === ls.id)?.quantity || 0;
+            const deltaQty = ls.quantity - prevQty;
+            if (deltaQty > 0) {
+              deductPackagedStock(ls.id, deltaQty);
+            }
+          });
+        }
+      } catch (invErr) {
+        console.warn('Inventory deduction notice on shift close:', invErr);
+      }
 
-    onCloseShift(closedShift);
-    setIsCloseConfirmOpen(false);
-    setToastMessage('✓ Shift Closed Successfully');
+      syncAllNonCashSales(supabase, activeReadings, closedShift.id);
 
-    setTimeout(() => {
-      setToastMessage(null);
-    }, 4000);
+      // Delegate authoritative shift closure, database update, and single deposit record insertion to parent handler
+      onCloseShift(closedShift);
+
+      setIsCloseConfirmOpen(false);
+      setCashBankedInput('');
+      setToastMessage('✓ Shift Closed Successfully');
+
+      setTimeout(() => {
+        setToastMessage(null);
+      }, 4000);
+    } catch (err) {
+      console.error('Error closing shift:', err);
+    } finally {
+      setIsClosingShift(false);
+    }
   };
 
   // Export current shift to CSV
@@ -2231,7 +2980,7 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
     csvContent += `Shift Name,${activeShift.name}\n`;
     csvContent += `Supervisor,${activeSupervisor?.name || 'N/A'}\n`;
     csvContent += `Started At,${new Date(activeShift.startTime).toLocaleString()}\n\n`;
-    csvContent += "Pump,Fuel Type,Assigned Pumper,Start Meter (L),End Meter (L),Fuel Sold (L),Testing Deducted (L),Net Sold (L),Fuel Price (Per Liter),Fuel Revenue,Oil/Lube Sales,Total Revenue,Credit Sales,Card Sales,Actual Cash\n";
+    csvContent += "Pump,Fuel Type,Assigned Pumper,Start Meter (L),End Meter (L),Fuel Sold (L),Testing Deducted (L),Net Sold (L),Fuel Price (Per Liter),Fuel Revenue (Rs.),Oil/Lube Sales (Rs.),Total Gross Revenue (Rs.),Credit Sales (Rs.),Card POS Sales (Rs.),Touch Card Sales (Rs.),Voucher Sales (Rs.),Total Non-Cash (Rs.),Actual Cash (Rs.)\n";
 
     activeShift.pumpReadings.forEach(r => {
       const pumperName = r.assignedPumperId 
@@ -2245,12 +2994,28 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       const totalRev = fuelRev + oilRev;
       const creditVal = r.creditSalesAmount || 0;
       const cardVal = r.cardSalesAmount || 0;
+      const touchCardVal = r.touchCardSalesAmount || 0;
+      const voucherVal = r.voucherSalesAmount || 0;
+      const totalNonCash = creditVal + cardVal + touchCardVal + voucherVal;
       const actCash = r.actualCash || 0;
 
-      csvContent += `"${r.pumpName}","${r.fuelType}","${pumperName}",${r.startMeter},${r.endMeter},${sold},${r.testingQty},${net},${price},${fuelRev.toFixed(2)},${oilRev.toFixed(2)},${totalRev.toFixed(2)},${creditVal.toFixed(2)},${cardVal.toFixed(2)},${actCash.toFixed(2)}\n`;
+      csvContent += `"${r.pumpName}","${r.fuelType}","${pumperName}",${r.startMeter},${r.endMeter},${sold},${r.testingQty},${net},${price},${fuelRev.toFixed(2)},${oilRev.toFixed(2)},${totalRev.toFixed(2)},${creditVal.toFixed(2)},${cardVal.toFixed(2)},${touchCardVal.toFixed(2)},${voucherVal.toFixed(2)},${totalNonCash.toFixed(2)},${actCash.toFixed(2)}\n`;
     });
 
-    csvContent += `\nTOTALS,,, , ,${stats.totalFuelSold.toFixed(2)}, ,${stats.totalNetSold.toFixed(2)}, ,${stats.totalNetSales.toFixed(2)}\n`;
+    csvContent += `\nSUMMARY & RECONCILIATION\n`;
+    csvContent += `Gross Fuel Sales (Rs.),${stats.totalFuelSales.toFixed(2)}\n`;
+    csvContent += `Loose Oil Sales (Rs.),${stats.totalOilSales.toFixed(2)}\n`;
+    csvContent += `LP Gas Sales (Rs.),${stats.totalGasSales.toFixed(2)}\n`;
+    csvContent += `Packaged Lubricant Sales (Rs.),${stats.totalPackagedLubeSales.toFixed(2)}\n`;
+    csvContent += `Total Gross Shift Revenue (Rs.),${stats.totalGrossSales.toFixed(2)}\n`;
+    csvContent += `(-) Corporate Credit Sales (Rs.),${stats.totalCreditSales.toFixed(2)}\n`;
+    csvContent += `(-) Card POS / Digital Swipes (Rs.),${stats.totalCardSales.toFixed(2)}\n`;
+    csvContent += `(-) Touch Card Sales (Rs.),${stats.totalTouchCardSales.toFixed(2)}\n`;
+    csvContent += `(-) Voucher / Coupon Sales (Rs.),${stats.totalVoucherSales.toFixed(2)}\n`;
+    csvContent += `Total Non-Cash Deductions (Rs.),${stats.totalNonCashSales.toFixed(2)}\n`;
+    csvContent += `Net Expected Physical Cash (Rs.),${stats.expectedCash.toFixed(2)}\n`;
+    csvContent += `Physical Cash Handed Over (Rs.),${stats.totalActualCash.toFixed(2)}\n`;
+    csvContent += `Shift Cash Variance (Rs.),${stats.cashVariance.toFixed(2)}\n`;
 
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement("a");
@@ -2303,82 +3068,160 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
           {/* Active Summary Running Totals */}
           <div id="shift-summary-grid" className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             
-            {/* Total Sales Large Bento */}
-            <div className="bg-[#E8F1F5] p-6 rounded-2xl border border-[#D0E2EB] text-[#1C1C1C] shadow-sm flex flex-col justify-between font-sans">
-              <div>
-                <span className="text-xs font-semibold uppercase tracking-wider text-gray-500 block">
-                  Total Expected Cash Revenue
+            {/* Ultra-Compact Financial Summary List View */}
+            <div id="shift-summary-financial-list" className="bg-white/95 p-2.5 sm:p-3 rounded-xl border border-gray-200/80 shadow-xs font-sans">
+              <div className="flex items-center justify-between pb-1.5 mb-1 border-b border-gray-100">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-gray-500 block">
+                  Shift Financial Summary
                 </span>
-                <span className="text-4xl tabular-nums font-extrabold mt-3 block tracking-tight">
-                  {formatCurrency(stats.totalNetSales)}
+                <span className="text-[9px] font-semibold text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-100 flex items-center gap-1 uppercase">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                  Live
                 </span>
               </div>
-              <div className="mt-6 pt-4 border-t border-gray-200 flex items-center justify-between text-xs text-gray-500">
-                <span>Active Shift ID: <strong className="text-[#1C1C1C] tabular-nums font-semibold">{activeShift.id}</strong></span>
-                <span className="bg-white px-2 py-0.5 rounded-lg text-[10px] font-semibold text-blue-600 animate-pulse uppercase border border-blue-100 shadow-sm">
-                  Live Syncing
-                </span>
+
+              <div className="divide-y divide-gray-100/80 text-xs">
+                {/* Row 1: EXPECTED CASH (Highlighted Total) */}
+                <div className="flex items-center justify-between py-1 bg-blue-50/50 -mx-1 px-1 rounded">
+                  <span className="text-[11px] font-bold text-blue-900 uppercase tracking-tight">EXPECTED CASH</span>
+                  <span className="text-xs sm:text-sm font-extrabold text-blue-700 tabular-nums">
+                    {formatCurrency(stats.totalExpectedCash)}
+                  </span>
+                </div>
+
+                {/* Row 2: Gross Fuel Sales */}
+                <div className="flex items-center justify-between py-0.5">
+                  <span className="text-[11px] font-medium text-gray-700">Gross Fuel Sales</span>
+                  <span className="text-xs font-bold text-gray-900 tabular-nums">
+                    {formatCurrency(stats.totalFuelSales)}
+                  </span>
+                </div>
+
+                {/* Row 3: Loose Oil Sales */}
+                <div className="flex items-center justify-between py-0.5">
+                  <span className="text-[11px] font-medium text-gray-700">(+) Loose Oil Sales</span>
+                  <span className="text-xs font-bold text-teal-900 tabular-nums">
+                    {formatCurrency(stats.totalOilSales || 0)}
+                  </span>
+                </div>
+
+                {/* Row 4: LP Gas Sales */}
+                <div className="flex items-center justify-between py-0.5">
+                  <span className="text-[11px] font-medium text-amber-800">(+) LP Gas Sales</span>
+                  <span className="text-xs font-bold text-amber-900 tabular-nums">
+                    {formatCurrency(stats.totalGasSales || 0)}
+                  </span>
+                </div>
+
+                {/* Row 5: Packaged Lubricant Sales */}
+                <div className="flex items-center justify-between py-0.5">
+                  <span className="text-[11px] font-medium text-teal-800">(+) Packaged Lubricants</span>
+                  <span className="text-xs font-bold text-teal-900 tabular-nums">
+                    {formatCurrency(stats.totalLubeSales || 0)}
+                  </span>
+                </div>
               </div>
             </div>
 
-            {/* Liters Sold Categorized by Fuel Type */}
-            <div className="glass-panel p-5 rounded-2xl lg:col-span-2 flex flex-col justify-between font-sans">
+            {/* Liters & Product Volume Breakdown (Fuel, LP Gas & Lubes) */}
+            <div className="glass-panel p-4 sm:p-5 rounded-2xl lg:col-span-2 flex flex-col justify-between font-sans">
               <div>
-                <span className="text-xs font-bold text-gray-500 uppercase tracking-wider block mb-3">
-                  Total Liters Sold (By Fuel Type)
-                </span>
+                <div className="flex items-center justify-between mb-2.5">
+                  <span className="text-xs font-bold text-gray-500 uppercase tracking-wider block">
+                    Total Volume &amp; Product Sales
+                  </span>
+                  <span className="text-[10px] text-gray-400 font-medium">Fuel • LP Gas • Lubricants</span>
+                </div>
                 
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
                   {/* Petrol 92 */}
-                  <div className="p-3 bg-blue-500/10 rounded-xl border border-blue-500/20">
-                    <span className="text-[10px] font-bold text-blue-600 uppercase block">Petrol 92</span>
-                    <span className="text-lg tabular-nums font-bold text-[#1C1C1C] mt-1 block">
+                  <div className="p-2.5 bg-blue-500/10 rounded-xl border border-blue-500/20">
+                    <span className="text-[10px] font-bold text-blue-600 uppercase block truncate">Petrol 92</span>
+                    <span className="text-base sm:text-lg tabular-nums font-bold text-[#1C1C1C] mt-1 block">
                       {formatLiters(fuelTypeTotals['Petrol 92'].net)}
                     </span>
-                    <span className="text-[10px] text-gray-500 tabular-nums mt-0.5 block">
+                    <span className="text-[10px] text-gray-500 tabular-nums mt-0.5 block truncate">
                       {formatCurrency(fuelTypeTotals['Petrol 92'].sales)}
                     </span>
                   </div>
 
                   {/* Petrol 95 */}
-                  <div className="p-3 bg-purple-500/10 rounded-xl border border-purple-500/20">
-                    <span className="text-[10px] font-bold text-purple-400 uppercase block">Petrol 95</span>
-                    <span className="text-lg tabular-nums font-bold text-[#1C1C1C] mt-1 block">
+                  <div className="p-2.5 bg-purple-500/10 rounded-xl border border-purple-500/20">
+                    <span className="text-[10px] font-bold text-purple-600 uppercase block truncate">Petrol 95</span>
+                    <span className="text-base sm:text-lg tabular-nums font-bold text-[#1C1C1C] mt-1 block">
                       {formatLiters(fuelTypeTotals['Petrol 95'].net)}
                     </span>
-                    <span className="text-[10px] text-gray-500 tabular-nums mt-0.5 block">
+                    <span className="text-[10px] text-gray-500 tabular-nums mt-0.5 block truncate">
                       {formatCurrency(fuelTypeTotals['Petrol 95'].sales)}
                     </span>
                   </div>
 
                   {/* Auto Diesel */}
-                  <div className="p-3 bg-amber-500/10 rounded-xl border border-amber-500/20">
-                    <span className="text-[10px] font-bold text-amber-400 uppercase block">Auto Diesel</span>
-                    <span className="text-lg tabular-nums font-bold text-[#1C1C1C] mt-1 block">
+                  <div className="p-2.5 bg-amber-500/10 rounded-xl border border-amber-500/20">
+                    <span className="text-[10px] font-bold text-amber-600 uppercase block truncate">Auto Diesel</span>
+                    <span className="text-base sm:text-lg tabular-nums font-bold text-[#1C1C1C] mt-1 block">
                       {formatLiters(fuelTypeTotals['Auto Diesel'].net)}
                     </span>
-                    <span className="text-[10px] text-gray-500 tabular-nums mt-0.5 block">
+                    <span className="text-[10px] text-gray-500 tabular-nums mt-0.5 block truncate">
                       {formatCurrency(fuelTypeTotals['Auto Diesel'].sales)}
                     </span>
                   </div>
 
                   {/* Super Diesel */}
-                  <div className="p-3 bg-emerald-500/10 rounded-xl border border-emerald-500/20">
-                    <span className="text-[10px] font-bold text-emerald-400 uppercase block">Super Diesel</span>
-                    <span className="text-lg tabular-nums font-bold text-[#1C1C1C] mt-1 block">
+                  <div className="p-2.5 bg-emerald-500/10 rounded-xl border border-emerald-500/20">
+                    <span className="text-[10px] font-bold text-emerald-600 uppercase block truncate">Super Diesel</span>
+                    <span className="text-base sm:text-lg tabular-nums font-bold text-[#1C1C1C] mt-1 block">
                       {formatLiters(fuelTypeTotals['Super Diesel'].net)}
                     </span>
-                    <span className="text-[10px] text-gray-500 tabular-nums mt-0.5 block">
+                    <span className="text-[10px] text-gray-500 tabular-nums mt-0.5 block truncate">
                       {formatCurrency(fuelTypeTotals['Super Diesel'].sales)}
+                    </span>
+                  </div>
+
+                  {/* LP Gas Sold */}
+                  <div className="p-2.5 bg-orange-500/10 rounded-xl border border-orange-500/20">
+                    <span className="text-[10px] font-bold text-orange-600 uppercase block truncate flex items-center gap-1">
+                      <Flame className="w-2.5 h-2.5 shrink-0 text-orange-500" /> LP Gas
+                    </span>
+                    <span className="text-base sm:text-lg tabular-nums font-bold text-[#1C1C1C] mt-1 block">
+                      {gasTotals.totalCylinders} <span className="text-xs font-semibold text-gray-500">Cyl</span>
+                    </span>
+                    <span className="text-[10px] text-gray-500 tabular-nums mt-0.5 block truncate">
+                      {formatCurrency(gasTotals.totalSales)}
+                    </span>
+                  </div>
+
+                  {/* Oil / Lubricants Sold */}
+                  <div className="p-2.5 bg-cyan-500/10 rounded-xl border border-cyan-500/20">
+                    <span className="text-[10px] font-bold text-cyan-700 uppercase block truncate flex items-center gap-1">
+                      <Droplet className="w-2.5 h-2.5 shrink-0 text-cyan-600" /> Oil &amp; Lubes
+                    </span>
+                    <span className="text-base sm:text-lg tabular-nums font-bold text-[#1C1C1C] mt-1 block">
+                      {oilTotals.totalUnits} <span className="text-xs font-semibold text-gray-500">Units</span>
+                    </span>
+                    <span className="text-[10px] text-gray-500 tabular-nums mt-0.5 block truncate">
+                      {formatCurrency(oilTotals.totalSales)}
                     </span>
                   </div>
                 </div>
               </div>
 
-              <div className="mt-4 pt-3 border-t border-gray-100 flex items-center justify-between text-xs text-gray-500 font-sans">
-                <span className="flex items-center gap-1">
-                  <Fuel className="w-3.5 h-3.5 text-blue-500" />
-                  <span>Total Net Liters Sold: <strong className="text-[#1C1C1C] tabular-nums">{formatLiters(stats.totalNetSold)}</strong></span>
+              <div className="mt-3.5 pt-2.5 border-t border-gray-100 flex flex-wrap items-center justify-between text-xs text-gray-500 font-sans gap-2">
+                <span className="flex items-center gap-2 flex-wrap">
+                  <span className="flex items-center gap-1">
+                    <Fuel className="w-3.5 h-3.5 text-blue-500" />
+                    <span>Net Fuel: <strong className="text-[#1C1C1C] tabular-nums">{formatLiters(stats.totalNetSold)}</strong></span>
+                  </span>
+                  <span className="text-gray-300">•</span>
+                  <span className="flex items-center gap-1">
+                    <Flame className="w-3.5 h-3.5 text-orange-500" />
+                    <span>LP Gas: <strong className="text-[#1C1C1C] tabular-nums">{gasTotals.totalCylinders} Cyl ({gasTotals.totalKg.toFixed(1)} kg)</strong></span>
+                  </span>
+                  <span className="text-gray-300">•</span>
+                  <span className="flex items-center gap-1">
+                    <ShoppingBag className="w-3.5 h-3.5 text-cyan-600" />
+                    <span>Lubes: <strong className="text-[#1C1C1C] tabular-nums">{oilTotals.totalUnits} Units</strong></span>
+                  </span>
                 </span>
                 <span>Active Pumps: <strong className="text-[#1C1C1C] tabular-nums">{stats.runningPumps} of {activeShift.pumpReadings.length}</strong></span>
               </div>
@@ -2508,6 +3351,322 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                       </div>
                     </div>
                   )}
+                </div>
+              </div>
+            </div>
+
+            {/* GAS & LUBRICANT COUNTER SALES CARD (Non-Pumper Independent - Ultra-Compact) */}
+            <div className="bg-white rounded-xl border border-amber-200/80 shadow-2xs overflow-hidden mb-2 font-sans">
+              <div className="bg-gradient-to-r from-amber-500/10 via-amber-500/5 to-transparent px-3.5 py-2 border-b border-amber-200/60 flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <div className="p-1 bg-amber-500 text-white rounded-lg shadow-2xs">
+                    <Flame className="w-3.5 h-3.5" />
+                  </div>
+                  <div>
+                    <h4 className="text-xs sm:text-sm font-bold text-gray-900 tracking-tight flex items-center gap-1.5">
+                      GAS &amp; LUBRICANT COUNTER SALES
+                      <span className="text-[9px] font-extrabold uppercase px-1.5 py-0.2 bg-amber-100 text-amber-800 rounded border border-amber-200">
+                        Counter
+                      </span>
+                    </h4>
+                  </div>
+                </div>
+
+                {/* Live Counter Revenue Badge */}
+                <div className="flex items-center gap-2 bg-white px-2.5 py-1 rounded-lg border border-amber-200 shadow-2xs text-xs">
+                  <span className="text-[11px] text-gray-500 font-semibold">Counter Total:</span>
+                  <span className="text-xs sm:text-sm font-extrabold text-amber-900 tabular-nums">
+                    {formatCurrency(draftCounterSales.totalCounterRevenue || 0)}
+                  </span>
+                </div>
+              </div>
+
+              <div className="p-3 grid grid-cols-1 lg:grid-cols-12 gap-3">
+                {/* 1. LP Gas Sales Section */}
+                <div className="lg:col-span-6 space-y-1.5">
+                  <div className="flex items-center justify-between pb-1 border-b border-gray-100">
+                    <div className="flex items-center gap-1 text-[11px] font-bold text-gray-800">
+                      <Flame className="w-3 h-3 text-amber-600" />
+                      <span>LP Gas Cylinder Sales</span>
+                    </div>
+                    <span className="text-[11px] font-extrabold text-amber-700 tabular-nums">
+                      {formatCurrency(draftCounterSales.totalGasSales || 0)}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {(draftCounterSales.gasSales || defaultGasSales).map((item, idx) => (
+                      <div key={`gas-sale-${item.type}`} className="p-2 bg-amber-50/50 rounded-lg border border-amber-100 flex flex-col justify-between">
+                        <div>
+                          <div className="flex items-baseline justify-between gap-1">
+                            <span className="text-[11px] font-bold text-gray-900 truncate">{item.type}</span>
+                            <span className="text-[9px] text-gray-500 font-semibold tabular-nums">Rs {item.unitPrice.toLocaleString()}</span>
+                          </div>
+                          <div className="mt-1.5 flex items-center gap-1">
+                            <label className="text-[10px] text-gray-500 font-medium shrink-0">Qty:</label>
+                            <input
+                              type="number"
+                              min="0"
+                              value={item.quantity === 0 ? '' : item.quantity}
+                              placeholder="0"
+                              onChange={(e) => {
+                                const newQty = Math.max(0, parseInt(e.target.value) || 0);
+                                const currentGas = draftCounterSales.gasSales || defaultGasSales;
+                                const updatedGas = currentGas.map((g, gIdx) => {
+                                  if (gIdx === idx) {
+                                    return {
+                                      ...g,
+                                      quantity: newQty,
+                                      totalAmount: newQty * g.unitPrice
+                                    };
+                                  }
+                                  return g;
+                                });
+                                const gasTotal = updatedGas.reduce((s, g) => s + g.totalAmount, 0);
+                                const lubeTotal = (draftCounterSales.lubeSales || []).reduce((s, l) => s + l.totalAmount, 0);
+                                const newCounterState: ShiftCounterSales = {
+                                  ...draftCounterSales,
+                                  gasSales: updatedGas,
+                                  totalGasSales: gasTotal,
+                                  totalLubeSales: lubeTotal,
+                                  totalCounterRevenue: gasTotal + lubeTotal
+                                };
+                                setDraftCounterSales(newCounterState);
+                                if (activeShift) {
+                                  localStorage.setItem(`fuelflow_counter_sales_${activeShift.id}`, JSON.stringify(newCounterState));
+                                }
+                              }}
+                              className="w-full px-1.5 py-0.5 bg-white border border-amber-200 rounded text-xs font-bold text-gray-900 focus:outline-none focus:border-amber-500 tabular-nums text-center"
+                            />
+                          </div>
+                        </div>
+                        <div className="mt-1.5 pt-1 border-t border-amber-100/80 flex justify-between items-center text-[10px]">
+                          <span className="text-gray-400">Total:</span>
+                          <span className="font-extrabold text-amber-900 tabular-nums">
+                            {formatCurrency(item.totalAmount)}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 2. Lubricant / Oil Bottle Sales Section */}
+                <div className="lg:col-span-6 space-y-1.5">
+                  <div className="flex items-center justify-between pb-1 border-b border-gray-100">
+                    <div className="flex items-center gap-1 text-[11px] font-bold text-gray-800">
+                      <ShoppingBag className="w-3 h-3 text-blue-600" />
+                      <span>Packaged Lubricant Sales</span>
+                    </div>
+                    <span className="text-[11px] font-extrabold text-blue-700 tabular-nums">
+                      {formatCurrency(draftCounterSales.totalLubeSales || 0)}
+                    </span>
+                  </div>
+
+                  {/* Add Lube Item Dropdown Inline Bar */}
+                  <div className="flex items-center gap-1.5">
+                    <select
+                      value={selectedAddLubeId}
+                      onChange={(e) => setSelectedAddLubeId(e.target.value)}
+                      className="flex-1 min-w-0 px-2.5 py-1 bg-gray-50 border border-gray-200 rounded-lg text-xs font-medium text-gray-800 focus:outline-none focus:border-blue-500"
+                    >
+                      <option value="">Select lubricant / oil to record...</option>
+                      {availablePackagedLubes.map(p => (
+                        <option key={`opt-lube-${p.id}`} value={p.id}>
+                          {p.name} ({p.packageSize || p.grade || 'Bottle'}) - Rs {p.retailPrice.toLocaleString()} (Stock: {p.currentStock})
+                        </option>
+                      ))}
+                    </select>
+
+                    <button
+                      type="button"
+                      disabled={!selectedAddLubeId}
+                      onClick={() => {
+                        const targetProd = availablePackagedLubes.find(p => p.id === selectedAddLubeId);
+                        if (!targetProd) return;
+
+                        const currentLubes = draftCounterSales.lubeSales || [];
+                        const exists = currentLubes.some(l => l.id === targetProd.id);
+                        let updatedLubes: ShiftLubeSale[];
+
+                        if (exists) {
+                          updatedLubes = currentLubes.map(l => {
+                            if (l.id === targetProd.id) {
+                              const nq = l.quantity + 1;
+                              return { ...l, quantity: nq, totalAmount: nq * l.unitPrice };
+                            }
+                            return l;
+                          });
+                        } else {
+                          updatedLubes = [
+                            ...currentLubes,
+                            {
+                              id: targetProd.id,
+                              name: targetProd.name,
+                              packSize: targetProd.packageSize || '1L',
+                              quantity: 1,
+                              unitPrice: targetProd.retailPrice,
+                              totalAmount: targetProd.retailPrice
+                            }
+                          ];
+                        }
+
+                        const gasTotal = (draftCounterSales.gasSales || defaultGasSales).reduce((s, g) => s + g.totalAmount, 0);
+                        const lubeTotal = updatedLubes.reduce((s, l) => s + l.totalAmount, 0);
+                        const newCounterState: ShiftCounterSales = {
+                          ...draftCounterSales,
+                          lubeSales: updatedLubes,
+                          totalGasSales: gasTotal,
+                          totalLubeSales: lubeTotal,
+                          totalCounterRevenue: gasTotal + lubeTotal
+                        };
+                        setDraftCounterSales(newCounterState);
+                        setSelectedAddLubeId('');
+                        if (activeShift) {
+                          localStorage.setItem(`fuelflow_counter_sales_${activeShift.id}`, JSON.stringify(newCounterState));
+                        }
+                      }}
+                      className="px-2.5 py-1 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white rounded-lg text-xs font-bold transition-all shrink-0 cursor-pointer"
+                    >
+                      + Add Item
+                    </button>
+                  </div>
+
+                  {/* List of Added Lubes */}
+                  <div className="space-y-1 max-h-24 overflow-y-auto pr-0.5">
+                    {(draftCounterSales.lubeSales || []).length > 0 ? (
+                      (draftCounterSales.lubeSales || []).map((lube, lIdx) => (
+                        <div key={`lube-sale-row-${lube.id || lIdx}`} className="p-1.5 bg-blue-50/40 rounded-lg border border-blue-100 flex items-center justify-between gap-1.5 text-xs">
+                          <div className="flex-1 min-w-0">
+                            <span className="font-bold text-gray-900 block truncate text-[11px]">{lube.name}</span>
+                            <span className="text-[9px] text-gray-500 font-semibold">{lube.packSize} • Rs {lube.unitPrice.toLocaleString()}</span>
+                          </div>
+                          
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <div className="flex items-center gap-1">
+                              <span className="text-[10px] text-gray-500">Qty:</span>
+                              <input
+                                type="number"
+                                min="1"
+                                value={lube.quantity}
+                                onChange={(e) => {
+                                  const nQty = Math.max(1, parseInt(e.target.value) || 1);
+                                  const updated = (draftCounterSales.lubeSales || []).map((l, idx) => {
+                                    if (idx === lIdx) {
+                                      return { ...l, quantity: nQty, totalAmount: nQty * l.unitPrice };
+                                    }
+                                    return l;
+                                  });
+                                  const gasTotal = (draftCounterSales.gasSales || defaultGasSales).reduce((s, g) => s + g.totalAmount, 0);
+                                  const lubeTotal = updated.reduce((s, l) => s + l.totalAmount, 0);
+                                  const newCounterState: ShiftCounterSales = {
+                                    ...draftCounterSales,
+                                    lubeSales: updated,
+                                    totalGasSales: gasTotal,
+                                    totalLubeSales: lubeTotal,
+                                    totalCounterRevenue: gasTotal + lubeTotal
+                                  };
+                                  setDraftCounterSales(newCounterState);
+                                  if (activeShift) {
+                                    localStorage.setItem(`fuelflow_counter_sales_${activeShift.id}`, JSON.stringify(newCounterState));
+                                  }
+                                }}
+                                className="w-12 px-1 py-0.5 bg-white border border-blue-200 rounded text-xs font-bold text-gray-900 text-center focus:outline-none"
+                              />
+                            </div>
+
+                            <span className="font-extrabold text-blue-900 tabular-nums min-w-[60px] text-right text-xs">
+                              {formatCurrency(lube.totalAmount)}
+                            </span>
+
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const updated = (draftCounterSales.lubeSales || []).filter((_, idx) => idx !== lIdx);
+                                const gasTotal = (draftCounterSales.gasSales || defaultGasSales).reduce((s, g) => s + g.totalAmount, 0);
+                                const lubeTotal = updated.reduce((s, l) => s + l.totalAmount, 0);
+                                const newCounterState: ShiftCounterSales = {
+                                  ...draftCounterSales,
+                                  lubeSales: updated,
+                                  totalGasSales: gasTotal,
+                                  totalLubeSales: lubeTotal,
+                                  totalCounterRevenue: gasTotal + lubeTotal
+                                };
+                                setDraftCounterSales(newCounterState);
+                                if (activeShift) {
+                                  localStorage.setItem(`fuelflow_counter_sales_${activeShift.id}`, JSON.stringify(newCounterState));
+                                }
+                              }}
+                              className="p-0.5 text-gray-400 hover:text-rose-600 rounded hover:bg-rose-50 cursor-pointer"
+                              title="Remove item"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="py-2 text-center text-gray-400 text-[11px] italic bg-gray-50/60 rounded-lg border border-dashed border-gray-200">
+                        No packaged oil bottles sold yet this shift.
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Dedicated Footer: Summary & Explicit Save Action Button */}
+              <div className="bg-slate-50 px-3.5 py-2 border-t border-amber-200/60 flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-[11px] font-semibold text-gray-500">Counter Revenue:</span>
+                  <span className="text-xs sm:text-sm font-extrabold text-amber-900 tabular-nums">
+                    {formatCurrency(draftCounterSales.totalCounterRevenue || 0)}
+                  </span>
+                  {hasUnsavedCounterSales ? (
+                    <span className="inline-flex items-center gap-1 text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-200 animate-pulse">
+                      <AlertCircle className="w-2.5 h-2.5" />
+                      Unsaved
+                    </span>
+                  ) : (draftCounterSales.totalCounterRevenue || 0) > 0 ? (
+                    <span className="inline-flex items-center gap-1 text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 border border-emerald-200">
+                      <CheckCircle className="w-2.5 h-2.5 text-emerald-600" />
+                      Committed &amp; Saved
+                    </span>
+                  ) : (
+                    <span className="text-[10px] text-gray-400 italic">
+                      Ready to record
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    id="btn-save-counter-sales"
+                    type="button"
+                    disabled={isCounterSalesSaving || !hasUnsavedCounterSales}
+                    onClick={handleSaveCounterSales}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-xs cursor-pointer ${
+                      hasUnsavedCounterSales
+                        ? 'bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-700 hover:to-amber-600 text-white shadow-md ring-2 ring-amber-400/30'
+                        : 'bg-gray-100 text-gray-400 border border-gray-200 cursor-not-allowed opacity-75'
+                    }`}
+                  >
+                    {isCounterSalesSaving ? (
+                      <>
+                        <RefreshCw className="w-3 h-3 animate-spin" />
+                        <span>Saving...</span>
+                      </>
+                    ) : hasUnsavedCounterSales ? (
+                      <>
+                        <Save className="w-3 h-3" />
+                        <span>Save Counter Sales</span>
+                      </>
+                    ) : (
+                      <>
+                        <Check className="w-3 h-3 text-emerald-600" />
+                        <span>Counter Sales Saved</span>
+                      </>
+                    )}
+                  </button>
                 </div>
               </div>
             </div>
@@ -2654,7 +3813,10 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                               const totalPumpGross = fuelRevenue + oilRevenue;
                               const creditSales = r.creditSalesAmount || 0;
                               const cardSales = r.cardSalesAmount || 0;
-                              const rawPumpExpCash = totalPumpGross - (creditSales + cardSales);
+                              const touchCardSales = r.touchCardSalesAmount || 0;
+                              const voucherSales = r.voucherSalesAmount || 0;
+                              const totalPumpNonCash = creditSales + cardSales + touchCardSales + voucherSales;
+                              const rawPumpExpCash = totalPumpGross - totalPumpNonCash;
 
                               // Calculate if other pumps assigned to this pumper have excess revenue to offset non-cash deductions
                               const otherPumpsExcess = assignedReadings
@@ -2665,7 +3827,7 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                   const oFuelSold = oIsOil ? 0 : Math.max(0, other.endMeter - other.startMeter);
                                   const oNetSold = oIsOil ? 0 : Math.max(0, oFuelSold - other.testingQty);
                                   const oGross = (oNetSold * oPrice) + (other.oilSalesAmount || 0);
-                                  const oNonCash = (other.creditSalesAmount || 0) + (other.cardSalesAmount || 0);
+                                  const oNonCash = (other.creditSalesAmount || 0) + (other.cardSalesAmount || 0) + (other.touchCardSalesAmount || 0) + (other.voucherSalesAmount || 0);
                                   return sum + Math.max(0, oGross - oNonCash);
                                 }, 0);
 
@@ -2767,7 +3929,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                                 <input
                                                   type="number"
                                                   step="any"
-                                                  value={r.startMeter ?? 0}
+                                                  value={r.startMeter === 0 ? '' : (r.startMeter ?? '')}
+                                                  placeholder="0"
                                                   disabled={isStartMeterLocked}
                                                   onFocus={(e) => e.target.select()}
                                                   onChange={(e) => handleUpdateReading(r.pumpId, 'startMeter', parseFloat(e.target.value) || 0)}
@@ -2815,7 +3978,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                                 <input
                                                   type="number"
                                                   step="any"
-                                                  value={r.endMeter ?? 0}
+                                                  value={r.endMeter === 0 ? '' : (r.endMeter ?? '')}
+                                                  placeholder="0"
                                                   disabled={isEndMeterLocked}
                                                   onFocus={(e) => e.target.select()}
                                                   onChange={(e) => handleUpdateReading(r.pumpId, 'endMeter', parseFloat(e.target.value) || 0)}
@@ -2834,7 +3998,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                           <input
                                             type="number"
                                             step="any"
-                                            value={r.testingQty ?? 0}
+                                            value={r.testingQty === 0 ? '' : (r.testingQty ?? '')}
+                                            placeholder="0"
                                             disabled={isPumperFinalized}
                                             onFocus={(e) => e.target.select()}
                                             onChange={(e) => handleUpdateReading(r.pumpId, 'testingQty', parseFloat(e.target.value) || 0)}
@@ -2895,7 +4060,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                                           type="number"
                                                           step="any"
                                                           disabled={isChamberOpeningLocked}
-                                                          value={opLiters}
+                                                          value={opLiters === 0 ? '' : opLiters}
+                                                          placeholder="0"
                                                           onFocus={(e) => e.target.select()}
                                                           onChange={(e) => handleUpdateChamberOpeningLevel(r.pumpId, ch.chamberId, parseFloat(e.target.value) || 0)}
                                                           className="w-16 px-1.5 py-0.5 bg-slate-50 border border-slate-200 rounded text-right font-bold text-slate-900 tabular-nums focus:bg-white focus:outline-none focus:border-amber-500 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed text-[11px]"
@@ -2925,7 +4091,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                                         type="number"
                                                         step="any"
                                                         disabled={isPumperFinalized}
-                                                        value={clLiters}
+                                                        value={clLiters === 0 ? '' : clLiters}
+                                                        placeholder="0"
                                                         onFocus={(e) => e.target.select()}
                                                         onChange={(e) => handleUpdateChamberClosingLevel(r.pumpId, ch.chamberId, parseFloat(e.target.value) || 0)}
                                                         className="w-16 px-1.5 py-0.5 bg-white border border-amber-300 rounded text-right font-bold text-slate-900 tabular-nums focus:outline-none focus:border-amber-600 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed text-[11px]"
@@ -2964,14 +4131,15 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                     )}
 
                                     {/* Non-Cash Collections */}
-                                    <div className="grid grid-cols-2 gap-2 text-xs pt-1 border-t border-slate-200/80">
+                                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs pt-1 border-t border-slate-200/80">
                                       <div>
                                         <label className="text-[10px] font-extrabold text-purple-700 block mb-0.5 uppercase">Credit Sales (Rs.)</label>
                                         <input
                                           type="number"
                                           step="any"
                                           disabled={isPumperFinalized}
-                                          value={r.creditSalesAmount ?? 0}
+                                          value={r.creditSalesAmount === 0 ? '' : (r.creditSalesAmount ?? '')}
+                                          placeholder="0"
                                           onFocus={(e) => e.target.select()}
                                           onChange={(e) => handleUpdateReading(r.pumpId, 'creditSalesAmount', parseFloat(e.target.value) || 0)}
                                           className="w-full px-2 py-1 bg-white border border-purple-200 rounded-lg text-xs font-bold text-right tabular-nums focus:bg-white focus:outline-none focus:border-purple-500 text-purple-900 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
@@ -2983,10 +4151,37 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                           type="number"
                                           step="any"
                                           disabled={isPumperFinalized}
-                                          value={r.cardSalesAmount ?? 0}
+                                          value={r.cardSalesAmount === 0 ? '' : (r.cardSalesAmount ?? '')}
+                                          placeholder="0"
                                           onFocus={(e) => e.target.select()}
                                           onChange={(e) => handleUpdateReading(r.pumpId, 'cardSalesAmount', parseFloat(e.target.value) || 0)}
                                           className="w-full px-2 py-1 bg-white border border-indigo-200 rounded-lg text-xs font-bold text-right tabular-nums focus:outline-none focus:border-indigo-500 text-indigo-900 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
+                                        />
+                                      </div>
+                                      <div>
+                                        <label className="text-[10px] font-extrabold text-teal-700 block mb-0.5 uppercase">Touch Card Sale (Rs.)</label>
+                                        <input
+                                          type="number"
+                                          step="any"
+                                          disabled={isPumperFinalized}
+                                          value={r.touchCardSalesAmount === 0 ? '' : (r.touchCardSalesAmount ?? '')}
+                                          placeholder="0"
+                                          onFocus={(e) => e.target.select()}
+                                          onChange={(e) => handleUpdateReading(r.pumpId, 'touchCardSalesAmount', parseFloat(e.target.value) || 0)}
+                                          className="w-full px-2 py-1 bg-white border border-teal-200 rounded-lg text-xs font-bold text-right tabular-nums focus:outline-none focus:border-teal-500 text-teal-900 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
+                                        />
+                                      </div>
+                                      <div>
+                                        <label className="text-[10px] font-extrabold text-amber-700 block mb-0.5 uppercase">Voucher Sale (Rs.)</label>
+                                        <input
+                                          type="number"
+                                          step="any"
+                                          disabled={isPumperFinalized}
+                                          value={r.voucherSalesAmount === 0 ? '' : (r.voucherSalesAmount ?? '')}
+                                          placeholder="0"
+                                          onFocus={(e) => e.target.select()}
+                                          onChange={(e) => handleUpdateReading(r.pumpId, 'voucherSalesAmount', parseFloat(e.target.value) || 0)}
+                                          className="w-full px-2 py-1 bg-white border border-amber-200 rounded-lg text-xs font-bold text-right tabular-nums focus:outline-none focus:border-amber-500 text-amber-900 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
                                         />
                                       </div>
                                     </div>
@@ -3042,11 +4237,11 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                 type="number"
                                 step="any"
                                 disabled={isPumperFinalized}
-                                value={p.totalActualCash ?? 0}
+                                value={p.totalActualCash === 0 ? '' : (p.totalActualCash ?? '')}
                                 onFocus={(e) => e.target.select()}
                                 onChange={(e) => handleUpdateConsolidatedCashForPumper(pumperId, parseFloat(e.target.value) || 0)}
                                 className="px-2.5 py-1 bg-white border border-gray-300 rounded-lg text-xs font-extrabold text-right tabular-nums text-gray-900 focus:outline-none focus:border-blue-600 w-32 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
-                                placeholder="0.00"
+                                placeholder="0"
                               />
                             </div>
 
@@ -3206,25 +4401,137 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                     </table>
                   </div>
 
-                  <div className="p-6 bg-gray-50/30 border-t border-gray-100">
-                    <h3 className="font-bold text-[#1C1C1C] text-sm uppercase tracking-wider mb-4">Financial Reconciliation</h3>
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                      <div className="bg-white p-4 rounded-xl border border-gray-200 shadow-sm">
-                        <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Expected Cash</p>
-                        <p className="text-lg font-bold text-[#1C1C1C] tabular-nums mt-1">{formatCurrency(selectedPastShift.totalNetSales || 0)}</p>
+                  {(() => {
+                    const pastFuelSales = (selectedPastShift.pumpReadings || []).reduce((sum: number, r: any) => {
+                      const dispensed = r.totalDispensed !== undefined ? r.totalDispensed : Math.max(0, (r.endMeter || 0) - (r.startMeter || 0) - (r.testingQty || 0));
+                      const rate = r.unitPrice || 0;
+                      return sum + (r.netSales || dispensed * rate || 0);
+                    }, 0);
+                    const pastOilSales = (selectedPastShift.pumpReadings || []).reduce((sum: number, r: any) => sum + (Number(r.oilSalesAmount || 0)), 0);
+                    const pastGasSales = selectedPastShift.counterSales?.totalGasSales ?? (selectedPastShift.counterSales?.gasSales || []).reduce((sum: number, g: any) => sum + (Number(g.totalAmount) || 0), 0);
+                    const pastLubeSales = selectedPastShift.counterSales?.totalLubeSales ?? (selectedPastShift.counterSales?.lubeSales || []).reduce((sum: number, l: any) => sum + (Number(l.totalAmount) || 0), 0);
+                    const pastCredit = Math.max(
+                      (selectedPastShift.pumpReadings || []).reduce((sum: number, r: any) => sum + (Number(r.creditSalesAmount || r.credit_sales_amount || 0)), 0),
+                      Number((selectedPastShift as any).creditSales ?? (selectedPastShift as any).credit_sales ?? (selectedPastShift as any).creditsales ?? (selectedPastShift as any).total_credit_sales ?? 0)
+                    );
+                    const pastCard = Math.max(
+                      (selectedPastShift.pumpReadings || []).reduce((sum: number, r: any) => sum + (Number(r.cardSalesAmount || r.card_sales_amount || 0)), 0),
+                      Number((selectedPastShift as any).cardSales ?? (selectedPastShift as any).card_sales ?? (selectedPastShift as any).cardsales ?? (selectedPastShift as any).total_card_sales ?? 0)
+                    );
+                    const pastTouchCard = Math.max(
+                      (selectedPastShift.pumpReadings || []).reduce((sum: number, r: any) => sum + (Number(r.touchCardSalesAmount || r.touch_card_sales_amount || 0)), 0),
+                      Number((selectedPastShift as any).touchCardSales ?? (selectedPastShift as any).touch_card_sales ?? (selectedPastShift as any).touchcardsales ?? (selectedPastShift as any).total_touch_card_sales ?? 0)
+                    );
+                    const pastVoucher = Math.max(
+                      (selectedPastShift.pumpReadings || []).reduce((sum: number, r: any) => sum + (Number(r.voucherSalesAmount || r.voucher_sales_amount || 0)), 0),
+                      Number((selectedPastShift as any).voucherSales ?? (selectedPastShift as any).voucher_sales ?? (selectedPastShift as any).vouchersales ?? (selectedPastShift as any).total_voucher_sales ?? 0)
+                    );
+                    const pastGross = (pastFuelSales + pastOilSales + pastGasSales + pastLubeSales) || selectedPastShift.totalNetSales || 0;
+                    const pastNonCash = pastCredit + pastCard + pastTouchCard + pastVoucher;
+                    const pastExpected = Math.max(0, pastGross - pastNonCash);
+
+                    const pastBanked = Number(selectedPastShift.cashBanked ?? (selectedPastShift as any).cash_banked ?? (selectedPastShift as any).cashbanked) || 0;
+
+                    let pastPhysical = selectedPastShift.totalPhysicalCash || (selectedPastShift.initialPumperCash || 0) + (selectedPastShift.replacementPumperCash || 0) || 0;
+                    if (pastPhysical === 0 && (selectedPastShift.pumpReadings || []).length > 0) {
+                      const sumPumpCash = (selectedPastShift.pumpReadings || []).reduce((sum: number, r: any) => sum + (Number(r.actualCash ?? r.actual_cash ?? r.actualcash) || 0), 0);
+                      if (sumPumpCash > 0) pastPhysical = sumPumpCash;
+                    }
+                    if (pastPhysical === 0 && pastBanked > 0) {
+                      pastPhysical = pastBanked;
+                    }
+
+                    const effectivePastPhysical = pastPhysical > 0 ? pastPhysical : pastBanked;
+                    const pastVariance = effectivePastPhysical - pastExpected;
+
+                    return (
+                      <div className="p-6 bg-gray-50/50 border-t border-gray-100 space-y-4">
+                        <h3 className="font-bold text-[#1C1C1C] text-sm uppercase tracking-wider">Financial Reconciliation &amp; Settlement</h3>
+                        
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs font-sans">
+                          {/* Left: Revenue Breakdown */}
+                          <div className="bg-white p-4 rounded-xl border border-gray-200/80 shadow-xs space-y-2">
+                            <div className="flex items-center justify-between">
+                              <span className="text-gray-600">Gross Fuel Sales:</span>
+                              <span className="font-bold text-gray-900 tabular-nums">{formatCurrency(pastFuelSales)}</span>
+                            </div>
+                            <div className="flex items-center justify-between">
+                              <span className="text-gray-600">(+) Loose Oil Sales:</span>
+                              <span className="font-bold text-gray-900 tabular-nums">{formatCurrency(pastOilSales)}</span>
+                            </div>
+                            <div className="flex items-center justify-between text-amber-900">
+                              <span className="text-amber-800 font-medium">(+) LP Gas Sales:</span>
+                              <span className="font-bold tabular-nums">{formatCurrency(pastGasSales)}</span>
+                            </div>
+                            <div className="flex items-center justify-between text-teal-900">
+                              <span className="text-teal-800 font-medium">(+) Packaged Lubricant Bottle Sales:</span>
+                              <span className="font-bold tabular-nums">{formatCurrency(pastLubeSales)}</span>
+                            </div>
+                            <div className="flex items-center justify-between pt-2 border-t border-gray-200 font-bold">
+                              <span className="text-slate-900">Total Gross Shift Revenue:</span>
+                              <span className="text-slate-900 text-sm tabular-nums">{formatCurrency(pastGross)}</span>
+                            </div>
+
+                            <div className="pt-2 border-t border-gray-200/60 space-y-1.5 text-[11px]">
+                              <div className="flex items-center justify-between text-amber-800">
+                                <span>(-) Corporate Credit Sales:</span>
+                                <span className="font-bold tabular-nums">{formatCurrency(pastCredit)}</span>
+                              </div>
+                              <div className="flex items-center justify-between text-blue-800">
+                                <span>(-) Card POS / Digital Swipes:</span>
+                                <span className="font-bold tabular-nums">{formatCurrency(pastCard)}</span>
+                              </div>
+                              <div className="flex items-center justify-between text-purple-800">
+                                <span>(-) Touch Card Sales:</span>
+                                <span className="font-bold tabular-nums">{formatCurrency(pastTouchCard)}</span>
+                              </div>
+                              <div className="flex items-center justify-between text-rose-800">
+                                <span>(-) Voucher / Coupon Sales:</span>
+                                <span className="font-bold tabular-nums">{formatCurrency(pastVoucher)}</span>
+                              </div>
+                              <div className="flex items-center justify-between pt-1 border-t border-dashed border-gray-200 text-gray-700 font-semibold">
+                                <span>Total Non-Cash Deductions:</span>
+                                <span className="font-bold text-gray-900 tabular-nums">{formatCurrency(pastNonCash)}</span>
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Right: Cash Reconciliation */}
+                          <div className="bg-emerald-50/30 p-4 rounded-xl border border-emerald-200/80 shadow-xs space-y-2.5">
+                            <div className="flex items-center justify-between">
+                              <span className="text-gray-700 font-medium">Net Expected Physical Cash:</span>
+                              <span className="font-bold text-gray-900 text-sm tabular-nums">{formatCurrency(pastExpected)}</span>
+                            </div>
+                            <div className="flex items-center justify-between">
+                              <span className="text-gray-700 font-medium">Physical Cash Handed Over:</span>
+                              <span className="font-bold text-emerald-800 text-sm tabular-nums">{formatCurrency(pastPhysical)}</span>
+                            </div>
+                            <div className="flex items-center justify-between text-purple-900 bg-purple-50 px-2.5 py-1.5 rounded-lg border border-purple-200/80">
+                              <span className="font-bold flex items-center gap-1.5">
+                                <Landmark className="w-3.5 h-3.5 text-purple-600" />
+                                Cash Banked / Deposit:
+                              </span>
+                              <span className="font-extrabold text-sm tabular-nums">{formatCurrency(pastBanked)}</span>
+                            </div>
+
+                            <div className="pt-2 border-t border-emerald-200 flex items-center justify-between">
+                              <span className="font-bold text-gray-900">Shift Cash Variance:</span>
+                              <div className="text-right">
+                                <span className={`text-sm font-black tabular-nums ${
+                                  pastVariance < -0.01 ? 'text-rose-600' : pastVariance > 0.01 ? 'text-amber-600' : 'text-emerald-700'
+                                }`}>
+                                  {pastVariance >= 0 && pastVariance > 0.01 ? '+' : ''}{formatCurrency(pastVariance)}
+                                </span>
+                                <span className="text-[10px] font-bold block text-gray-500 uppercase">
+                                  ({pastVariance < -0.01 ? 'Shortage' : pastVariance > 0.01 ? 'Excess' : 'Balanced'})
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
                       </div>
-                      <div className="bg-white p-4 rounded-xl border border-gray-200 shadow-sm">
-                        <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Actual Cash Collected (Placeholder)</p>
-                        <p className="text-lg font-bold text-blue-600 tabular-nums mt-1">{formatCurrency(selectedPastShift.totalNetSales || 0)}</p>
-                      </div>
-                      <div className={`bg-white p-4 rounded-xl border shadow-sm border-emerald-200 bg-emerald-50/50`}>
-                        <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Shortage / Overage</p>
-                        <p className={`text-lg font-bold tabular-nums mt-1 text-emerald-600`}>
-                          {formatCurrency(0)}
-                        </p>
-                      </div>
-                    </div>
-                  </div>
+                    );
+                  })()}
                 </div>
               </div>
             );
@@ -3272,12 +4579,13 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                     <table className="w-full text-left border-collapse">
                       <thead className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 shadow-xs">
                         <tr className="text-gray-500 font-bold text-[11px] uppercase tracking-wider">
-                          <th className="py-2.5 px-4">Shift ID / Name</th>
+                          <th className="py-2.5 px-4">Shift ID & Sequence</th>
                           <th className="py-2.5 px-4">Supervisor</th>
+                          <th className="py-2.5 px-4">Time Window</th>
                           <th className="py-2.5 px-4 text-right">Liters Sold</th>
                           <th className="py-2.5 px-4 text-right">Revenue (Rs.)</th>
                           <th className="py-2.5 px-4 text-right">Cash Rec. / Variance</th>
-                          <th className="py-2.5 px-4">End Time & Date</th>
+                          <th className="py-2.5 px-4 text-right">Banked (Rs.)</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-gray-100 text-xs">
@@ -3286,15 +4594,57 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                             const supervisorName = employees.find(e => e.id === shift.supervisorId || e.id === shift.supervisorid)?.name || shift.supervisorName || 'Unassigned';
                             const liters = shift.totalNetSold || shift.totalFuelSold || 0;
                             const revenue = shift.totalNetSales || 0;
-                            const physCash = shift.totalPhysicalCash !== undefined && shift.totalPhysicalCash > 0 
+                            const cashBanked = Number(shift.cashBanked ?? (shift as any).cash_banked ?? (shift as any).cashbanked) || 0;
+
+                            const pastCredit = Math.max(
+                              (shift.pumpReadings || []).reduce((sum: number, r: any) => sum + (Number(r.creditSalesAmount || r.credit_sales_amount || 0)), 0),
+                              Number((shift as any).creditSales ?? (shift as any).credit_sales ?? (shift as any).creditsales ?? (shift as any).total_credit_sales ?? 0)
+                            );
+                            const pastCard = Math.max(
+                              (shift.pumpReadings || []).reduce((sum: number, r: any) => sum + (Number(r.cardSalesAmount || r.card_sales_amount || 0)), 0),
+                              Number((shift as any).cardSales ?? (shift as any).card_sales ?? (shift as any).cardsales ?? (shift as any).total_card_sales ?? 0)
+                            );
+                            const pastTouchCard = Math.max(
+                              (shift.pumpReadings || []).reduce((sum: number, r: any) => sum + (Number(r.touchCardSalesAmount || r.touch_card_sales_amount || 0)), 0),
+                              Number((shift as any).touchCardSales ?? (shift as any).touch_card_sales ?? (shift as any).touchcardsales ?? (shift as any).total_touch_card_sales ?? 0)
+                            );
+                            const pastVoucher = Math.max(
+                              (shift.pumpReadings || []).reduce((sum: number, r: any) => sum + (Number(r.voucherSalesAmount || r.voucher_sales_amount || 0)), 0),
+                              Number((shift as any).voucherSales ?? (shift as any).voucher_sales ?? (shift as any).vouchersales ?? (shift as any).total_voucher_sales ?? 0)
+                            );
+                            const nonCash = pastCredit + pastCard + pastTouchCard + pastVoucher;
+                            const expectedCash = Math.max(0, revenue - nonCash);
+
+                            let physCash = shift.totalPhysicalCash !== undefined && shift.totalPhysicalCash > 0 
                               ? shift.totalPhysicalCash 
                               : ((shift.initialPumperCash || 0) + (shift.replacementPumperCash || 0));
-                            const hasHandover = physCash > 0 || !!shift.handoverNotes || !!shift.replacementPumperId;
-                            const variance = shift.cashVariance !== undefined ? shift.cashVariance : (physCash > 0 ? physCash - revenue : 0);
+                            if (physCash === 0 && (shift.pumpReadings || []).length > 0) {
+                              const sumPumpCash = (shift.pumpReadings || []).reduce((sum: number, r: any) => sum + (Number(r.actualCash ?? r.actual_cash ?? r.actualcash) || 0), 0);
+                              if (sumPumpCash > 0) physCash = sumPumpCash;
+                            }
+                            if (physCash === 0 && cashBanked > 0) {
+                              physCash = cashBanked;
+                            }
 
-                            const formattedDate = shift.endTime 
-                              ? new Date(shift.endTime).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })
-                              : 'Completed';
+                            const hasHandover = physCash > 0 || cashBanked > 0 || !!shift.handoverNotes || !!shift.replacementPumperId;
+                            const effectivePhys = physCash > 0 ? physCash : cashBanked;
+                            const variance = effectivePhys - expectedCash;
+
+                            let timeWindowText = 'Completed';
+                            if (shift.startTime) {
+                              const startD = new Date(shift.startTime);
+                              const startStr = startD.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                              const dateStr = startD.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+                              if (shift.endTime) {
+                                const endD = new Date(shift.endTime);
+                                const endStr = endD.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                                timeWindowText = `${dateStr} (${startStr} → ${endStr})`;
+                              } else {
+                                timeWindowText = `${dateStr} (${startStr})`;
+                              }
+                            } else if (shift.endTime) {
+                              timeWindowText = new Date(shift.endTime).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+                            }
 
                             return (
                               <tr 
@@ -3302,14 +4652,20 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                 className="hover:bg-gray-50/70 transition-colors"
                               >
                                 <td className="py-2.5 px-4 font-semibold text-[#1C1C1C] tabular-nums">
-                                  {shift.id} {shift.name ? <span className="text-[11px] font-normal text-gray-500">({shift.name})</span> : ''}
-                                  {hasHandover && (
-                                    <span className="ml-1.5 px-1.5 py-0.5 rounded bg-blue-50 text-blue-600 border border-blue-100 font-medium text-[9px] uppercase tracking-wider">
-                                      Handover
-                                    </span>
-                                  )}
+                                  <div className="flex items-center gap-1.5 font-mono text-xs">
+                                    <span>{shift.id}</span>
+                                    {hasHandover && (
+                                      <span className="px-1.5 py-0.5 rounded bg-blue-50 text-blue-600 border border-blue-100 font-medium text-[9px] uppercase tracking-wider">
+                                        Handover
+                                      </span>
+                                    )}
+                                  </div>
+                                  {shift.name && <span className="text-[10px] font-normal text-gray-400 block">{shift.name}</span>}
                                 </td>
-                                <td className="py-2.5 px-4 text-gray-600 font-medium">{supervisorName}</td>
+                                <td className="py-2.5 px-4 text-gray-700 font-medium">{supervisorName}</td>
+                                <td className="py-2.5 px-4 text-gray-500 tabular-nums font-medium text-[11px]">
+                                  {timeWindowText}
+                                </td>
                                 <td className="py-2.5 px-4 text-right tabular-nums font-semibold text-gray-700">
                                   {liters.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} L
                                 </td>
@@ -3332,15 +4688,15 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                     <span className="text-gray-400 font-normal text-[11px]">Match ({formatCurrency(revenue)})</span>
                                   )}
                                 </td>
-                                <td className="py-2.5 px-4 text-gray-500 tabular-nums font-medium text-[11px]">
-                                  {formattedDate}
+                                <td className="py-2.5 px-4 text-right tabular-nums font-semibold text-purple-700 text-xs">
+                                  {cashBanked > 0 ? formatCurrency(cashBanked) : <span className="text-gray-300">-</span>}
                                 </td>
                               </tr>
                             );
                           })
                         ) : (
                           <tr>
-                            <td colSpan={6} className="py-12 text-center text-gray-400 font-medium text-xs">
+                            <td colSpan={7} className="py-12 text-center text-gray-400 font-medium text-xs">
                               No shift logs found. Click '+ Open New Shift' to record your first shift
                             </td>
                           </tr>
@@ -3520,38 +4876,280 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
               <div className="w-12 h-12 bg-red-500/10 text-red-500 rounded-full flex items-center justify-center mx-auto mb-2 border border-red-500/20">
                 <AlertCircle className="w-6 h-6" />
               </div>
-              <h3 className="font-extrabold text-[#1C1C1C] text-lg">End Shift & Lock Ledger?</h3>
+              <h3 className="font-extrabold text-[#1C1C1C] text-lg">End Shift?</h3>
               <p className="text-gray-500 text-xs">
-                This action will lock current shift ledger (<strong className="text-[#1C1C1C] tabular-nums font-semibold">{activeShift.id}</strong>), save readings permanently, and deduct sold fuel from underground storage tanks.
+                This action will finalize the current shift (<strong className="text-[#1C1C1C] tabular-nums font-semibold">{activeShift.id}</strong>), save readings permanently, and deduct sold fuel from underground storage tanks.
               </p>
               
               {/* Overall Shift Revenue Summary Box */}
-              <div className="bg-white p-4 rounded-xl text-left text-xs text-gray-600 space-y-2.5 border border-gray-200/80 shadow-xs">
+              <div className="bg-white p-4 rounded-xl text-left text-xs text-gray-600 space-y-3 border border-gray-200/80 shadow-xs">
                 <div className="flex justify-between items-center pb-2 border-b border-gray-100">
                   <span className="font-bold text-gray-700">Supervisor: <strong className="text-[#1C1C1C]">{activeSupervisor?.name || 'N/A'}</strong></span>
                   <span className="font-bold text-gray-700">Shift: <strong className="text-[#1C1C1C]">{activeShift.name}</strong></span>
                 </div>
 
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                   <div className="bg-gray-50 p-2.5 rounded-xl border border-gray-100">
-                    <span className="text-[10px] text-gray-500 uppercase font-bold block">Net Fuel Sold</span>
-                    <span className="text-xs sm:text-sm font-extrabold text-[#1C1C1C] tabular-nums">{formatLiters(stats.totalNetSold)}</span>
+                    <span className="text-[10px] text-gray-500 uppercase font-bold block">Gross Revenue</span>
+                    <span className="text-xs sm:text-sm font-extrabold text-[#1C1C1C] tabular-nums">{formatCurrency(effectiveModalGrossSales)}</span>
                   </div>
-                  <div className="bg-gray-50 p-2.5 rounded-xl border border-gray-100">
-                    <span className="text-[10px] text-gray-500 uppercase font-bold block">Gross Fuel Revenue</span>
-                    <span className="text-xs sm:text-sm font-extrabold text-[#1C1C1C] tabular-nums">{formatCurrency(stats.totalFuelSales)}</span>
+                  <div className="bg-purple-50/60 p-2.5 rounded-xl border border-purple-100">
+                    <span className="text-[10px] text-purple-900 uppercase font-bold block">Non-Cash Deductions</span>
+                    <span className="text-xs sm:text-sm font-extrabold text-purple-700 tabular-nums">-{formatCurrency(effectiveModalNonCashSales)}</span>
                   </div>
-                  <div className="bg-amber-50/60 p-2.5 rounded-xl border border-amber-100 col-span-2 sm:col-span-1">
-                    <span className="text-[10px] text-amber-900 uppercase font-bold block">(+) Oil/Lube Sales</span>
-                    <span className="text-xs sm:text-sm font-extrabold text-amber-700 tabular-nums">+{formatCurrency(stats.totalOilSales)}</span>
+                  <div className="bg-blue-50/60 p-2.5 rounded-xl border border-blue-100">
+                    <span className="text-[10px] text-blue-900 uppercase font-bold block">Net Expected Cash</span>
+                    <span className="text-xs sm:text-sm font-extrabold text-blue-700 tabular-nums">{formatCurrency(effectiveModalExpectedCash)}</span>
+                  </div>
+                  <div className="bg-amber-50/60 p-2.5 rounded-xl border border-amber-100">
+                    <span className="text-[10px] text-amber-900 uppercase font-bold block">Net Fuel Sold</span>
+                    <span className="text-xs sm:text-sm font-extrabold text-amber-800 tabular-nums">{formatLiters(stats.totalNetSold)}</span>
                   </div>
                 </div>
 
                 <div className="flex justify-between items-center pt-2 border-t border-gray-100 text-xs">
-                  <span className="font-extrabold text-gray-800">Total Consolidated System Revenue:</span>
-                  <span className="font-extrabold text-blue-600 tabular-nums text-base">{formatCurrency(stats.totalNetSales)}</span>
+                  <span className="font-extrabold text-gray-800">Consolidated System Gross Revenue:</span>
+                  <span className="font-extrabold text-blue-600 tabular-nums text-base">{formatCurrency(effectiveModalGrossSales)}</span>
                 </div>
               </div>
+
+              {/* --- PHYSICAL CASH HANDED OVER INPUT & REAL-TIME VARIANCE SECTION --- */}
+              <div id="shift-physical-cash-section" className="bg-blue-50/70 border border-blue-200/90 rounded-xl p-4 text-left space-y-3 shadow-2xs">
+                <div className="flex items-center justify-between">
+                  <label htmlFor="shift-physical-cash-input" className="font-extrabold text-blue-950 text-xs uppercase tracking-wider flex items-center gap-1.5 cursor-pointer">
+                    <DollarSign className="w-3.5 h-3.5 text-blue-600" />
+                    PHYSICAL CASH HANDED OVER (RS.)
+                  </label>
+                  <span className="text-[10px] font-bold text-blue-800 bg-blue-100/90 px-2 py-0.5 rounded-full border border-blue-200/80">
+                    Shift Cash Reconciliation
+                  </span>
+                </div>
+
+                <div className="relative">
+                  <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-500 font-bold text-xs pointer-events-none">Rs.</span>
+                  <input
+                    id="shift-physical-cash-input"
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    placeholder="0.00"
+                    value={physicalCashHandedOverInput}
+                    onChange={(e) => setPhysicalCashHandedOverInput(e.target.value)}
+                    className="w-full pl-10 pr-4 py-2.5 bg-white border border-blue-300 rounded-lg text-sm font-extrabold text-[#1C1C1C] placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-600 tabular-nums shadow-2xs transition-all"
+                  />
+                </div>
+
+                {/* Real-time Variance Calculation Display */}
+                <div className="pt-2 border-t border-blue-200/60 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                  <div className="text-[11px] text-gray-600 font-medium leading-tight">
+                    <span className="text-gray-500">
+                      Variance Formula: (Physical Cash <strong className="text-gray-800 tabular-nums">{formatCurrency(modalPhysicalCashVal)}</strong> + Non-Cash <strong className="text-gray-800 tabular-nums">{formatCurrency(effectiveModalNonCashSales)}</strong>) − Gross Revenue <strong className="text-gray-800 tabular-nums">{formatCurrency(effectiveModalGrossSales)}</strong>
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="font-bold text-gray-600 text-[11px]">Shift Cash Variance:</span>
+                    {modalCashVariance < -0.01 ? (
+                      <span className="px-2.5 py-1 rounded-md font-extrabold text-xs bg-red-100 text-red-700 border border-red-200 tabular-nums flex items-center gap-1">
+                        <AlertTriangle className="w-3 h-3 text-red-600" />
+                        -{formatCurrency(Math.abs(modalCashVariance))} (Shortage)
+                      </span>
+                    ) : modalCashVariance > 0.01 ? (
+                      <span className="px-2.5 py-1 rounded-md font-extrabold text-xs bg-emerald-100 text-emerald-800 border border-emerald-200 tabular-nums flex items-center gap-1">
+                        <TrendingUp className="w-3 h-3 text-emerald-600" />
+                        +{formatCurrency(modalCashVariance)} (Excess)
+                      </span>
+                    ) : (
+                      <span className="px-2.5 py-1 rounded-md font-extrabold text-xs bg-emerald-100 text-emerald-800 border border-emerald-200 tabular-nums flex items-center gap-1">
+                        <CheckCircle className="w-3 h-3 text-emerald-600" />
+                        Rs. 0.00 (Balanced)
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* --- VARIANCE NON-CASH ALLOCATION / QUICK TAGGING PANEL --- */}
+              {(modalCashVariance !== 0 || totalAllocatedNonCash > 0) && (
+                <div id="variance-non-cash-allocation-section" className="bg-purple-50/80 border border-purple-200 rounded-xl p-4 text-left space-y-3 shadow-2xs animate-fade-in">
+                  <div className="flex items-center justify-between flex-wrap gap-1">
+                    <div className="flex items-center gap-1.5">
+                      <Tag className="w-3.5 h-3.5 text-purple-700" />
+                      <h4 className="font-extrabold text-purple-950 text-xs uppercase tracking-wider">
+                        Variance Non-Cash Allocation / Quick Tagging
+                      </h4>
+                    </div>
+                    {totalAllocatedNonCash > 0 && (
+                      <button
+                        type="button"
+                        onClick={handleResetAllocations}
+                        className="text-[10px] font-bold text-purple-700 hover:text-purple-900 bg-purple-100 hover:bg-purple-200/80 px-2 py-0.5 rounded-md cursor-pointer transition-colors"
+                      >
+                        Reset Allocations
+                      </button>
+                    )}
+                  </div>
+
+                  <p className="text-[11px] text-purple-900 leading-snug">
+                    {modalCashVariance < -0.01 ? (
+                      <>Discrepancy of <strong className="tabular-nums text-red-700 font-extrabold">{formatCurrency(Math.abs(modalCashVariance))}</strong> detected. Select payment type(s) below to allocate this variance directly to missing non-cash receipts before closing.</>
+                    ) : totalAllocatedNonCash > 0 ? (
+                      <>Allocated <strong className="tabular-nums text-purple-800 font-extrabold">{formatCurrency(totalAllocatedNonCash)}</strong> to non-cash payment records. Shift reconciliation is now balanced.</>
+                    ) : (
+                      <>Allocate variance amount to non-cash payment categories to balance the shift to Rs. 0.00.</>
+                    )}
+                  </p>
+
+                  {/* 1-Click Quick Allocation Buttons (when there is an unallocated shortage) */}
+                  {modalCashVariance < -0.01 && (
+                    <div className="space-y-1.5 pt-1">
+                      <span className="text-[10px] font-bold text-purple-800 uppercase tracking-wider block">
+                        Quick 1-Click Allocation ({formatCurrency(Math.abs(modalCashVariance))}):
+                      </span>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleQuickAllocateAll('card')}
+                          className="px-2.5 py-1.5 bg-white border border-purple-200 hover:border-purple-400 hover:bg-purple-100/50 rounded-lg text-xs font-bold text-purple-900 flex items-center justify-center gap-1.5 cursor-pointer shadow-2xs transition-all"
+                        >
+                          <CreditCard className="w-3 h-3 text-purple-600" />
+                          <span>+ Card POS</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleQuickAllocateAll('credit')}
+                          className="px-2.5 py-1.5 bg-white border border-purple-200 hover:border-purple-400 hover:bg-purple-100/50 rounded-lg text-xs font-bold text-purple-900 flex items-center justify-center gap-1.5 cursor-pointer shadow-2xs transition-all"
+                        >
+                          <Receipt className="w-3 h-3 text-purple-600" />
+                          <span>+ Credit</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleQuickAllocateAll('touchCard')}
+                          className="px-2.5 py-1.5 bg-white border border-purple-200 hover:border-purple-400 hover:bg-purple-100/50 rounded-lg text-xs font-bold text-purple-900 flex items-center justify-center gap-1.5 cursor-pointer shadow-2xs transition-all"
+                        >
+                          <CreditCard className="w-3 h-3 text-purple-600" />
+                          <span>+ Touch Card</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleQuickAllocateAll('voucher')}
+                          className="px-2.5 py-1.5 bg-white border border-purple-200 hover:border-purple-400 hover:bg-purple-100/50 rounded-lg text-xs font-bold text-purple-900 flex items-center justify-center gap-1.5 cursor-pointer shadow-2xs transition-all"
+                        >
+                          <Tag className="w-3 h-3 text-purple-600" />
+                          <span>+ Voucher</span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Itemized Categories with Checkboxes & Custom Numeric Inputs */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                    {/* Card POS */}
+                    <div className="bg-white p-2.5 rounded-lg border border-purple-200/80 flex items-center justify-between gap-2 shadow-2xs">
+                      <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-gray-800">
+                        <input
+                          type="checkbox"
+                          checked={varianceAllocations.card > 0}
+                          onChange={(e) => handleToggleCategory('card', e.target.checked)}
+                          className="rounded text-purple-600 focus:ring-purple-500 cursor-pointer"
+                        />
+                        <span>Card POS</span>
+                      </label>
+                      <div className="flex items-center gap-1">
+                        <span className="text-[10px] text-gray-400 font-bold">Rs.</span>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          placeholder="0.00"
+                          value={varianceAllocations.card || ''}
+                          onChange={(e) => handleCustomCategoryAmountChange('card', e.target.value)}
+                          className="w-24 px-2 py-1 bg-gray-50 border border-gray-200 rounded text-xs font-bold text-purple-900 text-right tabular-nums focus:outline-none focus:border-purple-500 focus:bg-white"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Corporate Credit */}
+                    <div className="bg-white p-2.5 rounded-lg border border-purple-200/80 flex items-center justify-between gap-2 shadow-2xs">
+                      <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-gray-800">
+                        <input
+                          type="checkbox"
+                          checked={varianceAllocations.credit > 0}
+                          onChange={(e) => handleToggleCategory('credit', e.target.checked)}
+                          className="rounded text-purple-600 focus:ring-purple-500 cursor-pointer"
+                        />
+                        <span>Corporate Credit</span>
+                      </label>
+                      <div className="flex items-center gap-1">
+                        <span className="text-[10px] text-gray-400 font-bold">Rs.</span>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          placeholder="0.00"
+                          value={varianceAllocations.credit || ''}
+                          onChange={(e) => handleCustomCategoryAmountChange('credit', e.target.value)}
+                          className="w-24 px-2 py-1 bg-gray-50 border border-gray-200 rounded text-xs font-bold text-purple-900 text-right tabular-nums focus:outline-none focus:border-purple-500 focus:bg-white"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Touch Card */}
+                    <div className="bg-white p-2.5 rounded-lg border border-purple-200/80 flex items-center justify-between gap-2 shadow-2xs">
+                      <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-gray-800">
+                        <input
+                          type="checkbox"
+                          checked={varianceAllocations.touchCard > 0}
+                          onChange={(e) => handleToggleCategory('touchCard', e.target.checked)}
+                          className="rounded text-purple-600 focus:ring-purple-500 cursor-pointer"
+                        />
+                        <span>Touch Card</span>
+                      </label>
+                      <div className="flex items-center gap-1">
+                        <span className="text-[10px] text-gray-400 font-bold">Rs.</span>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          placeholder="0.00"
+                          value={varianceAllocations.touchCard || ''}
+                          onChange={(e) => handleCustomCategoryAmountChange('touchCard', e.target.value)}
+                          className="w-24 px-2 py-1 bg-gray-50 border border-gray-200 rounded text-xs font-bold text-purple-900 text-right tabular-nums focus:outline-none focus:border-purple-500 focus:bg-white"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Voucher */}
+                    <div className="bg-white p-2.5 rounded-lg border border-purple-200/80 flex items-center justify-between gap-2 shadow-2xs">
+                      <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-gray-800">
+                        <input
+                          type="checkbox"
+                          checked={varianceAllocations.voucher > 0}
+                          onChange={(e) => handleToggleCategory('voucher', e.target.checked)}
+                          className="rounded text-purple-600 focus:ring-purple-500 cursor-pointer"
+                        />
+                        <span>Voucher</span>
+                      </label>
+                      <div className="flex items-center gap-1">
+                        <span className="text-[10px] text-gray-400 font-bold">Rs.</span>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          placeholder="0.00"
+                          value={varianceAllocations.voucher || ''}
+                          onChange={(e) => handleCustomCategoryAmountChange('voucher', e.target.value)}
+                          className="w-24 px-2 py-1 bg-gray-50 border border-gray-200 rounded text-xs font-bold text-purple-900 text-right tabular-nums focus:outline-none focus:border-purple-500 focus:bg-white"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <p className="text-[10px] text-purple-700/80 italic pt-1">
+                    * Allocated adjustments will sync directly into the respective database tables (card_sales, credit_sales, touch_card_sales, voucher_sales) upon shift closure.
+                  </p>
+                </div>
+              )}
 
               {/* Pumper Consolidated Shift Summary */}
               {allPumperStats.length > 0 && (
@@ -3566,7 +5164,7 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                     </span>
                   </div>
 
-                  <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                  <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
                     {allPumperStats.map((p) => {
                       const absVar = Math.abs(p.overallVariance);
                       const absVarFormatted = formatCurrency(absVar);
@@ -3600,8 +5198,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                               <span className="font-bold text-amber-700 tabular-nums">+{formatCurrency(p.totalOilSales)}</span>
                             </div>
                             <div>
-                              <span className="text-[9px] font-semibold text-purple-600 block uppercase">Non-Cash (Credit/Card)</span>
-                              <span className="font-bold text-purple-700 tabular-nums">-{formatCurrency(p.totalCreditSales + p.totalCardSales)}</span>
+                              <span className="text-[9px] font-semibold text-purple-600 block uppercase">Non-Cash Deductions</span>
+                              <span className="font-bold text-purple-700 tabular-nums">-{formatCurrency(p.totalNonCash)}</span>
                             </div>
                             <div>
                               <span className="text-[9px] font-extrabold text-blue-900 block uppercase">Net Cash Due</span>
@@ -3637,20 +5235,75 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                   </div>
                 </div>
               )}
+
+              {/* --- CASH BANKED / BANK DEPOSIT INPUT SECTION --- */}
+              <div id="shift-cash-banked-section" className="bg-emerald-50/70 border border-emerald-200/90 rounded-xl p-3.5 text-left space-y-2.5 shadow-2xs">
+                <div className="flex items-center justify-between">
+                  <label htmlFor="shift-cash-banked-input" className="font-extrabold text-emerald-950 text-xs uppercase tracking-wider flex items-center gap-1.5 cursor-pointer">
+                    <Landmark className="w-3.5 h-3.5 text-emerald-600" />
+                    CASH BANKED / BANK DEPOSIT (RS.)
+                  </label>
+                  <span className="text-[10px] font-bold text-emerald-800 bg-emerald-100/90 px-2 py-0.5 rounded-full border border-emerald-200/80">
+                    Direct Bank Deposit
+                  </span>
+                </div>
+
+                <div className="relative">
+                  <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-500 font-bold text-xs pointer-events-none">Rs.</span>
+                  <input
+                    id="shift-cash-banked-input"
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    placeholder="0.00"
+                    value={cashBankedInput}
+                    onChange={(e) => setCashBankedInput(e.target.value)}
+                    className="w-full pl-10 pr-4 py-2 bg-white border border-emerald-300 rounded-lg text-sm font-extrabold text-[#1C1C1C] placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-600 tabular-nums shadow-2xs transition-all"
+                  />
+                </div>
+
+                {/* Calculated sub-text displaying remaining cash in hand */}
+                <div className="pt-2 border-t border-emerald-200/60 flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 text-xs">
+                  <div className="text-[11px] text-gray-600 font-medium">
+                    <span className="text-gray-500">
+                      (Physical Cash <strong className="text-gray-800 tabular-nums">{formatCurrency(modalPhysicalCashVal)}</strong> − Cash Banked <strong className="text-gray-800 tabular-nums">{formatCurrency(Math.max(0, parseFloat(cashBankedInput) || 0))}</strong>)
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0 bg-white px-2.5 py-1 rounded-md border border-emerald-200 shadow-2xs">
+                    <span className="font-bold text-gray-600 text-[11px]">Remaining Cash in Hand:</span>
+                    <span className={`font-black text-xs sm:text-sm tabular-nums ${
+                      (modalPhysicalCashVal - (Math.max(0, parseFloat(cashBankedInput) || 0))) < 0 ? 'text-red-600' : 'text-emerald-900'
+                    }`}>
+                      {formatCurrency(modalPhysicalCashVal - (Math.max(0, parseFloat(cashBankedInput) || 0)))}
+                    </span>
+                  </div>
+                </div>
+              </div>
             </div>
 
             <div className="px-6 py-4 bg-gray-50 border-t border-gray-200 flex items-center justify-end gap-3 shrink-0">
               <button
-                onClick={() => setIsCloseConfirmOpen(false)}
-                className="px-4 py-2 bg-white border border-gray-200 text-gray-600 font-bold text-xs rounded-lg hover:bg-gray-100 cursor-pointer shadow-2xs transition-all"
+                type="button"
+                disabled={isClosingShift}
+                onClick={() => !isClosingShift && setIsCloseConfirmOpen(false)}
+                className="px-4 py-2 bg-white border border-gray-200 text-gray-600 font-bold text-xs rounded-lg hover:bg-gray-100 cursor-pointer shadow-2xs transition-all disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Cancel
               </button>
               <button
+                type="button"
+                disabled={isClosingShift}
                 onClick={handleConfirmCloseShift}
-                className="px-5 py-2 bg-gradient-to-r from-red-600 to-red-500 text-white font-bold text-xs rounded-lg hover:brightness-110 transition-all cursor-pointer shadow-sm"
+                className="flex items-center gap-2 px-5 py-2 bg-gradient-to-r from-red-600 to-red-500 text-white font-bold text-xs rounded-lg hover:brightness-110 transition-all cursor-pointer shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                Confirm & Lock Ledger
+                {isClosingShift ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>Ending Shift...</span>
+                  </>
+                ) : (
+                  <span>Confirm & End Shift</span>
+                )}
               </button>
             </div>
           </div>
@@ -3704,7 +5357,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                 <input
                   type="number"
                   step="0.01"
-                  value={modalHandoverMeter}
+                  value={modalHandoverMeter === 0 ? '' : modalHandoverMeter}
+                  placeholder="0"
                   onFocus={(e) => e.target.select()}
                   onChange={(e) => {
                     const val = e.target.value === '' ? '' : parseFloat(e.target.value) || 0;
@@ -3733,7 +5387,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                 <input
                   type="number"
                   step="0.01"
-                  value={modalOutgoingCash}
+                  value={modalOutgoingCash === 0 ? '' : modalOutgoingCash}
+                  placeholder="0"
                   onFocus={(e) => e.target.select()}
                   onChange={(e) => setModalOutgoingCash(e.target.value === '' ? '' : parseFloat(e.target.value) || 0)}
                   className="w-full px-3.5 py-2.5 bg-white border border-gray-300 rounded-xl text-sm font-bold text-[#1C1C1C] tabular-nums focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20"

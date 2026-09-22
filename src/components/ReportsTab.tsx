@@ -276,47 +276,73 @@ export default function ReportsTab({
     let totalOilSales = 0;
     let totalCreditSales = 0;
     let totalCardSales = 0;
+    let totalTouchCardSales = 0;
+    let totalVoucherSales = 0;
     let sumActualCash = 0;
 
     if (shift.pumpReadings && shift.pumpReadings.length > 0) {
-      shift.pumpReadings.forEach((r) => {
+      shift.pumpReadings.forEach((r: any) => {
         const soldLiters = Math.max(0, (r.endMeter || 0) - (r.startMeter || 0) - (r.testingQty || 0));
         const fuelVal = soldLiters * (r.unitPrice || 0);
-        const oilVal = r.oilSalesAmount || 0;
-        const creditVal = r.creditSalesAmount || 0;
-        const cardVal = r.cardSalesAmount || 0;
-        const cashVal = r.actualCash || 0;
+        const oilVal = Number(r.oilSalesAmount ?? r.oil_sales_amount) || 0;
+        const creditVal = Number(r.creditSalesAmount ?? r.credit_sales_amount) || 0;
+        const cardVal = Number(r.cardSalesAmount ?? r.card_sales_amount) || 0;
+        const touchVal = Number(r.touchCardSalesAmount ?? r.touch_card_sales_amount) || 0;
+        const voucherVal = Number(r.voucherSalesAmount ?? r.voucher_sales_amount) || 0;
+        const cashVal = Number(r.actualCash ?? r.actual_cash) || 0;
 
         grossFuelSales += fuelVal;
         totalOilSales += oilVal;
         totalCreditSales += creditVal;
         totalCardSales += cardVal;
+        totalTouchCardSales += touchVal;
+        totalVoucherSales += voucherVal;
         sumActualCash += cashVal;
       });
     }
 
-    const totalGrossSales = grossFuelSales + totalOilSales;
-    const totalNonCash = totalCreditSales + totalCardSales;
+    const finalCredit = Math.max(totalCreditSales, Number((shift as any).creditSales ?? (shift as any).credit_sales ?? (shift as any).total_credit_sales ?? 0));
+    const finalCard = Math.max(totalCardSales, Number((shift as any).cardSales ?? (shift as any).card_sales ?? (shift as any).total_card_sales ?? 0));
+    const finalTouch = Math.max(totalTouchCardSales, Number((shift as any).touchCardSales ?? (shift as any).touch_card_sales ?? (shift as any).total_touch_card_sales ?? 0));
+    const finalVoucher = Math.max(totalVoucherSales, Number((shift as any).voucherSales ?? (shift as any).voucher_sales ?? (shift as any).total_voucher_sales ?? 0));
+
+    const totalGasSales = shift.counterSales?.totalGasSales ?? (shift.counterSales?.gasSales || []).reduce((sum: number, g: any) => sum + (Number(g.totalAmount) || 0), 0);
+    const totalLubeSales = shift.counterSales?.totalLubeSales ?? (shift.counterSales?.lubeSales || []).reduce((sum: number, l: any) => sum + (Number(l.totalAmount) || 0), 0);
+
+    const totalGrossSales = (grossFuelSales + totalOilSales + totalGasSales + totalLubeSales) || shift.totalNetSales || 0;
+    const totalNonCash = finalCredit + finalCard + finalTouch + finalVoucher;
     
-    // Expected cash = Gross - Non-Cash
+    // Expected cash = Total Gross Revenue - Non-Cash Deductions (Credit + Card + Touch Card + Voucher)
     const totalExpectedCash = Math.max(0, totalGrossSales - totalNonCash);
     
+    const cashBanked = Number(shift.cashBanked ?? (shift as any).cash_banked) || 0;
+
     // Physical Cash handed over
-    const actualCashHandedOver = sumActualCash > 0 
+    let actualCashHandedOver = sumActualCash > 0 
       ? sumActualCash 
       : (shift.totalPhysicalCash || (shift.initialPumperCash || 0) + (shift.replacementPumperCash || 0));
 
-    // Cash Variance = Actual - Expected
+    if (actualCashHandedOver === 0 && cashBanked > 0) {
+      actualCashHandedOver = cashBanked;
+    }
+
+    const effectivePhysical = actualCashHandedOver > 0 ? actualCashHandedOver : cashBanked;
+
+    // Cash Variance = Effective Physical - Expected
     const variance = shift.cashVariance !== undefined && shift.cashVariance !== 0 
       ? shift.cashVariance 
-      : actualCashHandedOver - totalExpectedCash;
+      : effectivePhysical - totalExpectedCash;
 
     return {
       grossFuelSales,
       totalOilSales,
+      totalGasSales,
+      totalLubeSales,
       totalGrossSales,
-      totalCreditSales,
-      totalCardSales,
+      totalCreditSales: finalCredit,
+      totalCardSales: finalCard,
+      totalTouchCardSales: finalTouch,
+      totalVoucherSales: finalVoucher,
       totalNonCash,
       totalExpectedCash,
       actualCashHandedOver,

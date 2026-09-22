@@ -8,7 +8,7 @@ import {
   ShieldCheck, Fuel, Users, Sliders, Plus, Trash2, 
   CheckCircle2, AlertTriangle, Database, Copy, Check,
   Landmark, Edit2, Search, Phone, X, RefreshCcw,
-  Layers, Info, Tag, Calendar, Clock, Save, Gauge, Droplets
+  Layers, Info, Tag, Calendar, Clock, Save, Gauge, Droplets, Flame
 } from 'lucide-react';
 import { Employee, FuelTank, FuelType, Pump, PumpMachine, PriceSchedule, OilTank, AuthUser } from '../types';
 import { supabase, getTanksTableName } from '../lib/supabase';
@@ -571,6 +571,115 @@ export default function AdminControlTab({
     }
 
     showToast("Pending price schedule cancelled.");
+  };
+
+  // -------------------------------------------------------------
+  // D2) LP GAS TARIFF & CYLINDER PRICES MANAGEMENT
+  // -------------------------------------------------------------
+  const [gasPrices, setGasPrices] = useState<{ [key: string]: number }>(() => {
+    try {
+      const storedPrices = localStorage.getItem('fuel_flow_gas_prices');
+      if (storedPrices) {
+        return JSON.parse(storedPrices);
+      }
+      const storedInv = localStorage.getItem('fuel_flow_gas_stock') || localStorage.getItem('fuel_flow_gas_inventory');
+      if (storedInv) {
+        const parsed = JSON.parse(storedInv);
+        if (Array.isArray(parsed)) {
+          const pMap: { [key: string]: number } = {};
+          parsed.forEach((item: any) => {
+            if (item.size === '12.5 kg' || item.id === 'gas-12.5kg') pMap['12.5kg'] = item.selling_price || item.unit_price || 3690;
+            if (item.size === '5.0 kg' || item.id === 'gas-5.0kg' || item.id === 'gas-5kg') pMap['5kg'] = item.selling_price || item.unit_price || 1482;
+            if (item.size === '2.3 kg' || item.id === 'gas-2.3kg') pMap['2.3kg'] = item.selling_price || item.unit_price || 694;
+          });
+          return {
+            '12.5kg': pMap['12.5kg'] || 3690,
+            '5kg': pMap['5kg'] || 1482,
+            '2.3kg': pMap['2.3kg'] || 694
+          };
+        }
+      }
+    } catch (_) {}
+    return {
+      '12.5kg': 3690,
+      '5kg': 1482,
+      '2.3kg': 694
+    };
+  });
+
+  const [isUpdatingGasPrices, setIsUpdatingGasPrices] = useState(false);
+
+  const handleUpdateGasPrices = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsUpdatingGasPrices(true);
+    try {
+      // 1. Save to LocalStorage key 'fuel_flow_gas_prices'
+      localStorage.setItem('fuel_flow_gas_prices', JSON.stringify(gasPrices));
+
+      // 2. Update existing gas inventory items in LocalStorage
+      const gasKey = 'fuel_flow_gas_stock';
+      const altGasKey = 'fuel_flow_gas_inventory';
+      let currentGasList: any[] = [];
+      try {
+        const stored = localStorage.getItem(gasKey) || localStorage.getItem(altGasKey);
+        if (stored) {
+          currentGasList = JSON.parse(stored);
+        }
+      } catch (_) {}
+
+      if (!Array.isArray(currentGasList) || currentGasList.length === 0) {
+        currentGasList = [
+          { id: 'gas-12.5kg', size: '12.5 kg', full_count: 0, empty_count: 0, selling_price: gasPrices['12.5kg'], last_updated: new Date().toISOString() },
+          { id: 'gas-37.5kg', size: '37.5 kg', full_count: 0, empty_count: 0, selling_price: 11200, last_updated: new Date().toISOString() },
+          { id: 'gas-5.0kg', size: '5.0 kg', full_count: 0, empty_count: 0, selling_price: gasPrices['5kg'], last_updated: new Date().toISOString() },
+          { id: 'gas-2.3kg', size: '2.3 kg', full_count: 0, empty_count: 0, selling_price: gasPrices['2.3kg'], last_updated: new Date().toISOString() }
+        ];
+      } else {
+        currentGasList = currentGasList.map(item => {
+          if (item.size === '12.5 kg' || item.id === 'gas-12.5kg') {
+            return { ...item, selling_price: gasPrices['12.5kg'], unit_price: gasPrices['12.5kg'], last_updated: new Date().toISOString() };
+          }
+          if (item.size === '5.0 kg' || item.id === 'gas-5.0kg' || item.id === 'gas-5kg') {
+            return { ...item, selling_price: gasPrices['5kg'], unit_price: gasPrices['5kg'], last_updated: new Date().toISOString() };
+          }
+          if (item.size === '2.3 kg' || item.id === 'gas-2.3kg') {
+            return { ...item, selling_price: gasPrices['2.3kg'], unit_price: gasPrices['2.3kg'], last_updated: new Date().toISOString() };
+          }
+          return item;
+        });
+      }
+
+      localStorage.setItem(gasKey, JSON.stringify(currentGasList));
+      localStorage.setItem(altGasKey, JSON.stringify(currentGasList));
+      localStorage.setItem('fuelflow_lpgas_inventory', JSON.stringify(currentGasList));
+
+      // 3. Dispatch global custom events so Shift Management & Inventory tab react immediately
+      window.dispatchEvent(new CustomEvent('gas-prices-updated', {
+        detail: { updatedPrices: gasPrices, updatedInventory: currentGasList }
+      }));
+      window.dispatchEvent(new CustomEvent('gas-inventory-updated', {
+        detail: { updatedInventory: currentGasList }
+      }));
+
+      // 4. Update Supabase gas_inventory table
+      try {
+        const upsertPayload = [
+          { id: 'gas-12.5kg', size: '12.5 kg', selling_price: gasPrices['12.5kg'], last_updated: new Date().toISOString() },
+          { id: 'gas-5.0kg', size: '5.0 kg', selling_price: gasPrices['5kg'], last_updated: new Date().toISOString() },
+          { id: 'gas-2.3kg', size: '2.3 kg', selling_price: gasPrices['2.3kg'], last_updated: new Date().toISOString() }
+        ];
+        await supabase.from('gas_inventory').upsert(upsertPayload);
+      } catch (sbErr) {
+        console.warn('Supabase gas_inventory price sync notice:', sbErr);
+      }
+
+      showToast('✓ LP Gas Cylinder Selling Prices Updated Successfully!');
+    } catch (err) {
+      console.error('Error updating gas prices:', err);
+      showToast('Error updating LP gas prices');
+    } finally {
+      setIsUpdatingGasPrices(false);
+    }
   };
 
   // -------------------------------------------------------------
@@ -1137,6 +1246,153 @@ export default function AdminControlTab({
                 </tbody>
               </table>
             </div>
+          </div>
+
+          {/* LP GAS TARIFF & CYLINDER PRICES (CLEAN LIST VIEW) */}
+          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-100 bg-gray-50/50 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div className="p-1.5 bg-orange-100 text-orange-600 rounded-lg">
+                  <Flame className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-[#1C1C1C] text-xs uppercase tracking-wider">LP Gas Tariff &amp; Cylinder Prices</h3>
+                  <p className="text-[11px] text-gray-500 font-medium">Counter retail selling prices for Litro LP gas cylinders</p>
+                </div>
+              </div>
+              <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-orange-50 text-orange-700 border border-orange-200 uppercase tracking-wider">
+                Retail Rates
+              </span>
+            </div>
+
+            <form onSubmit={handleUpdateGasPrices}>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse">
+                  <thead className="bg-gray-50/90 border-b border-gray-100 text-gray-500 font-bold text-xs uppercase tracking-wider">
+                    <tr>
+                      <th className="py-3 px-6">Cylinder Type</th>
+                      <th className="py-3 px-6">Classification</th>
+                      <th className="py-3 px-6 text-right w-64">Selling Price (Rs.)</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-50 text-xs">
+                    {/* 12.5 kg */}
+                    <tr className="hover:bg-gray-50/50 transition-colors">
+                      <td className="py-3.5 px-6 font-bold text-gray-900">
+                        <div className="flex items-center gap-2">
+                          <span className="w-2 h-2 rounded-full bg-orange-500"></span>
+                          <span>12.5 kg Cylinder</span>
+                        </div>
+                      </td>
+                      <td className="py-3.5 px-6">
+                        <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-orange-50 text-orange-800 border border-orange-200">
+                          Standard Household
+                        </span>
+                      </td>
+                      <td className="py-3.5 px-6 text-right">
+                        <div className="flex items-center justify-end gap-1.5">
+                          <span className="text-xs font-bold text-gray-400">Rs.</span>
+                          <input
+                            type="number"
+                            step="1"
+                            min="0"
+                            required
+                            value={gasPrices['12.5kg'] || ''}
+                            onFocus={(e) => e.target.select()}
+                            onChange={(e) => setGasPrices(prev => ({ ...prev, '12.5kg': parseFloat(e.target.value) || 0 }))}
+                            className="w-32 px-3 py-1.5 bg-gray-50 border border-gray-200 rounded-lg text-gray-900 tabular-nums font-bold text-xs text-right focus:bg-white focus:outline-none focus:border-orange-500 focus:ring-1 focus:ring-orange-500"
+                          />
+                        </div>
+                      </td>
+                    </tr>
+
+                    {/* 5.0 kg */}
+                    <tr className="hover:bg-gray-50/50 transition-colors">
+                      <td className="py-3.5 px-6 font-bold text-gray-900">
+                        <div className="flex items-center gap-2">
+                          <span className="w-2 h-2 rounded-full bg-amber-500"></span>
+                          <span>5.0 kg Cylinder</span>
+                        </div>
+                      </td>
+                      <td className="py-3.5 px-6">
+                        <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-amber-50 text-amber-800 border border-amber-200">
+                          Buddy Cylinder
+                        </span>
+                      </td>
+                      <td className="py-3.5 px-6 text-right">
+                        <div className="flex items-center justify-end gap-1.5">
+                          <span className="text-xs font-bold text-gray-400">Rs.</span>
+                          <input
+                            type="number"
+                            step="1"
+                            min="0"
+                            required
+                            value={gasPrices['5kg'] || ''}
+                            onFocus={(e) => e.target.select()}
+                            onChange={(e) => setGasPrices(prev => ({ ...prev, '5kg': parseFloat(e.target.value) || 0 }))}
+                            className="w-32 px-3 py-1.5 bg-gray-50 border border-gray-200 rounded-lg text-gray-900 tabular-nums font-bold text-xs text-right focus:bg-white focus:outline-none focus:border-orange-500 focus:ring-1 focus:ring-orange-500"
+                          />
+                        </div>
+                      </td>
+                    </tr>
+
+                    {/* 2.3 kg */}
+                    <tr className="hover:bg-gray-50/50 transition-colors">
+                      <td className="py-3.5 px-6 font-bold text-gray-900">
+                        <div className="flex items-center gap-2">
+                          <span className="w-2 h-2 rounded-full bg-yellow-500"></span>
+                          <span>2.3 kg Cylinder</span>
+                        </div>
+                      </td>
+                      <td className="py-3.5 px-6">
+                        <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-yellow-50 text-yellow-800 border border-yellow-200">
+                          Portable Small
+                        </span>
+                      </td>
+                      <td className="py-3.5 px-6 text-right">
+                        <div className="flex items-center justify-end gap-1.5">
+                          <span className="text-xs font-bold text-gray-400">Rs.</span>
+                          <input
+                            type="number"
+                            step="1"
+                            min="0"
+                            required
+                            value={gasPrices['2.3kg'] || ''}
+                            onFocus={(e) => e.target.select()}
+                            onChange={(e) => setGasPrices(prev => ({ ...prev, '2.3kg': parseFloat(e.target.value) || 0 }))}
+                            className="w-32 px-3 py-1.5 bg-gray-50 border border-gray-200 rounded-lg text-gray-900 tabular-nums font-bold text-xs text-right focus:bg-white focus:outline-none focus:border-orange-500 focus:ring-1 focus:ring-orange-500"
+                          />
+                        </div>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Bottom Compact Action Row */}
+              <div className="px-6 py-3.5 bg-gray-50/60 border-t border-gray-100 flex items-center justify-between">
+                <span className="text-[11px] text-gray-500">
+                  Changes sync immediately with Shift Counter Sales &amp; LP Gas Inventory.
+                </span>
+                <button
+                  type="submit"
+                  disabled={isUpdatingGasPrices}
+                  className="px-4 py-2 bg-gradient-to-r from-orange-600 to-amber-600 hover:from-orange-700 hover:to-amber-700 text-white font-bold text-xs rounded-xl shadow-xs transition-all flex items-center gap-2 cursor-pointer"
+                >
+                  {isUpdatingGasPrices ? (
+                    <>
+                      <RefreshCcw className="w-3.5 h-3.5 animate-spin" />
+                      <span>Saving...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Save className="w-3.5 h-3.5" />
+                      <span>Update Gas Prices</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </form>
           </div>
 
           {/* Schedule Future Price Change Section */}
