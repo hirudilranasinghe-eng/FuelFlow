@@ -61,6 +61,17 @@ export const calculateChamberSoldLiters = (opening: number, closing: number): nu
   return Number((opening - closing).toFixed(2));
 };
 
+// Deterministic natural sorting helper for pumps and pump readings
+export function sortPumpReadingsNaturally<T extends { pumpName?: string; pumpId?: string; id?: string; startMeter?: number }>(list: T[]): T[] {
+  return [...list].sort((a, b) => {
+    const nameA = a.pumpName || a.pumpId || a.id || '';
+    const nameB = b.pumpName || b.pumpId || b.id || '';
+    const comp = nameA.localeCompare(nameB, undefined, { numeric: true, sensitivity: 'base' });
+    if (comp !== 0) return comp;
+    return (Number(a.startMeter) || 0) - (Number(b.startMeter) || 0);
+  });
+}
+
 export default function ShiftManagementTab({
   employees,
   tanks,
@@ -610,7 +621,7 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         }
       });
 
-      const ensuredReadings: PumpReading[] = availablePumps.map(p => {
+      const ensuredReadings: PumpReading[] = sortPumpReadingsNaturally(availablePumps.map(p => {
         const isOil = p.id === 'pump-oil-bay' || p.fuelType === 'Oil & Lubricants' || p.name.toLowerCase().includes('oil') || p.name.toLowerCase().includes('dispenser');
         
         if (readingMap.has(p.id)) {
@@ -679,7 +690,7 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
           unitPrice: tank ? tank.pricePerLiter : 355,
           chamberReadings: isOil ? getDefaultChambers(oilTanks) : undefined
         };
-      });
+      }));
 
       setDraftReadings(ensuredReadings);
       setDraftSupervisorId(activeShift.supervisorId);
@@ -1344,7 +1355,13 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       }
     });
 
-    return Object.values(pumperGroups);
+    const groups = Object.values(pumperGroups).map(group => ({
+      ...group,
+      readings: sortPumpReadingsNaturally<PumpReading>(group.readings)
+    }));
+
+    // Deterministic immutable sort by pumper name
+    return groups.sort((a, b) => (a.pumperName || a.pumperId).localeCompare(b.pumperName || b.pumperId, undefined, { numeric: true, sensitivity: 'base' }));
   }, [draftReadings, employees]);
 
   // Filter pumpers assigned to 2 or more active/draft pumps for multi-pump consolidation
@@ -2548,12 +2565,19 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
 
     selectedActivePumperIds.forEach(id => pumperIdsSet.add(id));
 
-    const pumperList = Array.from(pumperIdsSet);
+    // Deterministic immutable sorting for pumpers
+    const pumperList = Array.from(pumperIdsSet).sort((a, b) => {
+      const empA = employees.find(e => e.id === a)?.name || a;
+      const empB = employees.find(e => e.id === b)?.name || b;
+      return empA.localeCompare(empB, undefined, { numeric: true, sensitivity: 'base' });
+    });
     const query = searchQuery.trim().toLowerCase();
 
     return pumperList.map(pumperId => {
       const emp = employees.find(e => e.id === pumperId);
-      const assignedReadings = draftReadings.filter(r => r.assignedPumperId === pumperId);
+      const rawAssignedReadings = draftReadings.filter(r => r.assignedPumperId === pumperId);
+      // Deterministically sort assigned pumps/nozzles within the pumper card
+      const assignedReadings: PumpReading[] = sortPumpReadingsNaturally<PumpReading>(rawAssignedReadings);
 
       let totalGrossRevenue = 0;
       let totalFuelRevenue = 0;

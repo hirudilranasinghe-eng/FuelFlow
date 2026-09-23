@@ -323,8 +323,48 @@ export default function App() {
         setGasStock(customEvent.detail.updatedInventory);
       }
     };
+
+    const handleGasPricesUpdate = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      if (customEvent.detail?.updatedPrices) {
+        const pMap = customEvent.detail.updatedPrices;
+        setGasStock(prev => prev.map(item => {
+          if (item.size === '12.5 kg' || item.id === 'gas-12.5kg') return { ...item, selling_price: pMap['12.5kg'] || item.selling_price, unit_price: pMap['12.5kg'] || item.unit_price };
+          if (item.size === '5.0 kg' || item.id === 'gas-5.0kg' || item.id === 'gas-5kg') return { ...item, selling_price: pMap['5kg'] || item.selling_price, unit_price: pMap['5kg'] || item.unit_price };
+          if (item.size === '2.3 kg' || item.id === 'gas-2.3kg') return { ...item, selling_price: pMap['2.3kg'] || item.selling_price, unit_price: pMap['2.3kg'] || item.unit_price };
+          return item;
+        }));
+      }
+    };
+
+    const handleFuelPricesUpdate = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      if (customEvent.detail?.updatedTanks && Array.isArray(customEvent.detail.updatedTanks)) {
+        setTanks(customEvent.detail.updatedTanks);
+      } else if (customEvent.detail?.fuelType && customEvent.detail?.newPrice) {
+        const newPrice = Number(customEvent.detail.newPrice);
+        setTanks(prev => prev.map(t => t.fuelType === customEvent.detail.fuelType ? { ...t, pricePerLiter: newPrice } : t));
+      }
+    };
+
+    const handleTanksUpdate = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      if (customEvent.detail?.tanks && Array.isArray(customEvent.detail.tanks)) {
+        setTanks(customEvent.detail.tanks);
+      }
+    };
+
     window.addEventListener('gas-inventory-updated', handleGasUpdate);
-    return () => window.removeEventListener('gas-inventory-updated', handleGasUpdate);
+    window.addEventListener('gas-prices-updated', handleGasPricesUpdate);
+    window.addEventListener('fuel-prices-updated', handleFuelPricesUpdate);
+    window.addEventListener('tanks-updated', handleTanksUpdate);
+
+    return () => {
+      window.removeEventListener('gas-inventory-updated', handleGasUpdate);
+      window.removeEventListener('gas-prices-updated', handleGasPricesUpdate);
+      window.removeEventListener('fuel-prices-updated', handleFuelPricesUpdate);
+      window.removeEventListener('tanks-updated', handleTanksUpdate);
+    };
   }, []);
 
   useEffect(() => {
@@ -464,15 +504,18 @@ export default function App() {
       };
 
       try {
-        // Fetch employees
-        const { data: employeesData, error: empError } = await supabase.from('employees').select('*');
+        // Fetch employees with explicit deterministic ordering
+        const { data: employeesData, error: empError } = await supabase
+          .from('employees')
+          .select('*')
+          .order('name', { ascending: true });
         if (empError) handleSupabaseError(empError);
 
         if (employeesData && employeesData.length > 0) {
           const mappedEmps = employeesData.map(e => ({
             id: e.id, name: e.name, role: e.role, phone: e.phone, status: e.status, avatarColor: e.avatarcolor
           }));
-          setEmployees(mappedEmps as Employee[]);
+          setEmployees(mappedEmps.sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' })) as Employee[]);
         } else {
           setEmployees([]);
         }
@@ -536,11 +579,11 @@ export default function App() {
           setOilTanks([]);
         }
 
-        // Fetch pump_machines / machines table if available
+        // Fetch pump_machines / machines table if available with deterministic ordering
         try {
-          let { data: machinesData } = await supabase.from('pump_machines').select('*');
+          let { data: machinesData } = await supabase.from('pump_machines').select('*').order('name', { ascending: true });
           if (!machinesData || machinesData.length === 0) {
-            const { data: altMachData } = await supabase.from('machines').select('*');
+            const { data: altMachData } = await supabase.from('machines').select('*').order('name', { ascending: true });
             machinesData = altMachData;
           }
           if (machinesData && machinesData.length > 0) {
@@ -550,7 +593,7 @@ export default function App() {
               status: m.status || 'Active',
               location: m.location || ''
             }));
-            setPumpMachines(mappedMachines as PumpMachine[]);
+            setPumpMachines([...mappedMachines].sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id, undefined, { numeric: true, sensitivity: 'base' })) as PumpMachine[]);
           } else {
             setPumpMachines([]);
           }
@@ -559,10 +602,10 @@ export default function App() {
           setPumpMachines([]);
         }
 
-        // Fetch nozzles / pumps table
+        // Fetch nozzles / pumps table with deterministic ordering
         let fetchedPumps: any[] | null = null;
         try {
-          const { data: nozzlesData } = await supabase.from('nozzles').select('*');
+          const { data: nozzlesData } = await supabase.from('nozzles').select('*').order('name', { ascending: true });
           if (nozzlesData && nozzlesData.length > 0) {
             fetchedPumps = nozzlesData;
           }
@@ -570,7 +613,7 @@ export default function App() {
 
         if (!fetchedPumps || fetchedPumps.length === 0) {
           try {
-            const { data: pumpsData } = await supabase.from('pumps').select('*');
+            const { data: pumpsData } = await supabase.from('pumps').select('*').order('name', { ascending: true });
             if (pumpsData && pumpsData.length > 0) {
               fetchedPumps = pumpsData;
             }
@@ -588,7 +631,7 @@ export default function App() {
             machineName: p.machinename || p.machine_name || p.machineName || undefined,
             startMeter: Number(p.startmeter ?? p.start_meter ?? p.startMeter) || 0
           }));
-          setPumps(mappedPumps as Pump[]);
+          setPumps([...mappedPumps].sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id, undefined, { numeric: true, sensitivity: 'base' })) as Pump[]);
         } else {
           setPumps([]);
         }
@@ -625,6 +668,42 @@ export default function App() {
               ? appDepositsByShift[s.id]
               : Number(s.cash_banked ?? s.cashbanked ?? s.cashBanked) || 0;
 
+            const mappedReadings = (s.pumpReadings || []).map((r: any) => ({
+              id: r.id,
+              pumpId: r.pump_id || r.pumpid || r.pumpId,
+              pumpName: r.pump_name || r.pumpname || r.pumpName,
+              fuelType: r.fuel_type || r.fueltype || r.fuelType,
+              tankId: r.tank_id || r.tankid || r.tankId || (r.fueltype === 'Petrol 92' ? 'tank-petrol92' : r.fueltype === 'Petrol 95' ? 'tank-petrol95' : r.fueltype === 'Auto Diesel' ? 'tank-autodiesel' : 'tank-superdiesel'),
+              assignedPumperId: r.assigned_pumper_id || r.assignedpumperid || r.assignedPumperId || null,
+              replacementPumperId: r.replacement_pumper_id || r.replacementpumperid || r.replacementPumperId || null,
+              initialPumperCash: Number(r.initial_pumper_cash || r.initialpumpercash || r.initialPumperCash) || 0,
+              replacementPumperCash: Number(r.replacement_pumper_cash || r.replacementpumpercash || r.replacementPumperCash) || 0,
+              handoverMeter: Number(r.handover_meter !== undefined ? r.handover_meter : r.handovermeter !== undefined ? r.handovermeter : r.handoverMeter) || 0,
+              handoverNotes: r.handover_notes || r.handovernotes || r.handoverNotes || '',
+              startMeter: Number(r.start_meter !== undefined ? r.start_meter : r.startmeter !== undefined ? r.startmeter : r.startMeter) || 0,
+              endMeter: Number(r.end_meter !== undefined ? r.end_meter : r.endmeter !== undefined ? r.endmeter : r.endMeter) || 0,
+              testingQty: Number(r.testing_qty !== undefined ? r.testing_qty : r.testingqty !== undefined ? r.testingqty : r.testingQty) || 0,
+              status: r.status || 'Idle',
+              isLocked: r.is_locked !== undefined ? r.is_locked : r.islocked !== undefined ? r.islocked : r.isLocked,
+              isStartSaved: r.is_start_saved !== undefined ? r.is_start_saved : r.isstartsaved !== undefined ? r.isstartsaved : (r.is_locked || (Number(r.start_meter || r.startmeter || 0) > 0)),
+              isCardFinalized: r.is_card_finalized !== undefined ? r.is_card_finalized : r.iscardfinalized !== undefined ? r.iscardfinalized : (r.status === 'Completed'),
+              unitPrice: Number(r.unit_price || r.unitprice || r.unitPrice) || 0,
+              actualCash: Number(r.actual_cash ?? r.actualcash ?? r.actualCash) || 0,
+              cashVariance: Number(r.cash_variance ?? r.cashvariance ?? r.cashVariance) || 0,
+              creditSalesAmount: Number(r.credit_sales_amount ?? r.creditsalesamount ?? r.creditSalesAmount) || 0,
+              cardSalesAmount: Number(r.card_sales_amount ?? r.cardsalesamount ?? r.cardSalesAmount) || 0,
+              touchCardSalesAmount: Number(r.touch_card_sales_amount ?? r.touchcardsalesamount ?? r.touchCardSalesAmount) || 0,
+              voucherSalesAmount: Number(r.voucher_sales_amount ?? r.vouchersalesamount ?? r.voucherSalesAmount) || 0,
+              oilSalesAmount: Number(r.oil_sales_amount ?? r.oilsalesamount ?? r.oilSalesAmount) || 0
+            }));
+
+            // Deterministic immutable sorting for pumpReadings
+            const sortedReadings = mappedReadings.sort((a, b) => {
+              const nameComp = (a.pumpName || a.pumpId || '').localeCompare(b.pumpName || b.pumpId || '', undefined, { numeric: true, sensitivity: 'base' });
+              if (nameComp !== 0) return nameComp;
+              return (a.startMeter || 0) - (b.startMeter || 0);
+            });
+
             return {
               id: s.id,
               name: s.name,
@@ -643,30 +722,7 @@ export default function App() {
               cash_banked: bankedAmount,
               handoverNotes: s.handovernotes || '',
               replacementPumperId: s.replacementpumperid || '',
-              pumpReadings: (s.pumpReadings || []).map((r: any) => ({
-                pumpId: r.pump_id || r.pumpid || r.pumpId,
-                pumpName: r.pump_name || r.pumpname || r.pumpName,
-                fuelType: r.fuel_type || r.fueltype || r.fuelType,
-                tankId: r.tank_id || r.tankid || r.tankId || (r.fueltype === 'Petrol 92' ? 'tank-petrol92' : r.fueltype === 'Petrol 95' ? 'tank-petrol95' : r.fueltype === 'Auto Diesel' ? 'tank-autodiesel' : 'tank-superdiesel'),
-                assignedPumperId: r.assigned_pumper_id || r.assignedpumperid || r.assignedPumperId || null,
-                replacementPumperId: r.replacement_pumper_id || r.replacementpumperid || r.replacementPumperId || null,
-                initialPumperCash: Number(r.initial_pumper_cash || r.initialpumpercash || r.initialPumperCash) || 0,
-                handoverMeter: Number(r.handover_meter !== undefined ? r.handover_meter : r.handovermeter !== undefined ? r.handovermeter : r.handoverMeter) || 0,
-                handoverNotes: r.handover_notes || r.handovernotes || r.handoverNotes || '',
-                startMeter: Number(r.start_meter !== undefined ? r.start_meter : r.startmeter !== undefined ? r.startmeter : r.startMeter) || 0,
-                endMeter: Number(r.end_meter !== undefined ? r.end_meter : r.endmeter !== undefined ? r.endmeter : r.endMeter) || 0,
-                testingQty: Number(r.testing_qty !== undefined ? r.testing_qty : r.testingqty !== undefined ? r.testingqty : r.testingQty) || 0,
-                status: r.status || 'Idle',
-                isLocked: r.is_locked !== undefined ? r.is_locked : r.islocked !== undefined ? r.islocked : r.isLocked,
-                unitPrice: Number(r.unit_price || r.unitprice || r.unitPrice) || 0,
-                actualCash: Number(r.actual_cash ?? r.actualcash ?? r.actualCash) || 0,
-                cashVariance: Number(r.cash_variance ?? r.cashvariance ?? r.cashVariance) || 0,
-                creditSalesAmount: Number(r.credit_sales_amount ?? r.creditsalesamount ?? r.creditSalesAmount) || 0,
-                cardSalesAmount: Number(r.card_sales_amount ?? r.cardsalesamount ?? r.cardSalesAmount) || 0,
-                touchCardSalesAmount: Number(r.touch_card_sales_amount ?? r.touchcardsalesamount ?? r.touchCardSalesAmount) || 0,
-                voucherSalesAmount: Number(r.voucher_sales_amount ?? r.vouchersalesamount ?? r.voucherSalesAmount) || 0,
-                oilSalesAmount: Number(r.oil_sales_amount ?? r.oilsalesamount ?? r.oilSalesAmount) || 0
-              }))
+              pumpReadings: sortedReadings
             };
           });
 
@@ -739,6 +795,36 @@ export default function App() {
               createdAt: c.created_at || new Date().toISOString()
             }));
             setCustomers(mappedCustomers);
+          }
+        } catch (_) {}
+
+        // Fetch LP Gas stock & persisted prices from Supabase
+        try {
+          const { data: gasData } = await supabase.from('gas_inventory').select('*');
+          if (gasData && gasData.length > 0) {
+            const mappedGas: LPGasItem[] = [
+              { id: 'gas-12.5kg', size: '12.5 kg', full_count: 0, empty_count: 0, selling_price: 3690, last_updated: new Date().toISOString() },
+              { id: 'gas-37.5kg', size: '37.5 kg', full_count: 0, empty_count: 0, selling_price: 11200, last_updated: new Date().toISOString() },
+              { id: 'gas-5.0kg', size: '5.0 kg', full_count: 0, empty_count: 0, selling_price: 1482, last_updated: new Date().toISOString() },
+              { id: 'gas-2.3kg', size: '2.3 kg', full_count: 0, empty_count: 0, selling_price: 694, last_updated: new Date().toISOString() }
+            ].map(defItem => {
+              const match = gasData.find((g: any) => g.id === defItem.id || g.size === defItem.size);
+              if (match) {
+                const price = Number(match.selling_price || match.unit_price || match.price) || defItem.selling_price;
+                return {
+                  ...defItem,
+                  ...match,
+                  full_count: Number(match.full_count) || 0,
+                  empty_count: Number(match.empty_count) || 0,
+                  selling_price: price,
+                  unit_price: price
+                };
+              }
+              return defItem;
+            });
+            setGasStock(mappedGas);
+            localStorage.setItem('fuel_flow_gas_stock', JSON.stringify(mappedGas));
+            localStorage.setItem('fuel_flow_gas_inventory', JSON.stringify(mappedGas));
           }
         } catch (_) {}
 
@@ -888,6 +974,41 @@ export default function App() {
                     ? realtimeDeposits[s.id]
                     : Number(s.cash_banked ?? s.cashbanked ?? s.cashBanked) || 0;
 
+                  const mappedReadings = (s.pumpReadings || []).map((r: any) => ({
+                    id: r.id,
+                    pumpId: r.pump_id || r.pumpid || r.pumpId,
+                    pumpName: r.pump_name || r.pumpname || r.pumpName,
+                    fuelType: r.fuel_type || r.fueltype || r.fuelType,
+                    tankId: r.tank_id || r.tankid || r.tankId || (r.fueltype === 'Petrol 92' ? 'tank-petrol92' : r.fueltype === 'Petrol 95' ? 'tank-petrol95' : r.fueltype === 'Auto Diesel' ? 'tank-autodiesel' : 'tank-superdiesel'),
+                    assignedPumperId: r.assigned_pumper_id || r.assignedpumperid || r.assignedPumperId || null,
+                    replacementPumperId: r.replacement_pumper_id || r.replacementpumperid || r.replacementPumperId || null,
+                    initialPumperCash: Number(r.initial_pumper_cash || r.initialpumpercash || r.initialPumperCash) || 0,
+                    replacementPumperCash: Number(r.replacement_pumper_cash || r.replacementpumpercash || r.replacementPumperCash) || 0,
+                    handoverMeter: Number(r.handover_meter !== undefined ? r.handover_meter : r.handovermeter !== undefined ? r.handovermeter : r.handoverMeter) || 0,
+                    handoverNotes: r.handover_notes || r.handovernotes || r.handoverNotes || '',
+                    startMeter: Number(r.start_meter !== undefined ? r.start_meter : r.startmeter !== undefined ? r.startmeter : r.startMeter) || 0,
+                    endMeter: Number(r.end_meter !== undefined ? r.end_meter : r.endmeter !== undefined ? r.endmeter : r.endMeter) || 0,
+                    testingQty: Number(r.testing_qty !== undefined ? r.testing_qty : r.testingqty !== undefined ? r.testingqty : r.testingQty) || 0,
+                    status: r.status || 'Idle',
+                    isLocked: r.is_locked !== undefined ? r.is_locked : r.islocked !== undefined ? r.islocked : r.isLocked,
+                    isStartSaved: r.is_start_saved !== undefined ? r.is_start_saved : r.isstartsaved !== undefined ? r.isstartsaved : (r.is_locked || (Number(r.start_meter || r.startmeter || 0) > 0)),
+                    isCardFinalized: r.is_card_finalized !== undefined ? r.is_card_finalized : r.iscardfinalized !== undefined ? r.iscardfinalized : (r.status === 'Completed'),
+                    unitPrice: Number(r.unit_price || r.unitprice || r.unitPrice) || 0,
+                    actualCash: Number(r.actual_cash ?? r.actualcash ?? r.actualCash) || 0,
+                    cashVariance: Number(r.cash_variance ?? r.cashvariance ?? r.cashVariance) || 0,
+                    creditSalesAmount: Number(r.credit_sales_amount ?? r.creditsalesamount ?? r.creditSalesAmount) || 0,
+                    cardSalesAmount: Number(r.card_sales_amount ?? r.cardsalesamount ?? r.cardSalesAmount) || 0,
+                    touchCardSalesAmount: Number(r.touch_card_sales_amount ?? r.touchcardsalesamount ?? r.touchCardSalesAmount) || 0,
+                    voucherSalesAmount: Number(r.voucher_sales_amount ?? r.vouchersalesamount ?? r.voucherSalesAmount) || 0,
+                    oilSalesAmount: Number(r.oil_sales_amount ?? r.oilsalesamount ?? r.oilSalesAmount) || 0
+                  }));
+
+                  const sortedReadings = mappedReadings.sort((a, b) => {
+                    const nameComp = (a.pumpName || a.pumpId || '').localeCompare(b.pumpName || b.pumpId || '', undefined, { numeric: true, sensitivity: 'base' });
+                    if (nameComp !== 0) return nameComp;
+                    return (a.startMeter || 0) - (b.startMeter || 0);
+                  });
+
                   return {
                     id: s.id,
                     name: s.name,
@@ -906,30 +1027,7 @@ export default function App() {
                     cash_banked: bankedAmount,
                     handoverNotes: s.handovernotes || '',
                     replacementPumperId: s.replacementpumperid || '',
-                    pumpReadings: (s.pumpReadings || []).map((r: any) => ({
-                      pumpId: r.pump_id || r.pumpid || r.pumpId,
-                      pumpName: r.pump_name || r.pumpname || r.pumpName,
-                      fuelType: r.fuel_type || r.fueltype || r.fuelType,
-                      tankId: r.tank_id || r.tankid || r.tankId || (r.fueltype === 'Petrol 92' ? 'tank-petrol92' : r.fueltype === 'Petrol 95' ? 'tank-petrol95' : r.fueltype === 'Auto Diesel' ? 'tank-autodiesel' : 'tank-superdiesel'),
-                      assignedPumperId: r.assigned_pumper_id || r.assignedpumperid || r.assignedPumperId || null,
-                      replacementPumperId: r.replacement_pumper_id || r.replacementpumperid || r.replacementPumperId || null,
-                      initialPumperCash: Number(r.initial_pumper_cash || r.initialpumpercash || r.initialPumperCash) || 0,
-                      handoverMeter: Number(r.handover_meter !== undefined ? r.handover_meter : r.handovermeter !== undefined ? r.handovermeter : r.handoverMeter) || 0,
-                      handoverNotes: r.handover_notes || r.handovernotes || r.handoverNotes || '',
-                      startMeter: Number(r.start_meter !== undefined ? r.start_meter : r.startmeter !== undefined ? r.startmeter : r.startMeter) || 0,
-                      endMeter: Number(r.end_meter !== undefined ? r.end_meter : r.endmeter !== undefined ? r.endmeter : r.endMeter) || 0,
-                      testingQty: Number(r.testing_qty !== undefined ? r.testing_qty : r.testingqty !== undefined ? r.testingqty : r.testingQty) || 0,
-                      status: r.status || 'Idle',
-                      isLocked: r.is_locked !== undefined ? r.is_locked : r.islocked !== undefined ? r.islocked : r.isLocked,
-                      unitPrice: Number(r.unit_price || r.unitprice || r.unitPrice) || 0,
-                      actualCash: Number(r.actual_cash ?? r.actualcash ?? r.actualCash) || 0,
-                      cashVariance: Number(r.cash_variance ?? r.cashvariance ?? r.cashVariance) || 0,
-                      creditSalesAmount: Number(r.credit_sales_amount ?? r.creditsalesamount ?? r.creditSalesAmount) || 0,
-                      cardSalesAmount: Number(r.card_sales_amount ?? r.cardsalesamount ?? r.cardSalesAmount) || 0,
-                      touchCardSalesAmount: Number(r.touch_card_sales_amount ?? r.touchcardsalesamount ?? r.touchCardSalesAmount) || 0,
-                      voucherSalesAmount: Number(r.voucher_sales_amount ?? r.vouchersalesamount ?? r.voucherSalesAmount) || 0,
-                      oilSalesAmount: Number(r.oil_sales_amount ?? r.oilsalesamount ?? r.oilSalesAmount) || 0
-                    }))
+                    pumpReadings: sortedReadings
                   };
                 });
 

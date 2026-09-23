@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { FuelTank, FuelType, PriceSchedule, AuthUser } from '../types';
-import { Calendar, Trash2, Clock, Tag, Edit2, Save, X } from 'lucide-react';
-import { supabase } from '../lib/supabase';
+import { Calendar, Trash2, Clock, Tag, Edit2, Save, X, CheckCircle2 } from 'lucide-react';
+import { supabase, getTanksTableName } from '../lib/supabase';
 import { isAdmin } from '../lib/auth';
 
 interface PriceManagementTabProps {
@@ -16,12 +16,18 @@ interface PriceManagementTabProps {
 export default function PriceManagementTab({ tanks, setTanks, priceSchedules, setPriceSchedules, user, userRole }: PriceManagementTabProps) {
   const [editingTankId, setEditingTankId] = useState<string | null>(null);
   const [tempPrice, setTempPrice] = useState<number>(0);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), 3500);
+  };
 
   const [schedFuelType, setSchedFuelType] = useState<FuelType>('Petrol 92');
   const [schedPrice, setSchedPrice] = useState<number>(0);
   const [schedDate, setSchedDate] = useState<string>('');
 
-  const handleAddSchedule = (e: React.FormEvent) => {
+  const handleAddSchedule = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!schedDate || schedPrice <= 0) return;
 
@@ -34,8 +40,22 @@ export default function PriceManagementTab({ tanks, setTanks, priceSchedules, se
     };
 
     setPriceSchedules(prev => [...prev, newSchedule]);
+    
+    try {
+      await supabase.from('price_schedules').insert([{
+        id: newSchedule.id,
+        fueltype: newSchedule.fuelType,
+        newprice: newSchedule.newPrice,
+        effectivedate: newSchedule.effectiveDate,
+        status: newSchedule.status
+      }]);
+    } catch (err) {
+      console.warn("Supabase price schedule insert warning:", err);
+    }
+
     setSchedPrice(0);
     setSchedDate('');
+    showToast(`Price schedule logged for ${newSchedule.fuelType} effective ${new Date(schedDate).toLocaleString()}.`);
   };
 
   const handleCancelSchedule = async (id: string) => {
@@ -54,15 +74,15 @@ export default function PriceManagementTab({ tanks, setTanks, priceSchedules, se
     try {
       localStorage.setItem('fms_priceSchedules', JSON.stringify(updated));
     } catch (_) {}
+    showToast("Pending price schedule cancelled.");
   };
-
 
   const handleStartEdit = (tank: FuelTank) => {
     setEditingTankId(tank.id);
     setTempPrice(tank.pricePerLiter);
   };
 
-  const handleSaveEdit = (tankId: string) => {
+  const handleSaveEdit = async (tankId: string) => {
     if (tempPrice <= 0) return;
     const updated = tanks.map(t => {
       if (t.id === tankId) {
@@ -75,6 +95,75 @@ export default function PriceManagementTab({ tanks, setTanks, priceSchedules, se
     });
     setTanks(updated);
     setEditingTankId(null);
+
+    // Save to localStorage immediately
+    try {
+      localStorage.setItem('fms_tanks', JSON.stringify(updated));
+      const priceMap: { [fuelType: string]: number } = {};
+      updated.forEach(t => {
+        if (t.fuelType) priceMap[t.fuelType] = t.pricePerLiter;
+      });
+      localStorage.setItem('fuel_flow_fuel_prices', JSON.stringify(priceMap));
+    } catch (_) {}
+
+    const targetTank = updated.find(t => t.id === tankId);
+    if (targetTank) {
+      let sbSuccess = false;
+      let lastErrMsg = '';
+
+      // 1. Direct update to fuel_tanks / fuel_tank
+      try {
+        const tableName = getTanksTableName();
+        const { error: err1 } = await supabase.from(tableName).update({ priceperliter: tempPrice, price_per_liter: tempPrice }).eq('id', tankId);
+        if (err1) {
+          const { error: err2 } = await supabase.from(tableName).update({ priceperliter: tempPrice }).eq('id', tankId);
+          if (err2) {
+            const { error: err3 } = await supabase.from(tableName).update({ price_per_liter: tempPrice }).eq('id', tankId);
+            if (!err3) sbSuccess = true;
+            else lastErrMsg = err3.message || String(err3);
+          } else {
+            sbSuccess = true;
+          }
+        } else {
+          sbSuccess = true;
+        }
+      } catch (err: any) {
+        lastErrMsg = err?.message || String(err);
+        console.warn("Supabase update price error:", err);
+      }
+
+      // 2. Direct update to underground_tanks table if exists
+      try {
+        await supabase.from('underground_tanks').update({ price_per_liter: tempPrice, priceperliter: tempPrice }).eq('id', tankId);
+      } catch (_) {}
+
+      // 3. Direct upsert to fuel_prices table if exists
+      try {
+        await supabase.from('fuel_prices').upsert([
+          { id: tankId, fuel_type: targetTank.fuelType, price: tempPrice, price_per_liter: tempPrice, updated_at: new Date().toISOString() },
+          { id: targetTank.fuelType, fuel_type: targetTank.fuelType, price: tempPrice, price_per_liter: tempPrice, updated_at: new Date().toISOString() }
+        ]);
+      } catch (_) {}
+
+      // 4. Direct update to products table if exists
+      try {
+        await supabase.from('products').update({ price: tempPrice, selling_price: tempPrice, unit_price: tempPrice }).eq('name', targetTank.fuelType);
+      } catch (_) {}
+
+      // 5. Broadcast global events for instant app-wide synchronization
+      window.dispatchEvent(new CustomEvent('fuel-prices-updated', {
+        detail: { updatedTanks: updated, fuelType: targetTank.fuelType, newPrice: tempPrice, tankId }
+      }));
+      window.dispatchEvent(new CustomEvent('tanks-updated', {
+        detail: { tanks: updated }
+      }));
+
+      if (sbSuccess || !lastErrMsg) {
+        showToast(`✓ Retail price for ${targetTank.name} (${targetTank.fuelType}) saved & synced to Rs. ${tempPrice.toFixed(2)}.`);
+      } else {
+        showToast(`Price updated locally. Database sync notice: ${lastErrMsg}`);
+      }
+    }
   };
 
     const handleCancelEdit = () => {
@@ -312,6 +401,13 @@ export default function PriceManagementTab({ tanks, setTanks, priceSchedules, se
           </table>
         </div>
       </div>
+
+      {toastMessage && (
+        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-2 bg-[#1C1C1C] text-white px-4 py-3 rounded-xl shadow-2xl border border-white/10 text-xs font-semibold animate-fade-in">
+          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+          <span>{toastMessage}</span>
+        </div>
+      )}
     </div>
   );
 }

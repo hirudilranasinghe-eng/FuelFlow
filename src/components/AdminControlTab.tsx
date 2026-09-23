@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { 
   ShieldCheck, Fuel, Users, Sliders, Plus, Trash2, 
   CheckCircle2, AlertTriangle, Database, Copy, Check,
@@ -512,15 +512,73 @@ export default function AdminControlTab({
     setTanks(updatedTanks);
     setEditingTankPriceId(null);
 
+    // Immediately persist to localStorage
+    try {
+      localStorage.setItem('fms_tanks', JSON.stringify(updatedTanks));
+      const priceMap: { [fuelType: string]: number } = {};
+      updatedTanks.forEach(t => {
+        if (t.fuelType) priceMap[t.fuelType] = t.pricePerLiter;
+      });
+      localStorage.setItem('fuel_flow_fuel_prices', JSON.stringify(priceMap));
+    } catch (_) {}
+
     const targetTank = updatedTanks.find(t => t.id === tankId);
     if (targetTank) {
+      let sbSuccess = false;
+      let lastErrMsg = '';
+
+      // 1. Direct update to fuel_tanks / fuel_tank
       try {
         const tableName = getTanksTableName();
-        await supabase.from(tableName).update({ priceperliter: tempPriceVal }).eq('id', tankId);
-      } catch (err) {
-        console.warn("Supabase update price error:", err);
+        const { error: err1 } = await supabase.from(tableName).update({ priceperliter: tempPriceVal, price_per_liter: tempPriceVal }).eq('id', tankId);
+        if (err1) {
+          const { error: err2 } = await supabase.from(tableName).update({ priceperliter: tempPriceVal }).eq('id', tankId);
+          if (err2) {
+            const { error: err3 } = await supabase.from(tableName).update({ price_per_liter: tempPriceVal }).eq('id', tankId);
+            if (!err3) sbSuccess = true;
+            else lastErrMsg = err3.message || String(err3);
+          } else {
+            sbSuccess = true;
+          }
+        } else {
+          sbSuccess = true;
+        }
+      } catch (err: any) {
+        lastErrMsg = err?.message || String(err);
+        console.warn("Supabase update fuel_tanks price notice:", err);
       }
-      showToast(`Retail price for ${targetTank.name} updated to Rs. ${tempPriceVal.toFixed(2)}.`);
+
+      // 2. Direct update to underground_tanks table if exists
+      try {
+        await supabase.from('underground_tanks').update({ price_per_liter: tempPriceVal, priceperliter: tempPriceVal }).eq('id', tankId);
+      } catch (_) {}
+
+      // 3. Direct upsert to fuel_prices table if exists
+      try {
+        await supabase.from('fuel_prices').upsert([
+          { id: tankId, fuel_type: targetTank.fuelType, price: tempPriceVal, price_per_liter: tempPriceVal, updated_at: new Date().toISOString() },
+          { id: targetTank.fuelType, fuel_type: targetTank.fuelType, price: tempPriceVal, price_per_liter: tempPriceVal, updated_at: new Date().toISOString() }
+        ]);
+      } catch (_) {}
+
+      // 4. Direct update to products table if exists
+      try {
+        await supabase.from('products').update({ price: tempPriceVal, selling_price: tempPriceVal, unit_price: tempPriceVal }).eq('name', targetTank.fuelType);
+      } catch (_) {}
+
+      // 5. Broadcast global events for instant app-wide synchronization
+      window.dispatchEvent(new CustomEvent('fuel-prices-updated', {
+        detail: { updatedTanks, fuelType: targetTank.fuelType, newPrice: tempPriceVal, tankId }
+      }));
+      window.dispatchEvent(new CustomEvent('tanks-updated', {
+        detail: { tanks: updatedTanks }
+      }));
+
+      if (sbSuccess || !lastErrMsg) {
+        showToast(`✓ Retail price for ${targetTank.name} (${targetTank.fuelType}) saved & synced to Rs. ${tempPriceVal.toFixed(2)}.`);
+      } else {
+        showToast(`Price updated locally. Database sync warning: ${lastErrMsg}`);
+      }
     }
   };
 
@@ -607,6 +665,46 @@ export default function AdminControlTab({
     };
   });
 
+  // Sync latest gas prices from Supabase on mount/focus
+  useEffect(() => {
+    const fetchLatestGasPrices = async () => {
+      try {
+        const { data, error } = await supabase.from('gas_inventory').select('*');
+        if (!error && data && data.length > 0) {
+          const pMap: { [key: string]: number } = { ...gasPrices };
+          data.forEach((row: any) => {
+            const price = Number(row.selling_price || row.unit_price || row.price) || 0;
+            if (price > 0) {
+              if (row.id === 'gas-12.5kg' || row.size?.includes('12.5')) pMap['12.5kg'] = price;
+              if (row.id === 'gas-5.0kg' || row.id === 'gas-5kg' || row.size?.includes('5.0') || row.size === '5kg') pMap['5kg'] = price;
+              if (row.id === 'gas-2.3kg' || row.size?.includes('2.3')) pMap['2.3kg'] = price;
+            }
+          });
+          setGasPrices(prev => ({ ...prev, ...pMap }));
+          try {
+            localStorage.setItem('fuel_flow_gas_prices', JSON.stringify(pMap));
+          } catch (_) {}
+        }
+      } catch (_) {}
+    };
+
+    fetchLatestGasPrices();
+
+    const handleGasPricesUpdated = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      if (customEvent.detail?.updatedPrices) {
+        setGasPrices(prev => ({ ...prev, ...customEvent.detail.updatedPrices }));
+      }
+    };
+
+    window.addEventListener('gas-prices-updated', handleGasPricesUpdated);
+    window.addEventListener('focus', fetchLatestGasPrices);
+    return () => {
+      window.removeEventListener('gas-prices-updated', handleGasPricesUpdated);
+      window.removeEventListener('focus', fetchLatestGasPrices);
+    };
+  }, []);
+
   const [isUpdatingGasPrices, setIsUpdatingGasPrices] = useState(false);
 
   const handleUpdateGasPrices = async (e: React.FormEvent) => {
@@ -629,10 +727,10 @@ export default function AdminControlTab({
 
       if (!Array.isArray(currentGasList) || currentGasList.length === 0) {
         currentGasList = [
-          { id: 'gas-12.5kg', size: '12.5 kg', full_count: 0, empty_count: 0, selling_price: gasPrices['12.5kg'], last_updated: new Date().toISOString() },
-          { id: 'gas-37.5kg', size: '37.5 kg', full_count: 0, empty_count: 0, selling_price: 11200, last_updated: new Date().toISOString() },
-          { id: 'gas-5.0kg', size: '5.0 kg', full_count: 0, empty_count: 0, selling_price: gasPrices['5kg'], last_updated: new Date().toISOString() },
-          { id: 'gas-2.3kg', size: '2.3 kg', full_count: 0, empty_count: 0, selling_price: gasPrices['2.3kg'], last_updated: new Date().toISOString() }
+          { id: 'gas-12.5kg', size: '12.5 kg', full_count: 0, empty_count: 0, selling_price: gasPrices['12.5kg'], unit_price: gasPrices['12.5kg'], last_updated: new Date().toISOString() },
+          { id: 'gas-37.5kg', size: '37.5 kg', full_count: 0, empty_count: 0, selling_price: 11200, unit_price: 11200, last_updated: new Date().toISOString() },
+          { id: 'gas-5.0kg', size: '5.0 kg', full_count: 0, empty_count: 0, selling_price: gasPrices['5kg'], unit_price: gasPrices['5kg'], last_updated: new Date().toISOString() },
+          { id: 'gas-2.3kg', size: '2.3 kg', full_count: 0, empty_count: 0, selling_price: gasPrices['2.3kg'], unit_price: gasPrices['2.3kg'], last_updated: new Date().toISOString() }
         ];
       } else {
         currentGasList = currentGasList.map(item => {
@@ -661,22 +759,60 @@ export default function AdminControlTab({
         detail: { updatedInventory: currentGasList }
       }));
 
-      // 4. Update Supabase gas_inventory table
+      // 4. Update Supabase gas_inventory table with fallback strategy
+      let sbGasSuccess = false;
+      let sbGasErrorMsg = '';
       try {
         const upsertPayload = [
-          { id: 'gas-12.5kg', size: '12.5 kg', selling_price: gasPrices['12.5kg'], last_updated: new Date().toISOString() },
-          { id: 'gas-5.0kg', size: '5.0 kg', selling_price: gasPrices['5kg'], last_updated: new Date().toISOString() },
-          { id: 'gas-2.3kg', size: '2.3 kg', selling_price: gasPrices['2.3kg'], last_updated: new Date().toISOString() }
+          { id: 'gas-12.5kg', size: '12.5 kg', selling_price: gasPrices['12.5kg'], unit_price: gasPrices['12.5kg'], last_updated: new Date().toISOString() },
+          { id: 'gas-5.0kg', size: '5.0 kg', selling_price: gasPrices['5kg'], unit_price: gasPrices['5kg'], last_updated: new Date().toISOString() },
+          { id: 'gas-2.3kg', size: '2.3 kg', selling_price: gasPrices['2.3kg'], unit_price: gasPrices['2.3kg'], last_updated: new Date().toISOString() }
         ];
-        await supabase.from('gas_inventory').upsert(upsertPayload);
-      } catch (sbErr) {
+        const { error: upsertErr } = await supabase.from('gas_inventory').upsert(upsertPayload);
+        if (upsertErr) {
+          // Retry with selling_price only
+          const fbPayload = [
+            { id: 'gas-12.5kg', size: '12.5 kg', selling_price: gasPrices['12.5kg'] },
+            { id: 'gas-5.0kg', size: '5.0 kg', selling_price: gasPrices['5kg'] },
+            { id: 'gas-2.3kg', size: '2.3 kg', selling_price: gasPrices['2.3kg'] }
+          ];
+          const { error: fbErr } = await supabase.from('gas_inventory').upsert(fbPayload);
+          if (fbErr) {
+            // Retry with unit_price only
+            const unitPayload = [
+              { id: 'gas-12.5kg', size: '12.5 kg', unit_price: gasPrices['12.5kg'] },
+              { id: 'gas-5.0kg', size: '5.0 kg', unit_price: gasPrices['5kg'] },
+              { id: 'gas-2.3kg', size: '2.3 kg', unit_price: gasPrices['2.3kg'] }
+            ];
+            const { error: unitErr } = await supabase.from('gas_inventory').upsert(unitPayload);
+            if (!unitErr) sbGasSuccess = true;
+            else sbGasErrorMsg = unitErr.message || String(unitErr);
+          } else {
+            sbGasSuccess = true;
+          }
+        } else {
+          sbGasSuccess = true;
+        }
+      } catch (sbErr: any) {
+        sbGasErrorMsg = sbErr?.message || String(sbErr);
         console.warn('Supabase gas_inventory price sync notice:', sbErr);
       }
 
-      showToast('✓ LP Gas Cylinder Selling Prices Updated Successfully!');
-    } catch (err) {
+      // 5. Update products / lp_gas_inventory if present
+      try {
+        await supabase.from('products').update({ price: gasPrices['12.5kg'], selling_price: gasPrices['12.5kg'] }).ilike('name', '%12.5%');
+        await supabase.from('products').update({ price: gasPrices['5kg'], selling_price: gasPrices['5kg'] }).ilike('name', '%5.0%');
+        await supabase.from('products').update({ price: gasPrices['2.3kg'], selling_price: gasPrices['2.3kg'] }).ilike('name', '%2.3%');
+      } catch (_) {}
+
+      if (sbGasSuccess || !sbGasErrorMsg) {
+        showToast('✓ LP Gas Cylinder Selling Prices Updated & Synced Successfully!');
+      } else {
+        showToast(`LP Gas prices updated locally. Database sync warning: ${sbGasErrorMsg}`);
+      }
+    } catch (err: any) {
       console.error('Error updating gas prices:', err);
-      showToast('Error updating LP gas prices');
+      showToast(`Error updating LP gas prices: ${err?.message || 'Unknown error'}`);
     } finally {
       setIsUpdatingGasPrices(false);
     }
