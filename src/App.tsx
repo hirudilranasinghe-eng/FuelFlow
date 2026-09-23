@@ -2,7 +2,7 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { Info, AlertCircle, Database, ShieldCheck, LogOut, Building2, Calendar } from 'lucide-react';
 
@@ -409,11 +409,9 @@ export default function App() {
     }
   };
 
-  // Initialize data on component mount
-  useEffect(() => {
+  // Comprehensive database fetch handler with direct Supabase source of truth
+  const fetchAllData = useCallback(async () => {
     const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
-
-    const fetchAllData = async () => {
 
       const loadLocalStorageFallback = () => {
         try {
@@ -830,7 +828,7 @@ export default function App() {
 
         setTimeout(() => {
           isInitialLoad.current = false;
-        }, 1000);
+        }, 500);
       } catch (err: any) {
         if (err.message === 'tables_missing') {
           setDbError('Supabase tables do not exist. Please go to your Supabase Dashboard SQL Editor, paste and run the contents of `supabase_schema.sql` to initialize your database tables.');
@@ -846,224 +844,134 @@ export default function App() {
         }
         setTimeout(() => {
           isInitialLoad.current = false;
-        }, 1000);
+        }, 500);
+      }
+  }, []);
+
+  // Automatic Database Re-fetching on Mount, User login, Tab Focus, Visibility Change, and Online event
+  useEffect(() => {
+    fetchAllData();
+
+    const handleWindowFocus = () => {
+      fetchAllData();
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        fetchAllData();
       }
     };
 
-    fetchAllData();
+    const handleOnline = () => {
+      fetchAllData();
+    };
 
-    // Set up Real-time Supabase subscription for underground fuel tanks and bulk lubricants
-    let realtimeChannel: any = null;
-    let bulkOilChannel: any = null;
-    let shiftsChannel: any = null;
+    const handleAppRefresh = () => {
+      fetchAllData();
+    };
 
-    if (isConfigured) {
-      try {
-        const targetTable = getTanksTableName();
-        realtimeChannel = supabase
-          .channel(`fuel_tanks_realtime_${Date.now()}`)
-          .on(
-            'postgres_changes',
-            { event: '*', schema: 'public', table: targetTable },
-            (payload) => {
-              if (payload.eventType === 'INSERT') {
-                const row = payload.new;
-                const insertedTank: FuelTank = {
-                  id: row.id,
-                  name: row.name,
-                  fuelType: row.fueltype || row.fuel_type || 'Petrol 92',
-                  capacity: Number(row.capacity) || 0,
-                  currentLevel: Number(row.current_volume ?? row.current_stock ?? row.currentlevel ?? row.current_level) || 0,
-                  pricePerLiter: Number(row.priceperliter ?? row.price_per_liter) || 0,
-                };
-                setTanks((prev) => {
-                  if (prev.some((t) => t.id === insertedTank.id)) {
-                    return prev.map((t) => (t.id === insertedTank.id ? insertedTank : t));
-                  }
-                  return sortTanksNaturally([...prev, insertedTank]);
-                });
-              } else if (payload.eventType === 'UPDATE') {
-                const row = payload.new;
-                const updatedTank: FuelTank = {
-                  id: row.id,
-                  name: row.name,
-                  fuelType: row.fueltype || row.fuel_type || 'Petrol 92',
-                  capacity: Number(row.capacity) || 0,
-                  currentLevel: Number(row.current_volume ?? row.current_stock ?? row.currentlevel ?? row.current_level) || 0,
-                  pricePerLiter: Number(row.priceperliter ?? row.price_per_liter) || 0,
-                };
-                setTanks((prev) =>
-                  sortTanksNaturally(prev.map((t) => (t.id === updatedTank.id ? updatedTank : t)))
-                );
-              } else if (payload.eventType === 'DELETE') {
-                if (payload.old?.id) {
-                  setTanks((prev) => prev.filter((t) => t.id !== payload.old.id));
-                }
-              }
-            }
-          )
-          .subscribe();
+    window.addEventListener('focus', handleWindowFocus);
+    window.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('refresh-app-data', handleAppRefresh);
 
-        bulkOilChannel = supabase
-          .channel(`bulk_lubricants_app_realtime_${Date.now()}`)
-          .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'bulk_lubricants' }, (payload: any) => {
-            if (payload?.old?.id) {
-              setOilTanks(prev => prev.filter(t => t.id !== payload.old.id));
-            }
-          })
-          .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'oil_tanks' }, (payload: any) => {
-            if (payload?.old?.id) {
-              setOilTanks(prev => prev.filter(t => t.id !== payload.old.id));
-            }
-          })
-          .on('postgres_changes', { event: '*', schema: 'public', table: 'bulk_lubricants' }, async (payload: any) => {
-            if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
-              const row = payload.new;
-              if (row && row.id) {
-                const isChamber = row.type === 'chamber' || row.name?.toLowerCase().includes('chamber');
-                const tank: OilTank = {
-                  id: row.id,
-                  name: row.name || 'Bulk Oil Unit',
-                  grade: row.grade || row.oil_grade || '',
-                  capacity: Number(row.capacity) || (isChamber ? 100 : 210),
-                  currentLevel: Number(row.current_level ?? row.currentlevel ?? 0),
-                  pricePerLiter: Number(row.price_per_liter ?? row.priceperliter ?? 0),
-                  type: row.type || (isChamber ? 'chamber' : 'drum'),
-                  chamberNumber: row.chamber_number ?? row.chambernumber ?? undefined
-                };
-                setOilTanks(prev => {
-                  if (prev.some(t => t.id === tank.id)) {
-                    return prev.map(t => t.id === tank.id ? tank : t);
-                  }
-                  return [...prev, tank].sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id, undefined, { numeric: true, sensitivity: 'base' }));
-                });
-              }
-            }
-          })
-          .subscribe();
+    return () => {
+      window.removeEventListener('focus', handleWindowFocus);
+      window.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('refresh-app-data', handleAppRefresh);
+    };
+  }, [fetchAllData, user]);
 
-        // Shifts real-time channel
-        shiftsChannel = supabase
-          .channel(`shifts_app_realtime_${Date.now()}`)
-          .on('postgres_changes', { event: '*', schema: 'public', table: 'shifts' }, async () => {
-            try {
-              const { data: updatedShifts } = await supabase.from('shifts').select(`
-                *,
-                pumpReadings:pump_readings(*)
-              `).order('starttime', { ascending: false });
+  // Comprehensive Supabase Realtime Subscriptions across key tables
+  useEffect(() => {
+    const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
+    if (!isConfigured) return;
 
-              let realtimeDeposits: Record<string, number> = {};
-              try {
-                const { data: depositsData } = await supabase
-                  .from('shift_bank_deposits')
-                  .select('shift_id, deposited_amount');
-                if (depositsData && Array.isArray(depositsData)) {
-                  depositsData.forEach((d: any) => {
-                    const sId = d.shift_id || d.shiftId;
-                    const amt = Number(d.deposited_amount || d.depositedAmount || d.amount) || 0;
-                    if (sId) {
-                      realtimeDeposits[sId] = (realtimeDeposits[sId] || 0) + amt;
-                    }
-                  });
-                }
-              } catch (_) {}
+    let debounceTimer: any = null;
+    const debouncedFetch = () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        fetchAllData();
+      }, 250);
+    };
 
-              if (updatedShifts) {
-                const mappedShifts = updatedShifts.map(s => {
-                  const bankedAmount = realtimeDeposits[s.id] !== undefined
-                    ? realtimeDeposits[s.id]
-                    : Number(s.cash_banked ?? s.cashbanked ?? s.cashBanked) || 0;
+    let globalChannel: any = null;
 
-                  const mappedReadings = (s.pumpReadings || []).map((r: any) => ({
-                    id: r.id,
-                    pumpId: r.pump_id || r.pumpid || r.pumpId,
-                    pumpName: r.pump_name || r.pumpname || r.pumpName,
-                    fuelType: r.fuel_type || r.fueltype || r.fuelType,
-                    tankId: r.tank_id || r.tankid || r.tankId || (r.fueltype === 'Petrol 92' ? 'tank-petrol92' : r.fueltype === 'Petrol 95' ? 'tank-petrol95' : r.fueltype === 'Auto Diesel' ? 'tank-autodiesel' : 'tank-superdiesel'),
-                    assignedPumperId: r.assigned_pumper_id || r.assignedpumperid || r.assignedPumperId || null,
-                    replacementPumperId: r.replacement_pumper_id || r.replacementpumperid || r.replacementPumperId || null,
-                    initialPumperCash: Number(r.initial_pumper_cash || r.initialpumpercash || r.initialPumperCash) || 0,
-                    replacementPumperCash: Number(r.replacement_pumper_cash || r.replacementpumpercash || r.replacementPumperCash) || 0,
-                    handoverMeter: Number(r.handover_meter !== undefined ? r.handover_meter : r.handovermeter !== undefined ? r.handovermeter : r.handoverMeter) || 0,
-                    handoverNotes: r.handover_notes || r.handovernotes || r.handoverNotes || '',
-                    startMeter: Number(r.start_meter !== undefined ? r.start_meter : r.startmeter !== undefined ? r.startmeter : r.startMeter) || 0,
-                    endMeter: Number(r.end_meter !== undefined ? r.end_meter : r.endmeter !== undefined ? r.endmeter : r.endMeter) || 0,
-                    testingQty: Number(r.testing_qty !== undefined ? r.testing_qty : r.testingqty !== undefined ? r.testingqty : r.testingQty) || 0,
-                    status: r.status || 'Idle',
-                    isLocked: r.is_locked !== undefined ? r.is_locked : r.islocked !== undefined ? r.islocked : r.isLocked,
-                    isStartSaved: r.is_start_saved !== undefined ? r.is_start_saved : r.isstartsaved !== undefined ? r.isstartsaved : (r.is_locked || (Number(r.start_meter || r.startmeter || 0) > 0)),
-                    isCardFinalized: r.is_card_finalized !== undefined ? r.is_card_finalized : r.iscardfinalized !== undefined ? r.iscardfinalized : (r.status === 'Completed'),
-                    unitPrice: Number(r.unit_price || r.unitprice || r.unitPrice) || 0,
-                    actualCash: Number(r.actual_cash ?? r.actualcash ?? r.actualCash) || 0,
-                    cashVariance: Number(r.cash_variance ?? r.cashvariance ?? r.cashVariance) || 0,
-                    creditSalesAmount: Number(r.credit_sales_amount ?? r.creditsalesamount ?? r.creditSalesAmount) || 0,
-                    cardSalesAmount: Number(r.card_sales_amount ?? r.cardsalesamount ?? r.cardSalesAmount) || 0,
-                    touchCardSalesAmount: Number(r.touch_card_sales_amount ?? r.touchcardsalesamount ?? r.touchCardSalesAmount) || 0,
-                    voucherSalesAmount: Number(r.voucher_sales_amount ?? r.vouchersalesamount ?? r.voucherSalesAmount) || 0,
-                    oilSalesAmount: Number(r.oil_sales_amount ?? r.oilsalesamount ?? r.oilSalesAmount) || 0
-                  }));
-
-                  const sortedReadings = mappedReadings.sort((a, b) => {
-                    const nameComp = (a.pumpName || a.pumpId || '').localeCompare(b.pumpName || b.pumpId || '', undefined, { numeric: true, sensitivity: 'base' });
-                    if (nameComp !== 0) return nameComp;
-                    return (a.startMeter || 0) - (b.startMeter || 0);
-                  });
-
-                  return {
-                    id: s.id,
-                    name: s.name,
-                    supervisorId: s.supervisorid,
-                    startTime: s.starttime,
-                    endTime: s.endtime,
-                    isActive: s.isactive,
-                    totalFuelSold: Number(s.totalfuelsold) || 0,
-                    totalNetSold: Number(s.totalnetsold) || 0,
-                    totalNetSales: Number(s.totalnetsales) || 0,
-                    initialPumperCash: Number(s.initialpumpercash || s.initialPumperCash) || 0,
-                    replacementPumperCash: Number(s.replacementpumpercash || s.replacementPumperCash) || 0,
-                    totalPhysicalCash: Number(s.totalphysicalcash || s.totalPhysicalCash) || 0,
-                    cashVariance: s.cashvariance,
-                    cashBanked: bankedAmount,
-                    cash_banked: bankedAmount,
-                    handoverNotes: s.handovernotes || '',
-                    replacementPumperId: s.replacementpumperid || '',
-                    pumpReadings: sortedReadings
-                  };
-                });
-
-                const dbActive = mappedShifts.find(s => s.isActive);
-                const history = mappedShifts.filter(s => !s.isActive);
-
-                if (dbActive) {
-                  setActiveShift(dbActive as unknown as Shift);
-                } else {
-                  setActiveShift(null);
-                }
-
-                setShiftHistory(history as unknown as Shift[]);
-              }
-            } catch (err) {
-              console.warn("Realtime shifts sync notice:", err);
-            }
-          })
-          .subscribe();
-      } catch (err) {
-        console.warn("Realtime subscription setup notice:", err);
-      }
+    try {
+      const targetTable = getTanksTableName();
+      globalChannel = supabase
+        .channel(`fuelflow_app_cross_device_realtime_${Date.now()}`)
+        // 1. Fuel Tanks & Underground Tanks
+        .on('postgres_changes', { event: '*', schema: 'public', table: targetTable }, () => {
+          debouncedFetch();
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'underground_tanks' }, () => {
+          debouncedFetch();
+        })
+        // 2. Fuel Prices
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'fuel_prices' }, () => {
+          debouncedFetch();
+        })
+        // 3. Products
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'products' }, () => {
+          debouncedFetch();
+        })
+        // 4. Gas Inventory
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'gas_inventory' }, () => {
+          debouncedFetch();
+        })
+        // 5. Shifts, Readings & Deposits
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'shifts' }, () => {
+          debouncedFetch();
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'pump_readings' }, () => {
+          debouncedFetch();
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'shift_bank_deposits' }, () => {
+          debouncedFetch();
+        })
+        // 6. Employees
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'employees' }, () => {
+          debouncedFetch();
+        })
+        // 7. Pumps, Nozzles, Machines
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'nozzles' }, () => {
+          debouncedFetch();
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'pumps' }, () => {
+          debouncedFetch();
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'pump_machines' }, () => {
+          debouncedFetch();
+        })
+        // 8. Bulk Lubricants & Oils
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'bulk_lubricants' }, () => {
+          debouncedFetch();
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'oil_tanks' }, () => {
+          debouncedFetch();
+        })
+        // 9. Price Schedules
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'price_schedules' }, () => {
+          debouncedFetch();
+        })
+        // 10. Stock Deliveries
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'stock_deliveries' }, () => {
+          debouncedFetch();
+        })
+        .subscribe();
+    } catch (err) {
+      console.warn("Realtime subscription setup notice:", err);
     }
 
     return () => {
-      if (realtimeChannel) {
-        supabase.removeChannel(realtimeChannel);
-      }
-      if (bulkOilChannel) {
-        supabase.removeChannel(bulkOilChannel);
-      }
-      if (shiftsChannel) {
-        supabase.removeChannel(shiftsChannel);
+      if (debounceTimer) clearTimeout(debounceTimer);
+      if (globalChannel) {
+        supabase.removeChannel(globalChannel);
       }
     };
-  }, []);
+  }, [fetchAllData]);
 
 
   // Sync changes to Supabase and local storage upon state updates
