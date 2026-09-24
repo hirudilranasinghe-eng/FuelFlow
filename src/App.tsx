@@ -26,7 +26,7 @@ import CustomersTab from './components/CustomersTab';
 import EmployeesTab from './components/EmployeesTab';
 import AdminControlTab from './components/AdminControlTab';
 import PriceManagementTab from './components/PriceManagementTab';
-import LoginPage from './components/LoginPage';
+import LoginPage, { LoginModal } from './components/LoginPage';
 import { AuthUser, Employee, FuelTank, OilTank, Pump, PumpMachine, Shift, StockDelivery, PriceSchedule, Customer, CreditTransaction, CreditPayment, LPGasItem, resolveUserRole } from './types';
 import { supabase, getTanksTableName, setTanksTableName } from './lib/supabase';
 import { upsertPumpReadings, syncCreditAndCardSales, syncAllNonCashSales, updateNozzleMeterCarryover, saveOilTank, recordShiftBankDeposit, isPumpReadingActiveOrAssigned, saveShiftLogs } from './lib/supabaseClient';
@@ -36,13 +36,8 @@ export const defaultPumps: Pump[] = [];
 
 export default function App() {
   // Auth state & session guard
-  const [user, setUser] = useState<AuthUser | null>(() => {
-    try {
-      const stored = localStorage.getItem('fms_user');
-      if (stored) return JSON.parse(stored);
-    } catch (_) {}
-    return null;
-  });
+  const [isCheckingAuth, setIsCheckingAuth] = useState<boolean>(true);
+  const [user, setUser] = useState<AuthUser | null>(null);
 
   // Navigation active tab
   const [activeTab, setActiveTab] = useState<string>('dashboard');
@@ -64,14 +59,23 @@ export default function App() {
   const [isRlsActive, setIsRlsActive] = useState<boolean>(false);
   const isInitialLoad = useRef(true);
 
-  // Sync Supabase Auth session if configured
+  // Strict Supabase Auth session verification on initial load
   useEffect(() => {
+    let isMounted = true;
+    const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
+
     const checkSession = async () => {
-      const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
       if (isConfigured) {
         try {
-          const { data } = await supabase.auth.getSession();
-          if (data?.session?.user) {
+          const { data, error } = await supabase.auth.getSession();
+          if (error || !data?.session?.user) {
+            if (isMounted) {
+              setUser(null);
+              try {
+                localStorage.removeItem('fms_user');
+              } catch (_) {}
+            }
+          } else {
             const u = data.session.user;
             const userEmail = u.email || 'admin@fuelflow.lk';
             const { roleTitle } = resolveUserRole(userEmail, u.user_metadata?.role);
@@ -83,18 +87,44 @@ export default function App() {
               role: roleTitle,
               avatarColor: roleTitle === 'System Admin' ? 'bg-blue-600' : 'bg-purple-600',
             };
-            setUser(authUser);
-            localStorage.setItem('fms_user', JSON.stringify(authUser));
+            if (isMounted) {
+              setUser(authUser);
+              try {
+                localStorage.setItem('fms_user', JSON.stringify(authUser));
+              } catch (_) {}
+            }
           }
         } catch (err) {
           console.warn("Supabase auth session check notice:", err);
+          if (isMounted) {
+            setUser(null);
+            try {
+              localStorage.removeItem('fms_user');
+            } catch (_) {}
+          }
         }
+      } else {
+        try {
+          const stored = localStorage.getItem('fms_user');
+          if (stored && isMounted) {
+            setUser(JSON.parse(stored));
+          } else if (isMounted) {
+            setUser(null);
+          }
+        } catch (_) {
+          if (isMounted) setUser(null);
+        }
+      }
+
+      if (isMounted) {
+        setIsCheckingAuth(false);
       }
     };
 
     checkSession();
 
     const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!isMounted) return;
       if (session?.user) {
         const u = session.user;
         const userEmail = u.email || 'admin@fuelflow.lk';
@@ -108,11 +138,20 @@ export default function App() {
           avatarColor: roleTitle === 'System Admin' ? 'bg-blue-600' : 'bg-purple-600',
         };
         setUser(authUser);
-        localStorage.setItem('fms_user', JSON.stringify(authUser));
+        try {
+          localStorage.setItem('fms_user', JSON.stringify(authUser));
+        } catch (_) {}
+      } else {
+        setUser(null);
+        try {
+          localStorage.removeItem('fms_user');
+        } catch (_) {}
       }
+      setIsCheckingAuth(false);
     });
 
     return () => {
+      isMounted = false;
       authListener?.subscription?.unsubscribe();
     };
   }, []);
@@ -1527,6 +1566,25 @@ export default function App() {
     }
   };
 
+  // 1. Initial Session Verification Screen with minimal centered spinner
+  if (isCheckingAuth) {
+    return (
+      <div id="auth-loading-screen" className="min-h-screen w-full flex flex-col items-center justify-center bg-[#F4F7F6] text-slate-800 font-sans">
+        <div className="flex flex-col items-center gap-4 p-8 bg-white/90 backdrop-blur-md border border-slate-200/90 rounded-2xl shadow-xl max-w-sm w-full mx-4 text-center">
+          <div className="relative flex items-center justify-center">
+            <div className="w-12 h-12 border-3 border-emerald-500/20 border-t-emerald-600 rounded-full animate-spin" />
+            <div className="absolute w-3 h-3 bg-emerald-600 rounded-full animate-pulse" />
+          </div>
+          <div className="flex flex-col items-center gap-1">
+            <span className="text-sm font-extrabold text-slate-900 tracking-tight">Samse Auto Mart</span>
+            <span className="text-xs font-semibold text-slate-500">Verifying security session...</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // 2. Strict Unauthenticated Login Screen Guard
   if (!user) {
     return <LoginPage onLoginSuccess={handleLoginSuccess} />;
   }
