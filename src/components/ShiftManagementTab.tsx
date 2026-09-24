@@ -28,7 +28,7 @@ import {
   upsertPumpReadings,
   isPumpReadingActiveOrAssigned
 } from '../lib/supabaseClient';
-import { Employee, FuelTank, OilTank, Pump, PumpMachine, PumpReading, Shift, FuelType, ChamberReading, ShiftCounterSales, ShiftGasSale, ShiftLubeSale, PackagedOilItem } from '../types';
+import { Employee, FuelTank, OilTank, Pump, PumpMachine, PumpReading, Shift, FuelType, ChamberReading, ShiftCounterSales, ShiftGasSale, ShiftLubeSale, PackagedOilItem, ShiftBankDeposit } from '../types';
 import { deductPackagedStock, fetchPackagedLubricants } from '../lib/lubricantsClient';
 
 interface ShiftManagementTabProps {
@@ -43,6 +43,8 @@ interface ShiftManagementTabProps {
   activeShift: Shift | null;
   setActiveShift: React.Dispatch<React.SetStateAction<Shift | null>>;
   shiftHistory?: Shift[];
+  bankDeposits?: ShiftBankDeposit[];
+  onNavigateToDeposits?: () => void;
   onCloseShift: (closingShift: Shift) => void;
   onStartShift: (newShift: Omit<Shift, 'totalFuelSold' | 'totalNetSold' | 'totalNetSales'>) => void;
 }
@@ -84,6 +86,8 @@ export default function ShiftManagementTab({
   activeShift,
   setActiveShift,
   shiftHistory,
+  bankDeposits = [],
+  onNavigateToDeposits,
   onCloseShift,
   onStartShift,
 }: ShiftManagementTabProps) {
@@ -95,19 +99,6 @@ export default function ShiftManagementTab({
   const [isCloseConfirmOpen, setIsCloseConfirmOpen] = useState(false);
   const [isClosingShift, setIsClosingShift] = useState(false);
   const [isStartShiftOpen, setIsStartShiftOpen] = useState(false);
-  const [cashBankedInput, setCashBankedInput] = useState<string>('');
-  const [physicalCashHandedOverInput, setPhysicalCashHandedOverInput] = useState<string>('');
-  const [varianceAllocations, setVarianceAllocations] = useState<{
-    card: number;
-    credit: number;
-    touchCard: number;
-    voucher: number;
-  }>({
-    card: 0,
-    credit: 0,
-    touchCard: 0,
-    voucher: 0
-  });
   
   // New Shift Setup Form State
   const [newShiftTemplate, setNewShiftTemplate] = useState<'Morning' | 'Evening' | 'Night' | 'Custom'>('Morning');
@@ -2714,56 +2705,10 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
   };
 
   // Real-time computed values for Shift Closing Modal
-  const modalPhysicalCashVal = parseFloat(physicalCashHandedOverInput) || 0;
-  const totalAllocatedNonCash = (varianceAllocations.card || 0) + (varianceAllocations.credit || 0) + (varianceAllocations.touchCard || 0) + (varianceAllocations.voucher || 0);
-  const effectiveModalNonCashSales = (stats.totalNonCashSales || 0) + totalAllocatedNonCash;
+  const effectiveModalNonCashSales = stats.totalNonCashSales || 0;
   const effectiveModalGrossSales = stats.totalGrossSales || stats.totalNetSales || 0;
   const effectiveModalExpectedCash = Math.max(0, effectiveModalGrossSales - effectiveModalNonCashSales);
-
-  // Dynamic Shift Cash Variance: (Physical Cash Handed Over + Non-Cash Sales) - Total Gross Revenue
-  const modalCashVariance = (modalPhysicalCashVal + effectiveModalNonCashSales) - effectiveModalGrossSales;
-  const baseShortageAmount = Math.max(0, effectiveModalGrossSales - (modalPhysicalCashVal + (stats.totalNonCashSales || 0)));
-
-  const handleQuickAllocateAll = (category: 'card' | 'credit' | 'touchCard' | 'voucher') => {
-    const unallocated = Math.max(0, -modalCashVariance);
-    if (unallocated > 0) {
-      setVarianceAllocations(prev => ({
-        ...prev,
-        [category]: Number(((prev[category] || 0) + unallocated).toFixed(2))
-      }));
-    } else if (baseShortageAmount > 0) {
-      setVarianceAllocations({
-        card: category === 'card' ? baseShortageAmount : 0,
-        credit: category === 'credit' ? baseShortageAmount : 0,
-        touchCard: category === 'touchCard' ? baseShortageAmount : 0,
-        voucher: category === 'voucher' ? baseShortageAmount : 0,
-      });
-    }
-  };
-
-  const handleToggleCategory = (category: 'card' | 'credit' | 'touchCard' | 'voucher', isChecked: boolean) => {
-    if (!isChecked) {
-      setVarianceAllocations(prev => ({ ...prev, [category]: 0 }));
-    } else {
-      const remainingShortage = Math.max(0, effectiveModalGrossSales - (modalPhysicalCashVal + (stats.totalNonCashSales || 0) + (totalAllocatedNonCash - (varianceAllocations[category] || 0))));
-      setVarianceAllocations(prev => ({
-        ...prev,
-        [category]: remainingShortage > 0 ? Number(remainingShortage.toFixed(2)) : 0
-      }));
-    }
-  };
-
-  const handleCustomCategoryAmountChange = (category: 'card' | 'credit' | 'touchCard' | 'voucher', valStr: string) => {
-    const val = parseFloat(valStr) || 0;
-    setVarianceAllocations(prev => ({
-      ...prev,
-      [category]: Math.max(0, val)
-    }));
-  };
-
-  const handleResetAllocations = () => {
-    setVarianceAllocations({ card: 0, credit: 0, touchCard: 0, voucher: 0 });
-  };
+  const totalGasCylindersSold = (draftCounterSales.gasSales || []).reduce((s, g) => s + (g.quantity || 0), 0);
 
   // Perform validation check and open closing modal
   const handleEndShiftClick = () => {
@@ -2798,10 +2743,6 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
     } else {
       setValidationErrors([]);
       setShowValidationOverlay(false);
-      
-      const currentActualCash = stats.totalActualCash > 0 ? stats.totalActualCash : 0;
-      setPhysicalCashHandedOverInput(currentActualCash > 0 ? String(currentActualCash) : (stats.totalExpectedCash > 0 ? String(stats.totalExpectedCash) : '0'));
-      setVarianceAllocations({ card: 0, credit: 0, touchCard: 0, voucher: 0 });
       setIsCloseConfirmOpen(true);
     }
   };
@@ -2817,19 +2758,7 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       let totalSales = 0;
       let totalPumpsActualCash = 0;
 
-      const userPhysicalCash = parseFloat(physicalCashHandedOverInput) || 0;
-      const allocatedCard = varianceAllocations.card || 0;
-      const allocatedCredit = varianceAllocations.credit || 0;
-      const allocatedTouchCard = varianceAllocations.touchCard || 0;
-      const allocatedVoucher = varianceAllocations.voucher || 0;
-
-      // Identify active readings for distributing non-cash allocations
-      const activeIndices = draftReadings
-        .map((r, idx) => (isPumpReadingActiveOrAssigned(r) ? idx : -1))
-        .filter(idx => idx !== -1);
-      const targetAllocationIdx = activeIndices.length > 0 ? activeIndices[0] : 0;
-
-      const finalReadings = draftReadings.map((r, idx) => {
+      const finalReadings = draftReadings.map((r) => {
         const fuel = Math.max(0, r.endMeter - r.startMeter);
         const net = Math.max(0, fuel - r.testingQty);
         const price = getPriceForFuelType(r.fuelType);
@@ -2837,16 +2766,10 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         const oilSales = r.oilSalesAmount ?? 0;
         const totalGrossRev = grossFuelRev + oilSales;
 
-        // Apply quick-tagged non-cash adjustments to the pump reading so Supabase sync records them
-        const addCard = idx === targetAllocationIdx ? allocatedCard : 0;
-        const addCredit = idx === targetAllocationIdx ? allocatedCredit : 0;
-        const addTouchCard = idx === targetAllocationIdx ? allocatedTouchCard : 0;
-        const addVoucher = idx === targetAllocationIdx ? allocatedVoucher : 0;
-
-        const creditVal = (r.creditSalesAmount ?? 0) + addCredit;
-        const cardVal = (r.cardSalesAmount ?? 0) + addCard;
-        const touchCardVal = (r.touchCardSalesAmount ?? 0) + addTouchCard;
-        const voucherVal = (r.voucherSalesAmount ?? 0) + addVoucher;
+        const creditVal = r.creditSalesAmount ?? 0;
+        const cardVal = r.cardSalesAmount ?? 0;
+        const touchCardVal = r.touchCardSalesAmount ?? 0;
+        const voucherVal = r.voucherSalesAmount ?? 0;
 
         const netExpCash = Math.max(0, totalGrossRev - (creditVal + cardVal + touchCardVal + voucherVal));
         const actCash = r.actualCash ?? 0;
@@ -2888,15 +2811,12 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       });
       const totalNonCashSales = totalCreditSum + totalCardSum + totalTouchCardSum + totalVoucherSum;
 
-      const effectivePhysicalCash = userPhysicalCash > 0
-        ? userPhysicalCash
-        : (totalPumpsActualCash > 0 ? (totalPumpsActualCash + counterRevenue) : (initCash + replCash + counterRevenue));
+      const effectivePhysicalCash = totalPumpsActualCash > 0
+        ? (totalPumpsActualCash + counterRevenue)
+        : (initCash + replCash > 0 ? (initCash + replCash + counterRevenue) : Math.max(0, totalShiftGrossSales - totalNonCashSales));
 
-      // Dynamic Shift Cash Variance: (Physical Cash Handed Over + Non-Cash Sales) - Total Gross Revenue
       const variance = (effectivePhysicalCash + totalNonCashSales) - totalShiftGrossSales;
-      const rawBanked = typeof cashBankedInput === 'string' ? cashBankedInput.trim() : String(cashBankedInput ?? '');
-      const parsedBanked = parseFloat(rawBanked || '0');
-      const cashBankedVal = !isNaN(parsedBanked) && parsedBanked >= 0 ? Number(parsedBanked) : 0;
+      const cashBankedVal = 0;
 
       const activeReadings = finalReadings.filter(isPumpReadingActiveOrAssigned);
 
@@ -2982,7 +2902,6 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       onCloseShift(closedShift);
 
       setIsCloseConfirmOpen(false);
-      setCashBankedInput('');
       setToastMessage('✓ Shift Closed Successfully');
 
       setTimeout(() => {
@@ -4905,402 +4824,74 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                 This action will finalize the current shift (<strong className="text-[#1C1C1C] tabular-nums font-semibold">{activeShift.id}</strong>), save readings permanently, and deduct sold fuel from underground storage tanks.
               </p>
               
-              {/* Overall Shift Revenue Summary Box */}
-              <div className="bg-white p-4 rounded-xl text-left text-xs text-gray-600 space-y-3 border border-gray-200/80 shadow-xs">
-                <div className="flex justify-between items-center pb-2 border-b border-gray-100">
+              {/* Overall Shift Revenue & Volume Summary Box */}
+              <div className="bg-white p-4 sm:p-5 rounded-xl text-left text-xs text-gray-600 space-y-3.5 border border-gray-200/80 shadow-xs">
+                <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-1.5 pb-2.5 border-b border-gray-100">
                   <span className="font-bold text-gray-700">Supervisor: <strong className="text-[#1C1C1C]">{activeSupervisor?.name || 'N/A'}</strong></span>
                   <span className="font-bold text-gray-700">Shift: <strong className="text-[#1C1C1C]">{activeShift.name}</strong></span>
                 </div>
 
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                  <div className="bg-gray-50 p-2.5 rounded-xl border border-gray-100">
-                    <span className="text-[10px] text-gray-500 uppercase font-bold block">Gross Revenue</span>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                  <div className="bg-gray-50 p-3 rounded-xl border border-gray-100">
+                    <span className="text-[10px] text-gray-500 uppercase font-bold block mb-0.5">Gross Revenue</span>
                     <span className="text-xs sm:text-sm font-extrabold text-[#1C1C1C] tabular-nums">{formatCurrency(effectiveModalGrossSales)}</span>
                   </div>
-                  <div className="bg-purple-50/60 p-2.5 rounded-xl border border-purple-100">
-                    <span className="text-[10px] text-purple-900 uppercase font-bold block">Non-Cash Deductions</span>
+                  <div className="bg-purple-50/60 p-3 rounded-xl border border-purple-100">
+                    <span className="text-[10px] text-purple-900 uppercase font-bold block mb-0.5">Non-Cash Deductions</span>
                     <span className="text-xs sm:text-sm font-extrabold text-purple-700 tabular-nums">-{formatCurrency(effectiveModalNonCashSales)}</span>
                   </div>
-                  <div className="bg-blue-50/60 p-2.5 rounded-xl border border-blue-100">
-                    <span className="text-[10px] text-blue-900 uppercase font-bold block">Net Expected Cash</span>
+                  <div className="bg-blue-50/60 p-3 rounded-xl border border-blue-100">
+                    <span className="text-[10px] text-blue-900 uppercase font-bold block mb-0.5">Net Expected Cash</span>
                     <span className="text-xs sm:text-sm font-extrabold text-blue-700 tabular-nums">{formatCurrency(effectiveModalExpectedCash)}</span>
                   </div>
-                  <div className="bg-amber-50/60 p-2.5 rounded-xl border border-amber-100">
-                    <span className="text-[10px] text-amber-900 uppercase font-bold block">Net Fuel Sold</span>
+                  <div className="bg-amber-50/60 p-3 rounded-xl border border-amber-100">
+                    <span className="text-[10px] text-amber-900 uppercase font-bold block mb-0.5">Net Fuel Sold</span>
                     <span className="text-xs sm:text-sm font-extrabold text-amber-800 tabular-nums">{formatLiters(stats.totalNetSold)}</span>
                   </div>
                 </div>
 
-                <div className="flex justify-between items-center pt-2 border-t border-gray-100 text-xs">
+                {totalGasCylindersSold > 0 && (
+                  <div className="grid grid-cols-2 gap-2.5 pt-1">
+                    <div className="bg-emerald-50/60 p-2.5 rounded-xl border border-emerald-100 flex items-center justify-between">
+                      <span className="text-[10px] text-emerald-900 uppercase font-bold">LP Gas Sold</span>
+                      <span className="text-xs font-extrabold text-emerald-800 tabular-nums">{totalGasCylindersSold} Cylinders</span>
+                    </div>
+                    <div className="bg-emerald-50/60 p-2.5 rounded-xl border border-emerald-100 flex items-center justify-between">
+                      <span className="text-[10px] text-emerald-900 uppercase font-bold">Gas Revenue</span>
+                      <span className="text-xs font-extrabold text-emerald-800 tabular-nums">{formatCurrency(draftCounterSales.totalGasSales || 0)}</span>
+                    </div>
+                  </div>
+                )}
+
+                {(() => {
+                  const depositsForActive = (bankDeposits || []).filter(d => d.shift_id === activeShift.id);
+                  const totalBankedSoFar = depositsForActive.reduce((sum, d) => sum + (d.deposited_amount || 0), 0);
+                  const safeCashRemaining = Math.max(0, effectiveModalExpectedCash - totalBankedSoFar);
+
+                  if (totalBankedSoFar > 0) {
+                    return (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
+                        <div className="bg-emerald-50/70 p-2.5 rounded-xl border border-emerald-100 flex items-center justify-between">
+                          <span className="text-[10px] text-emerald-900 uppercase font-bold">Recorded Bank Deposits:</span>
+                          <span className="text-xs font-extrabold text-emerald-800 tabular-nums">
+                            {formatCurrency(totalBankedSoFar)} ({depositsForActive.length} drops)
+                          </span>
+                        </div>
+                        <div className="bg-purple-50/70 p-2.5 rounded-xl border border-purple-100 flex items-center justify-between">
+                          <span className="text-[10px] text-purple-900 uppercase font-bold">Safe Cash Remaining:</span>
+                          <span className="text-xs font-extrabold text-purple-800 tabular-nums">
+                            {formatCurrency(safeCashRemaining)}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  }
+                  return null;
+                })()}
+
+                <div className="flex justify-between items-center pt-2.5 border-t border-gray-100 text-xs">
                   <span className="font-extrabold text-gray-800">Consolidated System Gross Revenue:</span>
                   <span className="font-extrabold text-blue-600 tabular-nums text-base">{formatCurrency(effectiveModalGrossSales)}</span>
-                </div>
-              </div>
-
-              {/* --- PHYSICAL CASH HANDED OVER INPUT & REAL-TIME VARIANCE SECTION --- */}
-              <div id="shift-physical-cash-section" className="bg-blue-50/70 border border-blue-200/90 rounded-xl p-4 text-left space-y-3 shadow-2xs">
-                <div className="flex items-center justify-between">
-                  <label htmlFor="shift-physical-cash-input" className="font-extrabold text-blue-950 text-xs uppercase tracking-wider flex items-center gap-1.5 cursor-pointer">
-                    <DollarSign className="w-3.5 h-3.5 text-blue-600" />
-                    PHYSICAL CASH HANDED OVER (RS.)
-                  </label>
-                  <span className="text-[10px] font-bold text-blue-800 bg-blue-100/90 px-2 py-0.5 rounded-full border border-blue-200/80">
-                    Shift Cash Reconciliation
-                  </span>
-                </div>
-
-                <div className="relative">
-                  <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-500 font-bold text-xs pointer-events-none">Rs.</span>
-                  <input
-                    id="shift-physical-cash-input"
-                    type="number"
-                    min="0"
-                    step="0.01"
-                    placeholder="0.00"
-                    value={physicalCashHandedOverInput}
-                    onChange={(e) => setPhysicalCashHandedOverInput(e.target.value)}
-                    className="w-full pl-10 pr-4 py-2.5 bg-white border border-blue-300 rounded-lg text-sm font-extrabold text-[#1C1C1C] placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-600 tabular-nums shadow-2xs transition-all"
-                  />
-                </div>
-
-                {/* Real-time Variance Calculation Display */}
-                <div className="pt-2 border-t border-blue-200/60 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
-                  <div className="text-[11px] text-gray-600 font-medium leading-tight">
-                    <span className="text-gray-500">
-                      Variance Formula: (Physical Cash <strong className="text-gray-800 tabular-nums">{formatCurrency(modalPhysicalCashVal)}</strong> + Non-Cash <strong className="text-gray-800 tabular-nums">{formatCurrency(effectiveModalNonCashSales)}</strong>) − Gross Revenue <strong className="text-gray-800 tabular-nums">{formatCurrency(effectiveModalGrossSales)}</strong>
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <span className="font-bold text-gray-600 text-[11px]">Shift Cash Variance:</span>
-                    {modalCashVariance < -0.01 ? (
-                      <span className="px-2.5 py-1 rounded-md font-extrabold text-xs bg-red-100 text-red-700 border border-red-200 tabular-nums flex items-center gap-1">
-                        <AlertTriangle className="w-3 h-3 text-red-600" />
-                        -{formatCurrency(Math.abs(modalCashVariance))} (Shortage)
-                      </span>
-                    ) : modalCashVariance > 0.01 ? (
-                      <span className="px-2.5 py-1 rounded-md font-extrabold text-xs bg-emerald-100 text-emerald-800 border border-emerald-200 tabular-nums flex items-center gap-1">
-                        <TrendingUp className="w-3 h-3 text-emerald-600" />
-                        +{formatCurrency(modalCashVariance)} (Excess)
-                      </span>
-                    ) : (
-                      <span className="px-2.5 py-1 rounded-md font-extrabold text-xs bg-emerald-100 text-emerald-800 border border-emerald-200 tabular-nums flex items-center gap-1">
-                        <CheckCircle className="w-3 h-3 text-emerald-600" />
-                        Rs. 0.00 (Balanced)
-                      </span>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              {/* --- VARIANCE NON-CASH ALLOCATION / QUICK TAGGING PANEL --- */}
-              {(modalCashVariance !== 0 || totalAllocatedNonCash > 0) && (
-                <div id="variance-non-cash-allocation-section" className="bg-purple-50/80 border border-purple-200 rounded-xl p-4 text-left space-y-3 shadow-2xs animate-fade-in">
-                  <div className="flex items-center justify-between flex-wrap gap-1">
-                    <div className="flex items-center gap-1.5">
-                      <Tag className="w-3.5 h-3.5 text-purple-700" />
-                      <h4 className="font-extrabold text-purple-950 text-xs uppercase tracking-wider">
-                        Variance Non-Cash Allocation / Quick Tagging
-                      </h4>
-                    </div>
-                    {totalAllocatedNonCash > 0 && (
-                      <button
-                        type="button"
-                        onClick={handleResetAllocations}
-                        className="text-[10px] font-bold text-purple-700 hover:text-purple-900 bg-purple-100 hover:bg-purple-200/80 px-2 py-0.5 rounded-md cursor-pointer transition-colors"
-                      >
-                        Reset Allocations
-                      </button>
-                    )}
-                  </div>
-
-                  <p className="text-[11px] text-purple-900 leading-snug">
-                    {modalCashVariance < -0.01 ? (
-                      <>Discrepancy of <strong className="tabular-nums text-red-700 font-extrabold">{formatCurrency(Math.abs(modalCashVariance))}</strong> detected. Select payment type(s) below to allocate this variance directly to missing non-cash receipts before closing.</>
-                    ) : totalAllocatedNonCash > 0 ? (
-                      <>Allocated <strong className="tabular-nums text-purple-800 font-extrabold">{formatCurrency(totalAllocatedNonCash)}</strong> to non-cash payment records. Shift reconciliation is now balanced.</>
-                    ) : (
-                      <>Allocate variance amount to non-cash payment categories to balance the shift to Rs. 0.00.</>
-                    )}
-                  </p>
-
-                  {/* 1-Click Quick Allocation Buttons (when there is an unallocated shortage) */}
-                  {modalCashVariance < -0.01 && (
-                    <div className="space-y-1.5 pt-1">
-                      <span className="text-[10px] font-bold text-purple-800 uppercase tracking-wider block">
-                        Quick 1-Click Allocation ({formatCurrency(Math.abs(modalCashVariance))}):
-                      </span>
-                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                        <button
-                          type="button"
-                          onClick={() => handleQuickAllocateAll('card')}
-                          className="px-2.5 py-1.5 bg-white border border-purple-200 hover:border-purple-400 hover:bg-purple-100/50 rounded-lg text-xs font-bold text-purple-900 flex items-center justify-center gap-1.5 cursor-pointer shadow-2xs transition-all"
-                        >
-                          <CreditCard className="w-3 h-3 text-purple-600" />
-                          <span>+ Card POS</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleQuickAllocateAll('credit')}
-                          className="px-2.5 py-1.5 bg-white border border-purple-200 hover:border-purple-400 hover:bg-purple-100/50 rounded-lg text-xs font-bold text-purple-900 flex items-center justify-center gap-1.5 cursor-pointer shadow-2xs transition-all"
-                        >
-                          <Receipt className="w-3 h-3 text-purple-600" />
-                          <span>+ Credit</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleQuickAllocateAll('touchCard')}
-                          className="px-2.5 py-1.5 bg-white border border-purple-200 hover:border-purple-400 hover:bg-purple-100/50 rounded-lg text-xs font-bold text-purple-900 flex items-center justify-center gap-1.5 cursor-pointer shadow-2xs transition-all"
-                        >
-                          <CreditCard className="w-3 h-3 text-purple-600" />
-                          <span>+ Touch Card</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleQuickAllocateAll('voucher')}
-                          className="px-2.5 py-1.5 bg-white border border-purple-200 hover:border-purple-400 hover:bg-purple-100/50 rounded-lg text-xs font-bold text-purple-900 flex items-center justify-center gap-1.5 cursor-pointer shadow-2xs transition-all"
-                        >
-                          <Tag className="w-3 h-3 text-purple-600" />
-                          <span>+ Voucher</span>
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Itemized Categories with Checkboxes & Custom Numeric Inputs */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
-                    {/* Card POS */}
-                    <div className="bg-white p-2.5 rounded-lg border border-purple-200/80 flex items-center justify-between gap-2 shadow-2xs">
-                      <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-gray-800">
-                        <input
-                          type="checkbox"
-                          checked={varianceAllocations.card > 0}
-                          onChange={(e) => handleToggleCategory('card', e.target.checked)}
-                          className="rounded text-purple-600 focus:ring-purple-500 cursor-pointer"
-                        />
-                        <span>Card POS</span>
-                      </label>
-                      <div className="flex items-center gap-1">
-                        <span className="text-[10px] text-gray-400 font-bold">Rs.</span>
-                        <input
-                          type="number"
-                          min="0"
-                          step="0.01"
-                          placeholder="0.00"
-                          value={varianceAllocations.card || ''}
-                          onChange={(e) => handleCustomCategoryAmountChange('card', e.target.value)}
-                          className="w-24 px-2 py-1 bg-gray-50 border border-gray-200 rounded text-xs font-bold text-purple-900 text-right tabular-nums focus:outline-none focus:border-purple-500 focus:bg-white"
-                        />
-                      </div>
-                    </div>
-
-                    {/* Corporate Credit */}
-                    <div className="bg-white p-2.5 rounded-lg border border-purple-200/80 flex items-center justify-between gap-2 shadow-2xs">
-                      <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-gray-800">
-                        <input
-                          type="checkbox"
-                          checked={varianceAllocations.credit > 0}
-                          onChange={(e) => handleToggleCategory('credit', e.target.checked)}
-                          className="rounded text-purple-600 focus:ring-purple-500 cursor-pointer"
-                        />
-                        <span>Corporate Credit</span>
-                      </label>
-                      <div className="flex items-center gap-1">
-                        <span className="text-[10px] text-gray-400 font-bold">Rs.</span>
-                        <input
-                          type="number"
-                          min="0"
-                          step="0.01"
-                          placeholder="0.00"
-                          value={varianceAllocations.credit || ''}
-                          onChange={(e) => handleCustomCategoryAmountChange('credit', e.target.value)}
-                          className="w-24 px-2 py-1 bg-gray-50 border border-gray-200 rounded text-xs font-bold text-purple-900 text-right tabular-nums focus:outline-none focus:border-purple-500 focus:bg-white"
-                        />
-                      </div>
-                    </div>
-
-                    {/* Touch Card */}
-                    <div className="bg-white p-2.5 rounded-lg border border-purple-200/80 flex items-center justify-between gap-2 shadow-2xs">
-                      <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-gray-800">
-                        <input
-                          type="checkbox"
-                          checked={varianceAllocations.touchCard > 0}
-                          onChange={(e) => handleToggleCategory('touchCard', e.target.checked)}
-                          className="rounded text-purple-600 focus:ring-purple-500 cursor-pointer"
-                        />
-                        <span>Touch Card</span>
-                      </label>
-                      <div className="flex items-center gap-1">
-                        <span className="text-[10px] text-gray-400 font-bold">Rs.</span>
-                        <input
-                          type="number"
-                          min="0"
-                          step="0.01"
-                          placeholder="0.00"
-                          value={varianceAllocations.touchCard || ''}
-                          onChange={(e) => handleCustomCategoryAmountChange('touchCard', e.target.value)}
-                          className="w-24 px-2 py-1 bg-gray-50 border border-gray-200 rounded text-xs font-bold text-purple-900 text-right tabular-nums focus:outline-none focus:border-purple-500 focus:bg-white"
-                        />
-                      </div>
-                    </div>
-
-                    {/* Voucher */}
-                    <div className="bg-white p-2.5 rounded-lg border border-purple-200/80 flex items-center justify-between gap-2 shadow-2xs">
-                      <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-gray-800">
-                        <input
-                          type="checkbox"
-                          checked={varianceAllocations.voucher > 0}
-                          onChange={(e) => handleToggleCategory('voucher', e.target.checked)}
-                          className="rounded text-purple-600 focus:ring-purple-500 cursor-pointer"
-                        />
-                        <span>Voucher</span>
-                      </label>
-                      <div className="flex items-center gap-1">
-                        <span className="text-[10px] text-gray-400 font-bold">Rs.</span>
-                        <input
-                          type="number"
-                          min="0"
-                          step="0.01"
-                          placeholder="0.00"
-                          value={varianceAllocations.voucher || ''}
-                          onChange={(e) => handleCustomCategoryAmountChange('voucher', e.target.value)}
-                          className="w-24 px-2 py-1 bg-gray-50 border border-gray-200 rounded text-xs font-bold text-purple-900 text-right tabular-nums focus:outline-none focus:border-purple-500 focus:bg-white"
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  <p className="text-[10px] text-purple-700/80 italic pt-1">
-                    * Allocated adjustments will sync directly into the respective database tables (card_sales, credit_sales, touch_card_sales, voucher_sales) upon shift closure.
-                  </p>
-                </div>
-              )}
-
-              {/* Pumper Consolidated Shift Summary */}
-              {allPumperStats.length > 0 && (
-                <div className="text-left space-y-2 pt-1">
-                  <div className="flex items-center justify-between">
-                    <h4 className="font-extrabold text-[#1C1C1C] text-xs uppercase tracking-wider flex items-center gap-1.5">
-                      <Users className="w-3.5 h-3.5 text-blue-600" />
-                      Pumper Consolidated Shift Summary
-                    </h4>
-                    <span className="text-[10px] font-bold text-gray-500 bg-gray-200/60 px-2 py-0.5 rounded-full">
-                      {allPumperStats.length} {allPumperStats.length === 1 ? 'Pumper Account' : 'Pumper Accounts'}
-                    </span>
-                  </div>
-
-                  <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
-                    {allPumperStats.map((p) => {
-                      const absVar = Math.abs(p.overallVariance);
-                      const absVarFormatted = formatCurrency(absVar);
-
-                      return (
-                        <div key={`modal-pumper-${p.pumperId}`} className="bg-white p-3 rounded-xl border border-gray-200/90 shadow-2xs space-y-2 text-xs">
-                          <div className="flex items-center justify-between gap-2 border-b border-gray-100 pb-2">
-                            <div className="flex items-center gap-2">
-                              <div className={`w-6 h-6 rounded-lg text-white font-bold text-xs flex items-center justify-center shrink-0 ${p.avatarColor}`}>
-                                {p.pumperName.charAt(0)}
-                              </div>
-                              <span className="font-bold text-[#1C1C1C]">{p.pumperName}</span>
-                            </div>
-                            <div className="flex items-center gap-1 flex-wrap">
-                              {p.readings.map(r => (
-                                <span key={`m-pill-${r.pumpId}`} className="text-[9px] font-bold px-1.5 py-0.5 bg-gray-100 text-gray-700 rounded-md tabular-nums border border-gray-200/60">
-                                  {r.pumpName}
-                                </span>
-                              ))}
-                            </div>
-                          </div>
-
-                          {/* Financial Row */}
-                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] bg-gray-50/80 p-2 rounded-lg border border-gray-100">
-                            <div>
-                              <span className="text-[9px] font-semibold text-gray-400 block uppercase">Fuel Sales</span>
-                              <span className="font-bold text-gray-700 tabular-nums">{formatCurrency(p.totalFuelRevenue)}</span>
-                            </div>
-                            <div>
-                              <span className="text-[9px] font-semibold text-amber-700 block uppercase">Oil/Lube Sales</span>
-                              <span className="font-bold text-amber-700 tabular-nums">+{formatCurrency(p.totalOilSales)}</span>
-                            </div>
-                            <div>
-                              <span className="text-[9px] font-semibold text-purple-600 block uppercase">Non-Cash Deductions</span>
-                              <span className="font-bold text-purple-700 tabular-nums">-{formatCurrency(p.totalNonCash)}</span>
-                            </div>
-                            <div>
-                              <span className="text-[9px] font-extrabold text-blue-900 block uppercase">Net Cash Due</span>
-                              <span className="font-extrabold text-blue-700 tabular-nums">{formatCurrency(p.totalNetExpCash)}</span>
-                            </div>
-                          </div>
-
-                          {/* Cash Handover & Variance Status */}
-                          <div className="flex items-center justify-between pt-1 text-xs">
-                            <div className="flex items-center gap-1 text-gray-600">
-                              <span className="font-medium">Actual Cash Handed Over:</span>
-                              <span className="font-bold text-[#1C1C1C] tabular-nums">{formatCurrency(p.totalActualCash)}</span>
-                            </div>
-                            <div>
-                              {p.overallVariance < -0.01 ? (
-                                <span className="px-2 py-0.5 rounded-md font-extrabold text-[11px] bg-red-100 text-red-700 border border-red-200 tabular-nums">
-                                  -{absVarFormatted} (Shortage)
-                                </span>
-                              ) : p.overallVariance > 0.01 ? (
-                                <span className="px-2 py-0.5 rounded-md font-extrabold text-[11px] bg-emerald-100 text-emerald-800 border border-emerald-200 tabular-nums">
-                                  +{absVarFormatted} (Excess)
-                                </span>
-                              ) : (
-                                <span className="px-2 py-0.5 rounded-md font-extrabold text-[11px] bg-gray-100 text-gray-700 border border-gray-200 tabular-nums">
-                                  Rs. 0.00 (Balanced)
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-
-              {/* --- CASH BANKED / BANK DEPOSIT INPUT SECTION --- */}
-              <div id="shift-cash-banked-section" className="bg-emerald-50/70 border border-emerald-200/90 rounded-xl p-3.5 text-left space-y-2.5 shadow-2xs">
-                <div className="flex items-center justify-between">
-                  <label htmlFor="shift-cash-banked-input" className="font-extrabold text-emerald-950 text-xs uppercase tracking-wider flex items-center gap-1.5 cursor-pointer">
-                    <Landmark className="w-3.5 h-3.5 text-emerald-600" />
-                    CASH BANKED / BANK DEPOSIT (RS.)
-                  </label>
-                  <span className="text-[10px] font-bold text-emerald-800 bg-emerald-100/90 px-2 py-0.5 rounded-full border border-emerald-200/80">
-                    Direct Bank Deposit
-                  </span>
-                </div>
-
-                <div className="relative">
-                  <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-500 font-bold text-xs pointer-events-none">Rs.</span>
-                  <input
-                    id="shift-cash-banked-input"
-                    type="number"
-                    min="0"
-                    step="0.01"
-                    placeholder="0.00"
-                    value={cashBankedInput}
-                    onChange={(e) => setCashBankedInput(e.target.value)}
-                    className="w-full pl-10 pr-4 py-2 bg-white border border-emerald-300 rounded-lg text-sm font-extrabold text-[#1C1C1C] placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-600 tabular-nums shadow-2xs transition-all"
-                  />
-                </div>
-
-                {/* Calculated sub-text displaying remaining cash in hand */}
-                <div className="pt-2 border-t border-emerald-200/60 flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 text-xs">
-                  <div className="text-[11px] text-gray-600 font-medium">
-                    <span className="text-gray-500">
-                      (Physical Cash <strong className="text-gray-800 tabular-nums">{formatCurrency(modalPhysicalCashVal)}</strong> − Cash Banked <strong className="text-gray-800 tabular-nums">{formatCurrency(Math.max(0, parseFloat(cashBankedInput) || 0))}</strong>)
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-1.5 shrink-0 bg-white px-2.5 py-1 rounded-md border border-emerald-200 shadow-2xs">
-                    <span className="font-bold text-gray-600 text-[11px]">Remaining Cash in Hand:</span>
-                    <span className={`font-black text-xs sm:text-sm tabular-nums ${
-                      (modalPhysicalCashVal - (Math.max(0, parseFloat(cashBankedInput) || 0))) < 0 ? 'text-red-600' : 'text-emerald-900'
-                    }`}>
-                      {formatCurrency(modalPhysicalCashVal - (Math.max(0, parseFloat(cashBankedInput) || 0)))}
-                    </span>
-                  </div>
                 </div>
               </div>
             </div>

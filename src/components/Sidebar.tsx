@@ -8,7 +8,7 @@ import {
   LayoutDashboard, Clock, Fuel, BarChart3, FileText, Users, 
   ShieldCheck, ChevronLeft, ChevronRight, ChevronDown,
   Droplet, CreditCard, TrendingUp, Droplets, Truck,
-  Database, Gauge, Tag, ArrowLeftRight, Flame
+  Database, Gauge, Tag, ArrowLeftRight, Flame, Landmark
 } from 'lucide-react';
 
 import { AuthUser, resolveUserRole } from '../types';
@@ -64,6 +64,7 @@ export default function Sidebar({
   const menuItems = [
     { id: 'dashboard', name: 'Dashboard', icon: LayoutDashboard },
     { id: 'shift', name: 'Shift Management', icon: Clock },
+    { id: 'deposits', name: 'Deposits', icon: Landmark },
     { id: 'stock', name: 'Fuel Stock', icon: Fuel },
     { id: 'oil-storage', name: 'Oil (Lubricant) Storage', icon: Droplets },
     { id: 'gas-inventory', name: 'LP Gas Inventory', icon: Flame },

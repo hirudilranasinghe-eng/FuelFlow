@@ -248,6 +248,21 @@ CREATE TABLE price_schedules (
     status TEXT NOT NULL CHECK (status IN ('Pending', 'Applied', 'Cancelled'))
 );
 
+-- Shift Bank Deposits (Multi-entry Partial Cash Drops per Shift)
+CREATE TABLE IF NOT EXISTS shift_bank_deposits (
+    id TEXT PRIMARY KEY,
+    shift_id TEXT REFERENCES shifts(id) ON DELETE CASCADE,
+    shift_name TEXT,
+    deposited_amount NUMERIC NOT NULL DEFAULT 0,
+    deposited_by TEXT NOT NULL DEFAULT 'Supervisor',
+    bank_name TEXT DEFAULT 'Commercial Bank of Ceylon',
+    account_number TEXT,
+    slip_no TEXT,
+    notes TEXT,
+    deposit_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Disable Row Level Security (RLS) for all tables to allow simple public access
 ALTER TABLE employees DISABLE ROW LEVEL SECURITY;
 ALTER TABLE fuel_tanks DISABLE ROW LEVEL SECURITY;
@@ -263,6 +278,7 @@ ALTER TABLE card_sales DISABLE ROW LEVEL SECURITY;
 ALTER TABLE payment_settlements DISABLE ROW LEVEL SECURITY;
 ALTER TABLE pumper_non_cash_sales DISABLE ROW LEVEL SECURITY;
 ALTER TABLE customer_ledgers DISABLE ROW LEVEL SECURITY;
+ALTER TABLE shift_bank_deposits DISABLE ROW LEVEL SECURITY;
 
 -- Disable RLS for fuel_tank if it exists
 DO $$

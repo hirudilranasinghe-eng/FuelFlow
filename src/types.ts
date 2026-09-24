@@ -273,8 +273,12 @@ export interface Shift {
 export interface ShiftBankDeposit {
   id?: string;
   shift_id: string;
+  shift_name?: string;
   deposited_amount: number;
-  deposited_by: string; // supervisor name
+  deposited_by: string; // supervisor or employee name
+  bank_name?: string; // e.g. "Commercial Bank", "Bank of Ceylon (BOC)", "People's Bank", "Sampath Bank", "Hatton National Bank (HNB)"
+  account_number?: string;
+  slip_no?: string; // Reference or deposit slip number
   created_at?: string;
   deposit_date?: string;
   notes?: string;

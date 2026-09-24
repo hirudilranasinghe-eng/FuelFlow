@@ -26,10 +26,11 @@ import CustomersTab from './components/CustomersTab';
 import EmployeesTab from './components/EmployeesTab';
 import AdminControlTab from './components/AdminControlTab';
 import PriceManagementTab from './components/PriceManagementTab';
+import DepositsTab from './components/DepositsTab';
 import LoginPage, { LoginModal } from './components/LoginPage';
-import { AuthUser, Employee, FuelTank, OilTank, Pump, PumpMachine, Shift, StockDelivery, PriceSchedule, Customer, CreditTransaction, CreditPayment, LPGasItem, resolveUserRole } from './types';
+import { AuthUser, Employee, FuelTank, OilTank, Pump, PumpMachine, Shift, StockDelivery, PriceSchedule, Customer, CreditTransaction, CreditPayment, LPGasItem, ShiftBankDeposit, resolveUserRole } from './types';
 import { supabase, getTanksTableName, setTanksTableName } from './lib/supabase';
-import { upsertPumpReadings, syncCreditAndCardSales, syncAllNonCashSales, updateNozzleMeterCarryover, saveOilTank, recordShiftBankDeposit, isPumpReadingActiveOrAssigned, saveShiftLogs } from './lib/supabaseClient';
+import { upsertPumpReadings, syncCreditAndCardSales, syncAllNonCashSales, updateNozzleMeterCarryover, saveOilTank, recordShiftBankDeposit, fetchShiftBankDeposits, saveIndividualBankDeposit, deleteIndividualBankDeposit, isPumpReadingActiveOrAssigned, saveShiftLogs } from './lib/supabaseClient';
 
 export const defaultPumpMachines: PumpMachine[] = [];
 export const defaultPumps: Pump[] = [];
@@ -322,6 +323,18 @@ export default function App() {
       if (stored) {
         const parsed = JSON.parse(stored);
         if (Array.isArray(parsed) && !parsed.some((p: any) => p.id === 'PAY-501')) return parsed;
+      }
+    } catch (_) {}
+    return [];
+  });
+
+  // Global Bank Deposits State (Multi-Entry Ledger)
+  const [bankDeposits, setBankDeposits] = useState<ShiftBankDeposit[]>(() => {
+    try {
+      const stored = localStorage.getItem('fms_bankDeposits');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed)) return parsed;
       }
     } catch (_) {}
     return [];
@@ -910,6 +923,19 @@ export default function App() {
             } catch (_) {}
           }
         } catch (_) {}
+
+        // Fetch shift bank deposits from Supabase
+        try {
+          const depositsData = await fetchShiftBankDeposits(supabase);
+          if (depositsData && depositsData.length > 0) {
+            setBankDeposits(depositsData);
+            try {
+              localStorage.setItem('fms_bankDeposits', JSON.stringify(depositsData));
+            } catch (_) {}
+          }
+        } catch (depErr) {
+          console.warn("fetchShiftBankDeposits notice:", depErr);
+        }
 
         setTimeout(() => {
           isInitialLoad.current = false;
@@ -1566,6 +1592,53 @@ export default function App() {
     }
   };
 
+  // Actions for Multi-Entry Bank Deposits
+  const handleAddDeposit = async (newDepositData: Omit<ShiftBankDeposit, 'id' | 'created_at'>) => {
+    const depositId = `DEP-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    const newDeposit: ShiftBankDeposit = {
+      ...newDepositData,
+      id: depositId,
+      created_at: new Date().toISOString()
+    };
+
+    const updatedDeposits = [newDeposit, ...bankDeposits];
+    setBankDeposits(updatedDeposits);
+    try {
+      localStorage.setItem('fms_bankDeposits', JSON.stringify(updatedDeposits));
+    } catch (_) {}
+
+    // Calculate sum of deposits for this specific shift
+    const shiftDeposits = updatedDeposits.filter(d => d.shift_id === newDeposit.shift_id);
+    const totalShiftBanked = shiftDeposits.reduce((sum, d) => sum + (d.deposited_amount || 0), 0);
+
+    // Update activeShift or shiftHistory if matched
+    if (activeShift && activeShift.id === newDeposit.shift_id) {
+      setActiveShift(prev => prev ? { ...prev, cashBanked: totalShiftBanked, cash_banked: totalShiftBanked } : null);
+    }
+    setShiftHistory(prev => prev.map(s => s.id === newDeposit.shift_id ? { ...s, cashBanked: totalShiftBanked, cash_banked: totalShiftBanked } : s));
+
+    // Sync to Supabase
+    await saveIndividualBankDeposit(supabase, newDeposit, totalShiftBanked);
+  };
+
+  const handleDeleteDeposit = async (depositId: string, shiftId: string) => {
+    const updatedDeposits = bankDeposits.filter(d => d.id !== depositId);
+    setBankDeposits(updatedDeposits);
+    try {
+      localStorage.setItem('fms_bankDeposits', JSON.stringify(updatedDeposits));
+    } catch (_) {}
+
+    const shiftDeposits = updatedDeposits.filter(d => d.shift_id === shiftId);
+    const totalShiftBanked = shiftDeposits.reduce((sum, d) => sum + (d.deposited_amount || 0), 0);
+
+    if (activeShift && activeShift.id === shiftId) {
+      setActiveShift(prev => prev ? { ...prev, cashBanked: totalShiftBanked, cash_banked: totalShiftBanked } : null);
+    }
+    setShiftHistory(prev => prev.map(s => s.id === shiftId ? { ...s, cashBanked: totalShiftBanked, cash_banked: totalShiftBanked } : s));
+
+    await deleteIndividualBankDeposit(supabase, depositId, shiftId, totalShiftBanked);
+  };
+
   // 1. Initial Session Verification Screen with minimal centered spinner
   if (isCheckingAuth) {
     return (
@@ -1722,8 +1795,22 @@ export default function App() {
                 activeShift={activeShift}
                 setActiveShift={setActiveShift}
                 shiftHistory={shiftHistory}
+                bankDeposits={bankDeposits}
+                onNavigateToDeposits={() => handleSetActiveTab('deposits')}
                 onCloseShift={handleCloseShift}
                 onStartShift={handleStartShift}
+              />
+            )}
+
+            {activeTab === 'deposits' && (
+              <DepositsTab
+                activeShift={activeShift}
+                shiftHistory={shiftHistory}
+                employees={employees}
+                bankDeposits={bankDeposits}
+                onAddDeposit={handleAddDeposit}
+                onDeleteDeposit={handleDeleteDeposit}
+                user={user}
               />
             )}
 

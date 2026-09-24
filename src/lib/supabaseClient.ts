@@ -1,5 +1,5 @@
 import { supabase, getTanksTableName } from './supabase';
-import { PumpReading, FuelTank, OilTank, Customer, CustomerLedgerEntry, Shift } from '../types';
+import { PumpReading, FuelTank, OilTank, Customer, CustomerLedgerEntry, Shift, ShiftBankDeposit } from '../types';
 
 export { supabase };
 
@@ -1192,6 +1192,151 @@ export async function saveCustomerLedgerEntry(client: any, entry: CustomerLedger
  * and updates the 'cash_banked' column in the 'shifts' table.
  * Includes deduplication & upsert to prevent duplicate row insertions per shift.
  */
+/**
+ * Fetches all bank deposits from Supabase shift_bank_deposits table
+ */
+export async function fetchShiftBankDeposits(client: any): Promise<ShiftBankDeposit[]> {
+  if (!client) return [];
+  try {
+    const { data, error } = await client
+      .from('shift_bank_deposits')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.warn("fetchShiftBankDeposits notice:", error.message || error);
+      return [];
+    }
+
+    if (data && Array.isArray(data)) {
+      return data.map((d: any) => ({
+        id: String(d.id || `DEP-${Date.now()}`),
+        shift_id: String(d.shift_id || d.shiftid || ''),
+        shift_name: d.shift_name || d.shiftname || '',
+        deposited_amount: Number(d.deposited_amount ?? d.amount ?? 0),
+        deposited_by: d.deposited_by || d.depositedby || 'Supervisor',
+        bank_name: d.bank_name || d.bankname || 'Commercial Bank',
+        account_number: d.account_number || d.accountnumber || '',
+        slip_no: d.slip_no || d.slipno || d.reference_no || '',
+        created_at: d.created_at || d.createdat || new Date().toISOString(),
+        deposit_date: d.deposit_date || d.depositdate || d.created_at || new Date().toISOString(),
+        notes: d.notes || ''
+      }));
+    }
+  } catch (err: any) {
+    console.warn("fetchShiftBankDeposits exception:", err?.message || err);
+  }
+  return [];
+}
+
+/**
+ * Saves a single bank deposit record and recalculates/syncs the total banked cash for the shift.
+ */
+export async function saveIndividualBankDeposit(
+  client: any,
+  deposit: ShiftBankDeposit,
+  totalShiftDepositedCash?: number
+) {
+  if (!client || !deposit || !deposit.shift_id) return { success: false };
+  const now = new Date().toISOString();
+  const depositId = deposit.id || `DEP-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+  const amount = Number(deposit.deposited_amount) || 0;
+
+  const recordPayload: any = {
+    id: depositId,
+    shift_id: deposit.shift_id,
+    deposited_amount: amount,
+    deposited_by: deposit.deposited_by || 'Supervisor',
+    bank_name: deposit.bank_name || 'Commercial Bank',
+    slip_no: deposit.slip_no || '',
+    notes: deposit.notes || '',
+    deposit_date: deposit.deposit_date || now,
+    created_at: deposit.created_at || now
+  };
+
+  try {
+    const { error: upsertErr } = await client
+      .from('shift_bank_deposits')
+      .upsert([recordPayload], { onConflict: 'id' });
+
+    if (upsertErr) {
+      const { error: insErr } = await client
+        .from('shift_bank_deposits')
+        .insert([{
+          id: depositId,
+          shift_id: deposit.shift_id,
+          deposited_amount: amount,
+          deposited_by: deposit.deposited_by || 'Supervisor',
+          notes: deposit.notes || '',
+          created_at: now
+        }]);
+
+      if (insErr) {
+        console.warn("shift_bank_deposits insert notice:", insErr.message || insErr);
+      }
+    }
+  } catch (err) {
+    console.warn("shift_bank_deposits save exception:", err);
+  }
+
+  // Update shifts table cash_banked if total sum is supplied
+  if (totalShiftDepositedCash !== undefined) {
+    try {
+      await client
+        .from('shifts')
+        .update({
+          cash_banked: totalShiftDepositedCash,
+          cashbanked: totalShiftDepositedCash
+        })
+        .eq('id', deposit.shift_id);
+    } catch (shiftErr) {
+      console.warn("shifts cash_banked update notice:", shiftErr);
+    }
+  }
+
+  return { success: true, id: depositId };
+}
+
+/**
+ * Deletes a bank deposit record and syncs the updated total banked amount for the shift.
+ */
+export async function deleteIndividualBankDeposit(
+  client: any,
+  depositId: string,
+  shiftId: string,
+  newTotalBanked?: number
+) {
+  if (!client || !depositId) return { success: false };
+  try {
+    const { error } = await client
+      .from('shift_bank_deposits')
+      .delete()
+      .eq('id', depositId);
+
+    if (error) {
+      console.warn("deleteIndividualBankDeposit notice:", error.message || error);
+    }
+  } catch (err) {
+    console.warn("deleteIndividualBankDeposit exception:", err);
+  }
+
+  if (newTotalBanked !== undefined && shiftId) {
+    try {
+      await client
+        .from('shifts')
+        .update({
+          cash_banked: newTotalBanked,
+          cashbanked: newTotalBanked
+        })
+        .eq('id', shiftId);
+    } catch (shiftErr) {
+      console.warn("shifts cash_banked update notice:", shiftErr);
+    }
+  }
+
+  return { success: true };
+}
+
 export async function recordShiftBankDeposit(
   client: any,
   payload: {
