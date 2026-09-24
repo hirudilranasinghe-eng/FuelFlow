@@ -796,19 +796,44 @@ export default function App() {
           }
         } catch (_) {}
 
-        // Fetch LP Gas stock & persisted prices from Supabase
+        // Fetch LP Gas stock & persisted prices from Supabase (with flexible column mapping & products table fallback)
         try {
+          // 1. Fetch any gas prices present in products table
+          let productGasMap: Record<string, number> = {};
+          try {
+            const { data: productData } = await supabase.from('products').select('*');
+            if (productData && Array.isArray(productData)) {
+              productData.forEach((p: any) => {
+                const name = (p.name || '').toLowerCase();
+                const pCategory = (p.category || p.type || '').toLowerCase();
+                const price = Number(p.selling_price || p.unit_price || p.price) || 0;
+                if (price > 0 && (pCategory.includes('gas') || name.includes('gas') || p.id?.startsWith('gas-'))) {
+                  if (name.includes('12.5') || p.id === 'gas-12.5kg') productGasMap['12.5kg'] = price;
+                  if (name.includes('37.5') || p.id === 'gas-37.5kg') productGasMap['37.5kg'] = price;
+                  if (name.includes('5.0') || name.includes('5kg') || p.id === 'gas-5.0kg' || p.id === 'gas-5kg') productGasMap['5kg'] = price;
+                  if (name.includes('2.3') || p.id === 'gas-2.3kg') productGasMap['2.3kg'] = price;
+                }
+              });
+            }
+          } catch (_) {}
+
+          // 2. Fetch from gas_inventory table
           const { data: gasData } = await supabase.from('gas_inventory').select('*');
+          const defaultItems: LPGasItem[] = [
+            { id: 'gas-12.5kg', size: '12.5 kg', full_count: 0, empty_count: 0, selling_price: productGasMap['12.5kg'] || 3690, unit_price: productGasMap['12.5kg'] || 3690, last_updated: new Date().toISOString() },
+            { id: 'gas-37.5kg', size: '37.5 kg', full_count: 0, empty_count: 0, selling_price: productGasMap['37.5kg'] || 11200, unit_price: productGasMap['37.5kg'] || 11200, last_updated: new Date().toISOString() },
+            { id: 'gas-5.0kg', size: '5.0 kg', full_count: 0, empty_count: 0, selling_price: productGasMap['5kg'] || 1482, unit_price: productGasMap['5kg'] || 1482, last_updated: new Date().toISOString() },
+            { id: 'gas-2.3kg', size: '2.3 kg', full_count: 0, empty_count: 0, selling_price: productGasMap['2.3kg'] || 694, unit_price: productGasMap['2.3kg'] || 694, last_updated: new Date().toISOString() }
+          ];
+
+          let mappedGas: LPGasItem[] = [];
+          let missingRowsToInsert: any[] = [];
+
           if (gasData && gasData.length > 0) {
-            const mappedGas: LPGasItem[] = [
-              { id: 'gas-12.5kg', size: '12.5 kg', full_count: 0, empty_count: 0, selling_price: 3690, last_updated: new Date().toISOString() },
-              { id: 'gas-37.5kg', size: '37.5 kg', full_count: 0, empty_count: 0, selling_price: 11200, last_updated: new Date().toISOString() },
-              { id: 'gas-5.0kg', size: '5.0 kg', full_count: 0, empty_count: 0, selling_price: 1482, last_updated: new Date().toISOString() },
-              { id: 'gas-2.3kg', size: '2.3 kg', full_count: 0, empty_count: 0, selling_price: 694, last_updated: new Date().toISOString() }
-            ].map(defItem => {
+            mappedGas = defaultItems.map(defItem => {
               const match = gasData.find((g: any) => g.id === defItem.id || g.size === defItem.size);
               if (match) {
-                const price = Number(match.selling_price || match.unit_price || match.price) || defItem.selling_price;
+                const price = Number(match.selling_price || match.unit_price || match.price) || productGasMap[defItem.id.replace('gas-', '').replace('.0kg', 'kg')] || defItem.selling_price;
                 return {
                   ...defItem,
                   ...match,
@@ -818,11 +843,32 @@ export default function App() {
                   unit_price: price
                 };
               }
+              missingRowsToInsert.push(defItem);
               return defItem;
             });
-            setGasStock(mappedGas);
-            localStorage.setItem('fuel_flow_gas_stock', JSON.stringify(mappedGas));
-            localStorage.setItem('fuel_flow_gas_inventory', JSON.stringify(mappedGas));
+          } else {
+            mappedGas = defaultItems;
+            missingRowsToInsert = defaultItems;
+          }
+
+          setGasStock(mappedGas);
+          localStorage.setItem('fuel_flow_gas_stock', JSON.stringify(mappedGas));
+          localStorage.setItem('fuel_flow_gas_inventory', JSON.stringify(mappedGas));
+
+          // Also sync extracted gas prices to local storage key
+          const priceMap: Record<string, number> = {};
+          mappedGas.forEach(item => {
+            if (item.size === '12.5 kg' || item.id === 'gas-12.5kg') priceMap['12.5kg'] = item.selling_price;
+            if (item.size === '5.0 kg' || item.id === 'gas-5.0kg' || item.id === 'gas-5kg') priceMap['5kg'] = item.selling_price;
+            if (item.size === '2.3 kg' || item.id === 'gas-2.3kg') priceMap['2.3kg'] = item.selling_price;
+          });
+          localStorage.setItem('fuel_flow_gas_prices', JSON.stringify(priceMap));
+
+          // If any size row is missing in Supabase, auto-insert it
+          if (missingRowsToInsert.length > 0) {
+            try {
+              await supabase.from('gas_inventory').upsert(missingRowsToInsert, { onConflict: 'id' });
+            } catch (_) {}
           }
         } catch (_) {}
 

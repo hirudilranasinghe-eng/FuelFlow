@@ -669,17 +669,48 @@ export default function AdminControlTab({
   useEffect(() => {
     const fetchLatestGasPrices = async () => {
       try {
-        const { data, error } = await supabase.from('gas_inventory').select('*');
-        if (!error && data && data.length > 0) {
-          const pMap: { [key: string]: number } = { ...gasPrices };
-          data.forEach((row: any) => {
-            const price = Number(row.selling_price || row.unit_price || row.price) || 0;
-            if (price > 0) {
-              if (row.id === 'gas-12.5kg' || row.size?.includes('12.5')) pMap['12.5kg'] = price;
-              if (row.id === 'gas-5.0kg' || row.id === 'gas-5kg' || row.size?.includes('5.0') || row.size === '5kg') pMap['5kg'] = price;
-              if (row.id === 'gas-2.3kg' || row.size?.includes('2.3')) pMap['2.3kg'] = price;
-            }
-          });
+        const pMap: { [key: string]: number } = { ...gasPrices };
+        let foundAny = false;
+
+        // 1. Try gas_inventory table
+        try {
+          const { data, error } = await supabase.from('gas_inventory').select('*');
+          if (!error && data && data.length > 0) {
+            data.forEach((row: any) => {
+              const price = Number(row.selling_price || row.unit_price || row.price) || 0;
+              if (price > 0) {
+                if (row.id === 'gas-12.5kg' || row.size?.includes('12.5')) { pMap['12.5kg'] = price; foundAny = true; }
+                if (row.id === 'gas-5.0kg' || row.id === 'gas-5kg' || row.size?.includes('5.0') || row.size === '5kg') { pMap['5kg'] = price; foundAny = true; }
+                if (row.id === 'gas-2.3kg' || row.size?.includes('2.3')) { pMap['2.3kg'] = price; foundAny = true; }
+              }
+            });
+          }
+        } catch (_) {}
+
+        // 2. Fallback / supplement with products table where category='gas' or type='gas'
+        try {
+          const { data: prodData } = await supabase.from('products').select('*');
+          if (prodData && Array.isArray(prodData)) {
+            prodData.forEach((row: any) => {
+              const name = (row.name || '').toLowerCase();
+              const cat = (row.category || row.type || '').toLowerCase();
+              const price = Number(row.selling_price || row.unit_price || row.price) || 0;
+              if (price > 0 && (cat.includes('gas') || name.includes('gas') || row.id?.startsWith('gas-'))) {
+                if (name.includes('12.5') || row.id === 'gas-12.5kg') {
+                  if (!pMap['12.5kg'] || pMap['12.5kg'] === 3690) { pMap['12.5kg'] = price; foundAny = true; }
+                }
+                if (name.includes('5.0') || name.includes('5kg') || row.id === 'gas-5.0kg' || row.id === 'gas-5kg') {
+                  if (!pMap['5kg'] || pMap['5kg'] === 1482) { pMap['5kg'] = price; foundAny = true; }
+                }
+                if (name.includes('2.3') || row.id === 'gas-2.3kg') {
+                  if (!pMap['2.3kg'] || pMap['2.3kg'] === 694) { pMap['2.3kg'] = price; foundAny = true; }
+                }
+              }
+            });
+          }
+        } catch (_) {}
+
+        if (foundAny) {
           setGasPrices(prev => ({ ...prev, ...pMap }));
           try {
             localStorage.setItem('fuel_flow_gas_prices', JSON.stringify(pMap));
@@ -759,34 +790,89 @@ export default function AdminControlTab({
         detail: { updatedInventory: currentGasList }
       }));
 
-      // 4. Update Supabase gas_inventory table with fallback strategy
+      // 4. Update Supabase gas_inventory table with flexible column mapping and insert if missing
       let sbGasSuccess = false;
       let sbGasErrorMsg = '';
+
+      const targetSizes = [
+        { id: 'gas-12.5kg', size: '12.5 kg', price: gasPrices['12.5kg'] },
+        { id: 'gas-5.0kg', size: '5.0 kg', price: gasPrices['5kg'] },
+        { id: 'gas-2.3kg', size: '2.3 kg', price: gasPrices['2.3kg'] }
+      ];
+
       try {
-        const upsertPayload = [
-          { id: 'gas-12.5kg', size: '12.5 kg', selling_price: gasPrices['12.5kg'], unit_price: gasPrices['12.5kg'], last_updated: new Date().toISOString() },
-          { id: 'gas-5.0kg', size: '5.0 kg', selling_price: gasPrices['5kg'], unit_price: gasPrices['5kg'], last_updated: new Date().toISOString() },
-          { id: 'gas-2.3kg', size: '2.3 kg', selling_price: gasPrices['2.3kg'], unit_price: gasPrices['2.3kg'], last_updated: new Date().toISOString() }
-        ];
-        const { error: upsertErr } = await supabase.from('gas_inventory').upsert(upsertPayload);
+        // Fetch existing gas_inventory records to preserve counts or prepare insertion
+        const { data: existingGasRows } = await supabase.from('gas_inventory').select('*');
+        const existingMap = new Map((existingGasRows || []).map((r: any) => [r.id || r.size, r]));
+
+        const upsertPayload = targetSizes.map(item => {
+          const existing = existingMap.get(item.id) || existingMap.get(item.size);
+          return {
+            id: item.id,
+            size: item.size,
+            full_count: existing?.full_count ?? 0,
+            empty_count: existing?.empty_count ?? 0,
+            selling_price: item.price,
+            unit_price: item.price,
+            price: item.price,
+            last_updated: new Date().toISOString()
+          };
+        });
+
+        // 4a. Upsert with both selling_price and unit_price
+        const { error: upsertErr } = await supabase.from('gas_inventory').upsert(upsertPayload, { onConflict: 'id' });
         if (upsertErr) {
           // Retry with selling_price only
-          const fbPayload = [
-            { id: 'gas-12.5kg', size: '12.5 kg', selling_price: gasPrices['12.5kg'] },
-            { id: 'gas-5.0kg', size: '5.0 kg', selling_price: gasPrices['5kg'] },
-            { id: 'gas-2.3kg', size: '2.3 kg', selling_price: gasPrices['2.3kg'] }
-          ];
-          const { error: fbErr } = await supabase.from('gas_inventory').upsert(fbPayload);
-          if (fbErr) {
+          const spPayload = targetSizes.map(item => {
+            const existing = existingMap.get(item.id) || existingMap.get(item.size);
+            return {
+              id: item.id,
+              size: item.size,
+              full_count: existing?.full_count ?? 0,
+              empty_count: existing?.empty_count ?? 0,
+              selling_price: item.price,
+              last_updated: new Date().toISOString()
+            };
+          });
+          const { error: spErr } = await supabase.from('gas_inventory').upsert(spPayload, { onConflict: 'id' });
+
+          if (spErr) {
             // Retry with unit_price only
-            const unitPayload = [
-              { id: 'gas-12.5kg', size: '12.5 kg', unit_price: gasPrices['12.5kg'] },
-              { id: 'gas-5.0kg', size: '5.0 kg', unit_price: gasPrices['5kg'] },
-              { id: 'gas-2.3kg', size: '2.3 kg', unit_price: gasPrices['2.3kg'] }
-            ];
-            const { error: unitErr } = await supabase.from('gas_inventory').upsert(unitPayload);
-            if (!unitErr) sbGasSuccess = true;
-            else sbGasErrorMsg = unitErr.message || String(unitErr);
+            const upPayload = targetSizes.map(item => {
+              const existing = existingMap.get(item.id) || existingMap.get(item.size);
+              return {
+                id: item.id,
+                size: item.size,
+                full_count: existing?.full_count ?? 0,
+                empty_count: existing?.empty_count ?? 0,
+                unit_price: item.price,
+                last_updated: new Date().toISOString()
+              };
+            });
+            const { error: upErr } = await supabase.from('gas_inventory').upsert(upPayload, { onConflict: 'id' });
+            if (!upErr) {
+              sbGasSuccess = true;
+            } else {
+              // Row-by-row fallback update/insert
+              let anySuccess = false;
+              for (const item of targetSizes) {
+                const { error: updateErr } = await supabase
+                  .from('gas_inventory')
+                  .update({ selling_price: item.price, unit_price: item.price, last_updated: new Date().toISOString() })
+                  .or(`id.eq.${item.id},size.eq.${item.size}`);
+                if (!updateErr) {
+                  anySuccess = true;
+                } else {
+                  const { error: updateErr2 } = await supabase
+                    .from('gas_inventory')
+                    .update({ selling_price: item.price })
+                    .or(`id.eq.${item.id},size.eq.${item.size}`);
+                  if (!updateErr2) anySuccess = true;
+                }
+              }
+              if (anySuccess) sbGasSuccess = true;
+              else sbGasErrorMsg = upErr.message || String(upErr);
+            }
           } else {
             sbGasSuccess = true;
           }
@@ -798,17 +884,74 @@ export default function AdminControlTab({
         console.warn('Supabase gas_inventory price sync notice:', sbErr);
       }
 
-      // 5. Update products / lp_gas_inventory if present
+      // 5. Products Table Fallback: update and upsert corresponding LP gas item prices in products table
       try {
-        await supabase.from('products').update({ price: gasPrices['12.5kg'], selling_price: gasPrices['12.5kg'] }).ilike('name', '%12.5%');
-        await supabase.from('products').update({ price: gasPrices['5kg'], selling_price: gasPrices['5kg'] }).ilike('name', '%5.0%');
-        await supabase.from('products').update({ price: gasPrices['2.3kg'], selling_price: gasPrices['2.3kg'] }).ilike('name', '%2.3%');
-      } catch (_) {}
+        // 5a. Update products where category = 'gas' or type = 'gas' or name matches
+        await supabase
+          .from('products')
+          .update({ price: gasPrices['12.5kg'], selling_price: gasPrices['12.5kg'], unit_price: gasPrices['12.5kg'] })
+          .or('name.ilike.%12.5%,id.eq.gas-12.5kg');
+        
+        await supabase
+          .from('products')
+          .update({ price: gasPrices['5kg'], selling_price: gasPrices['5kg'], unit_price: gasPrices['5kg'] })
+          .or('name.ilike.%5.0%,name.ilike.%5kg%,id.eq.gas-5.0kg,id.eq.gas-5kg');
+
+        await supabase
+          .from('products')
+          .update({ price: gasPrices['2.3kg'], selling_price: gasPrices['2.3kg'], unit_price: gasPrices['2.3kg'] })
+          .or('name.ilike.%2.3%,id.eq.gas-2.3kg');
+
+        // 5b. Upsert into products table to ensure rows exist for gas category
+        const gasProductsToUpsert = [
+          {
+            id: 'gas-12.5kg',
+            name: 'LP Gas 12.5 kg',
+            category: 'gas',
+            type: 'gas',
+            price: gasPrices['12.5kg'],
+            selling_price: gasPrices['12.5kg'],
+            unit_price: gasPrices['12.5kg']
+          },
+          {
+            id: 'gas-5.0kg',
+            name: 'LP Gas 5.0 kg',
+            category: 'gas',
+            type: 'gas',
+            price: gasPrices['5kg'],
+            selling_price: gasPrices['5kg'],
+            unit_price: gasPrices['5kg']
+          },
+          {
+            id: 'gas-2.3kg',
+            name: 'LP Gas 2.3 kg',
+            category: 'gas',
+            type: 'gas',
+            price: gasPrices['2.3kg'],
+            selling_price: gasPrices['2.3kg'],
+            unit_price: gasPrices['2.3kg']
+          }
+        ];
+
+        const { error: prodUpsertErr } = await supabase.from('products').upsert(gasProductsToUpsert, { onConflict: 'id' });
+        if (prodUpsertErr) {
+          const simplerProdPayload = gasProductsToUpsert.map(p => ({
+            id: p.id,
+            name: p.name,
+            category: p.category,
+            price: p.price,
+            selling_price: p.selling_price
+          }));
+          await supabase.from('products').upsert(simplerProdPayload, { onConflict: 'id' });
+        }
+      } catch (prodErr) {
+        console.warn('Products table gas price sync notice:', prodErr);
+      }
 
       if (sbGasSuccess || !sbGasErrorMsg) {
-        showToast('✓ LP Gas Cylinder Selling Prices Updated & Synced Successfully!');
+        showToast('✓ LP Gas Cylinder Selling Prices Updated & Synced to Database Successfully!');
       } else {
-        showToast(`LP Gas prices updated locally. Database sync warning: ${sbGasErrorMsg}`);
+        showToast(`LP Gas prices updated locally. Database sync notice: ${sbGasErrorMsg}`);
       }
     } catch (err: any) {
       console.error('Error updating gas prices:', err);
