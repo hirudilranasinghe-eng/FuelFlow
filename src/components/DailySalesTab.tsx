@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { Shift, Employee, FuelTank, OilTank, PumpReading, ChamberReading, ShiftCounterSales } from '../types';
 import { supabase } from '../lib/supabase';
+import DailyShiftSummary from './DailyShiftSummary';
 
 interface DailySalesTabProps {
   shiftHistory?: Shift[];
@@ -96,6 +97,8 @@ export default function DailySalesTab({
   const [endDate, setEndDate] = useState<string>('');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'completed' | 'active'>('all');
+  const [viewMode, setViewMode] = useState<'ledger' | 'summary_report'>('ledger');
+  const [selectedSummaryShiftId, setSelectedSummaryShiftId] = useState<string>('');
 
   // Slide-over / modal state for single shift audit
   const [selectedShiftRecord, setSelectedShiftRecord] = useState<IndividualShiftRecord | null>(null);
@@ -990,22 +993,61 @@ export default function DailySalesTab({
             </p>
           </div>
 
-          {/* Action buttons (Export) */}
-          <div className="flex items-center gap-2 shrink-0">
-            <button
-              id="btn-export-daily-sales-csv"
-              onClick={exportMasterShiftsCSV}
-              disabled={filteredShiftRecords.length === 0}
-              className="inline-flex items-center gap-2 px-3.5 py-1.5 bg-slate-900 hover:bg-black text-white rounded-xl text-xs font-bold transition-all shadow-xs cursor-pointer disabled:opacity-50"
-            >
-              <Download className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Export</span>
-            </button>
+          {/* View Mode Toggle Tabs & Action buttons */}
+          <div className="flex items-center gap-2 shrink-0 flex-wrap">
+            <div className="inline-flex rounded-xl bg-gray-100 p-0.5 text-xs font-semibold">
+              <button
+                onClick={() => setViewMode('ledger')}
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all cursor-pointer ${
+                  viewMode === 'ledger'
+                    ? 'bg-white text-slate-900 font-bold shadow-2xs'
+                    : 'text-gray-600 hover:text-gray-900'
+                }`}
+              >
+                <BarChart3 className="w-3.5 h-3.5" />
+                <span>Shift Ledger</span>
+              </button>
+              <button
+                onClick={() => setViewMode('summary_report')}
+                className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg transition-all cursor-pointer ${
+                  viewMode === 'summary_report'
+                    ? 'bg-indigo-600 text-white font-bold shadow-2xs'
+                    : 'text-gray-600 hover:text-gray-900'
+                }`}
+              >
+                <FileText className="w-3.5 h-3.5" />
+                <span>Comprehensive Shift Summary Report</span>
+              </button>
+            </div>
+
+            {viewMode === 'ledger' && (
+              <button
+                id="btn-export-daily-sales-csv"
+                onClick={exportMasterShiftsCSV}
+                disabled={filteredShiftRecords.length === 0}
+                className="inline-flex items-center gap-2 px-3.5 py-1.5 bg-slate-900 hover:bg-black text-white rounded-xl text-xs font-bold transition-all shadow-xs cursor-pointer disabled:opacity-50"
+              >
+                <Download className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Export</span>
+              </button>
+            )}
           </div>
         </div>
+      </div>
 
-        {/* Date Filter, Status Toggle & Search Controls Bar */}
-        <div className="flex flex-wrap items-center justify-between gap-3 bg-white p-2.5 sm:p-3 rounded-2xl border border-gray-200/80 shadow-2xs">
+      {viewMode === 'summary_report' ? (
+        <DailyShiftSummary
+          shifts={supabaseShifts.length > 0 ? supabaseShifts : shiftHistory}
+          selectedShiftId={selectedSummaryShiftId || selectedShiftRecord?.id}
+          onSelectShiftId={(id) => setSelectedSummaryShiftId(id)}
+          tanks={tanks}
+          employees={employees}
+          onBack={() => setViewMode('ledger')}
+        />
+      ) : (
+        <>
+          {/* Date Filter, Status Toggle & Search Controls Bar */}
+          <div className="flex flex-wrap items-center justify-between gap-3 bg-white p-2.5 sm:p-3 rounded-2xl border border-gray-200/80 shadow-2xs">
           {/* Left: Date Range Filter & Status Filter */}
           <div className="flex flex-wrap items-center gap-2">
             {/* Dual Date Picker */}
@@ -1149,7 +1191,6 @@ export default function DailySalesTab({
             </span>
           </div>
         </div>
-      </div>
 
       {/* ========================================================================= */}
       {/* 2. INDIVIDUAL SHIFT LEDGER TABLE (1 Shift = 1 Distinct Row) */}
@@ -1322,6 +1363,8 @@ export default function DailySalesTab({
           </div>
         )}
       </div>
+      </>
+      )}
 
       {/* ========================================================================= */}
       {/* 3. FULL-SCREEN INDIVIDUAL SHIFT BREAKDOWN VIEW (Single Shift Audit) */}
@@ -1365,6 +1408,19 @@ export default function DailySalesTab({
 
             {/* Top Right Actions */}
             <div className="flex items-center gap-2">
+              <button
+                onClick={() => {
+                  setSelectedSummaryShiftId(selectedShiftRecord.id);
+                  setViewMode('summary_report');
+                  setSelectedShiftRecord(null);
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold transition-all shadow-xs cursor-pointer"
+                title="View Comprehensive Shift Summary Report"
+              >
+                <FileText className="w-3.5 h-3.5" />
+                <span>Comprehensive Summary Sheet</span>
+              </button>
+
               <button
                 onClick={() => exportSingleShiftDetailCSV(selectedShiftRecord)}
                 className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-slate-900 hover:bg-black text-white rounded-xl text-xs font-bold transition-all shadow-xs cursor-pointer"

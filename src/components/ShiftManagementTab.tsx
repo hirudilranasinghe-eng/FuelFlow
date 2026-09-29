@@ -74,6 +74,17 @@ export function sortPumpReadingsNaturally<T extends { pumpName?: string; pumpId?
   });
 }
 
+// Local date string formatter helper (YYYY-MM-DD)
+export const getLocalDateString = (dateInput?: Date | string | null): string => {
+  const d = dateInput ? new Date(dateInput) : new Date();
+  if (isNaN(d.getTime())) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const year = d.getFullYear();
+  const month = pad(d.getMonth() + 1);
+  const day = pad(d.getDate());
+  return `${year}-${month}-${day}`;
+};
+
 export default function ShiftManagementTab({
   employees,
   tanks,
@@ -101,6 +112,7 @@ export default function ShiftManagementTab({
   const [isStartShiftOpen, setIsStartShiftOpen] = useState(false);
   
   // New Shift Setup Form State
+  const [shiftStartDate, setShiftStartDate] = useState<string>(() => getLocalDateString());
   const [newShiftTemplate, setNewShiftTemplate] = useState<'Morning' | 'Evening' | 'Night' | 'Custom'>('Morning');
   const [shiftNameInput, setShiftNameInput] = useState('Morning Shift');
   const [startTimeInput, setStartTimeInput] = useState('06:00');
@@ -2658,7 +2670,18 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
 
   // Handle opening shift submission
   const handleStartNewShiftSubmit = () => {
-    const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    let y = new Date().getFullYear();
+    let m = String(new Date().getMonth() + 1).padStart(2, '0');
+    let d = String(new Date().getDate()).padStart(2, '0');
+
+    if (shiftStartDate && /^\d{4}-\d{2}-\d{2}$/.test(shiftStartDate)) {
+      const parts = shiftStartDate.split('-');
+      y = parseInt(parts[0], 10);
+      m = parts[1];
+      d = parts[2];
+    }
+
+    const dateStr = `${y}${m}${d}`;
     const randSuffix = Math.floor(10 + Math.random() * 90);
     const newShiftId = `SH-${dateStr}-${randSuffix}`;
 
@@ -2687,10 +2710,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
     });
 
     const combinedShiftName = 'Full Day Shift (08:00 AM - 08:00 AM)';
-
-    const now = new Date();
-    const datePart = now.toISOString().slice(0, 10);
-    const fullISOStart = `${datePart}T08:00:00`;
+    const selectedDateObj = new Date(Number(y), Number(m) - 1, Number(d), 8, 0, 0);
+    const fullISOStart = !isNaN(selectedDateObj.getTime()) ? selectedDateObj.toISOString() : new Date().toISOString();
 
     onStartShift({
       id: newShiftId,
@@ -2997,7 +3018,10 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         ) : (
           <button
             id="btn-start-shift"
-            onClick={() => setIsStartShiftOpen(true)}
+            onClick={() => {
+              setShiftStartDate(getLocalDateString());
+              setIsStartShiftOpen(true);
+            }}
             className="flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-500 text-white font-bold text-sm rounded-xl hover:brightness-110 transition-all shadow-md cursor-pointer"
           >
             <Plus className="w-4 h-4" />
@@ -4726,15 +4750,33 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                 </p>
               </div>
 
+              {/* Shift Start Date Selector */}
+              <div>
+                <label className="text-xs font-bold text-gray-600 uppercase tracking-wider block mb-1.5 flex items-center gap-1.5">
+                  <Calendar className="w-3.5 h-3.5 text-gray-500" />
+                  Shift Start Date *
+                </label>
+                <div className="relative">
+                  <input
+                    type="date"
+                    value={shiftStartDate}
+                    onChange={(e) => setShiftStartDate(e.target.value)}
+                    className="w-full px-3.5 py-2.5 bg-white border border-gray-300 text-[#1C1C1C] rounded-xl text-sm font-semibold focus:outline-none focus:border-blue-500 cursor-pointer shadow-2xs"
+                    required
+                  />
+                </div>
+              </div>
+
               {/* Supervisor selection */}
               <div>
-                <label className="text-xs font-bold text-gray-600 uppercase tracking-wider block mb-1.5">
-                  Assign Supervisor
+                <label className="text-xs font-bold text-gray-600 uppercase tracking-wider block mb-1.5 flex items-center gap-1.5">
+                  <User className="w-3.5 h-3.5 text-gray-500" />
+                  Assign Supervisor *
                 </label>
                 <select
                   value={newSupervisorId}
                   onChange={(e) => setNewSupervisorId(e.target.value)}
-                  className="w-full px-3.5 py-2.5 bg-white border border-gray-300 text-[#1C1C1C] rounded-xl text-sm font-semibold focus:outline-none focus:border-blue-500"
+                  className="w-full px-3.5 py-2.5 bg-white border border-gray-300 text-[#1C1C1C] rounded-xl text-sm font-semibold focus:outline-none focus:border-blue-500 cursor-pointer"
                 >
                   <option value="" disabled>-- Select Station Supervisor --</option>
                   {supervisors.map((s) => (
@@ -4766,8 +4808,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
               </button>
               <button
                 onClick={handleStartNewShiftSubmit}
-                className="px-5 py-2 bg-gradient-to-r from-emerald-600 to-teal-500 text-white font-bold text-xs rounded-lg hover:brightness-110 transition-all cursor-pointer"
-                disabled={!newSupervisorId}
+                className="px-5 py-2 bg-gradient-to-r from-emerald-600 to-teal-500 text-white font-bold text-xs rounded-lg hover:brightness-110 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                disabled={!newSupervisorId || !shiftStartDate}
               >
                 Launch Shift
               </button>
@@ -4888,6 +4930,44 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                   }
                   return null;
                 })()}
+
+                {/* Pumper Balances & Handover Breakdown */}
+                {activePumpersData.length > 0 && (
+                  <div className="pt-2 border-t border-gray-100 space-y-2">
+                    <span className="text-[10px] font-bold text-gray-500 uppercase tracking-wider block">
+                      Pumper Shortage &amp; Excess Breakdown
+                    </span>
+                    <div className="space-y-1.5 max-h-36 overflow-y-auto">
+                      {allPumperStats.map(ps => {
+                        const isShort = ps.totalCashVariance < -0.5;
+                        const isExcess = ps.totalCashVariance > 0.5;
+                        return (
+                          <div key={ps.pumperId} className="flex items-center justify-between p-2 bg-gray-50 rounded-lg border border-gray-100 text-[11px]">
+                            <div className="flex items-center gap-1.5">
+                              <span className="w-5 h-5 rounded-full bg-indigo-100 text-indigo-700 font-bold flex items-center justify-center text-[10px]">
+                                {ps.pumperName.charAt(0)}
+                              </span>
+                              <span className="font-bold text-slate-800">{ps.pumperName}</span>
+                            </div>
+                            <div className="flex items-center gap-3">
+                              <span className="text-gray-500">Exp: {formatCurrency(ps.totalNetExpCash)}</span>
+                              <span className="font-semibold text-slate-900">Act: {formatCurrency(ps.totalActualCash)}</span>
+                              <span className={`font-bold px-1.5 py-0.5 rounded text-[10px] ${
+                                isShort ? 'bg-rose-100 text-rose-700 border border-rose-200' :
+                                isExcess ? 'bg-emerald-100 text-emerald-700 border border-emerald-200' :
+                                'bg-gray-100 text-gray-600'
+                              }`}>
+                                {isShort ? `- ${formatCurrency(Math.abs(ps.totalCashVariance))}` :
+                                 isExcess ? `+ ${formatCurrency(ps.totalCashVariance)}` :
+                                 'Balanced'}
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
 
                 <div className="flex justify-between items-center pt-2.5 border-t border-gray-100 text-xs">
                   <span className="font-extrabold text-gray-800">Consolidated System Gross Revenue:</span>

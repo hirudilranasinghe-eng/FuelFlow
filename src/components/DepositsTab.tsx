@@ -5,7 +5,7 @@
 
 import React, { useState, useMemo, useEffect } from 'react';
 import { 
-  Landmark, Plus, Search, Filter, Calendar, Clock, User, 
+  Landmark, Plus, Filter, Calendar, Clock, User, 
   Receipt, FileText, Trash2, CheckCircle2, AlertCircle, 
   ArrowUpRight, DollarSign, RefreshCw, Download,
   Building2, Wallet, ArrowDownRight, ShieldCheck, Sparkles, X
@@ -54,7 +54,7 @@ export default function DepositsTab({
 
   // Form State
   const [selectedShiftId, setSelectedShiftId] = useState<string>(activeShift?.id || '');
-  const [amount, setAmount] = useState<string>('');
+  const [depositAmount, setDepositAmount] = useState<string>('');
   const [bankName, setBankName] = useState<string>('Commercial Bank of Ceylon');
   const [customBankName, setCustomBankName] = useState<string>('');
   const [accountNumber, setAccountNumber] = useState<string>('');
@@ -123,10 +123,68 @@ export default function DepositsTab({
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [formError, setFormError] = useState<string | null>(null);
 
+  // Financial calculations for the selected target shift
+  const selectedShiftFinancials = useMemo(() => {
+    const shift = selectedShiftId === activeShift?.id
+      ? activeShift
+      : shiftHistory.find(s => s.id === selectedShiftId);
+
+    if (!shift) {
+      return {
+        grossRev: 0,
+        nonCashRev: 0,
+        expectedCash: 0,
+        alreadyBanked: 0,
+        remainingBeforeEntry: 0,
+        shiftName: 'No Shift Selected'
+      };
+    }
+
+    const readings = shift.pumpReadings || [];
+    let grossRev = 0;
+    let nonCashRev = 0;
+
+    readings.forEach(r => {
+      const fuelSold = Math.max(0, (r.endMeter || 0) - (r.startMeter || 0) - (r.testingQty || 0));
+      const fuelRev = fuelSold * (r.unitPrice || 0);
+      const oilRev = r.oilSalesAmount || 0;
+      grossRev += (fuelRev + oilRev);
+      nonCashRev += ((r.creditSalesAmount || 0) + (r.cardSalesAmount || 0) + (r.touchCardSalesAmount || 0) + (r.voucherSalesAmount || 0));
+    });
+
+    const counterSales = shift.counterSales?.totalCounterRevenue || 0;
+    grossRev += counterSales;
+
+    const expectedCash = Math.max(0, grossRev - nonCashRev);
+    const existingDeposits = bankDeposits.filter(d => d.shift_id === shift.id);
+    const alreadyBanked = existingDeposits.reduce((sum, d) => sum + (d.deposited_amount || 0), 0);
+    const remainingBeforeEntry = Math.max(0, expectedCash - alreadyBanked);
+
+    return {
+      grossRev,
+      nonCashRev,
+      expectedCash,
+      alreadyBanked,
+      remainingBeforeEntry,
+      shiftName: shift.name || shift.id
+    };
+  }, [selectedShiftId, activeShift, shiftHistory, bankDeposits]);
+
+  // Parsed single deposit amount
+  const parsedDepositAmount = useMemo(() => {
+    return parseFloat(depositAmount) || 0;
+  }, [depositAmount]);
+
+  // Remaining shift balance after applying entered deposit amount
+  const remainingShiftBalance = useMemo(() => {
+    return selectedShiftFinancials.expectedCash - (selectedShiftFinancials.alreadyBanked + parsedDepositAmount);
+  }, [selectedShiftFinancials, parsedDepositAmount]);
+
   // Filters
-  const [searchTerm, setSearchTerm] = useState<string>('');
   const [filterShiftId, setFilterShiftId] = useState<string>('all');
   const [filterBank, setFilterBank] = useState<string>('all');
+  const [filterStartDate, setFilterStartDate] = useState<string>('');
+  const [filterEndDate, setFilterEndDate] = useState<string>('');
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
 
   // Sync default shift ID & supervisor if activeShift loads or changes
@@ -144,7 +202,7 @@ export default function DepositsTab({
 
   // Reset form inputs helper
   const resetFormFields = () => {
-    setAmount('');
+    setDepositAmount('');
     setSlipNo('');
     setNotes('');
     setCustomBankName('');
@@ -184,6 +242,33 @@ export default function DepositsTab({
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isModalOpen, isSubmitting]);
+
+  // Helper to format Shift dropdown option label: SH-XXXXXXXX-XX (YYYY-MM-DD)
+  const formatShiftDropdownLabel = (s: Shift): string => {
+    let dateStr = '';
+    if (s.startTime) {
+      const d = new Date(s.startTime);
+      if (!isNaN(d.getTime())) {
+        dateStr = d.toISOString().slice(0, 10);
+      }
+    }
+    if (!dateStr && s.endTime) {
+      const d = new Date(s.endTime);
+      if (!isNaN(d.getTime())) {
+        dateStr = d.toISOString().slice(0, 10);
+      }
+    }
+    if (!dateStr && s.id && s.id.startsWith('SH-')) {
+      const parts = s.id.split('-');
+      if (parts.length >= 2 && parts[1].length === 8) {
+        dateStr = `${parts[1].slice(0, 4)}-${parts[1].slice(4, 6)}-${parts[1].slice(6, 8)}`;
+      }
+    }
+    if (!dateStr) {
+      dateStr = new Date().toISOString().slice(0, 10);
+    }
+    return `${s.id} (${dateStr})`;
+  };
 
   // Format Helpers
   const formatCurrency = (val: number) => {
@@ -244,20 +329,27 @@ export default function DepositsTab({
         if (item.bank_name !== filterBank) return false;
       }
 
-      // Search term (slip no, deposited by, notes, shift id)
-      if (searchTerm.trim()) {
-        const q = searchTerm.toLowerCase().trim();
-        const matchSlip = (item.slip_no || '').toLowerCase().includes(q);
-        const matchBy = (item.deposited_by || '').toLowerCase().includes(q);
-        const matchNotes = (item.notes || '').toLowerCase().includes(q);
-        const matchShift = (item.shift_id || '').toLowerCase().includes(q);
-        const matchBank = (item.bank_name || '').toLowerCase().includes(q);
-        if (!matchSlip && !matchBy && !matchNotes && !matchShift && !matchBank) return false;
+      // Date range filter
+      if (filterStartDate || filterEndDate) {
+        const itemDateStr = item.deposit_date || item.created_at;
+        if (itemDateStr) {
+          const itemDate = new Date(itemDateStr);
+          if (!isNaN(itemDate.getTime())) {
+            if (filterStartDate) {
+              const start = new Date(`${filterStartDate}T00:00:00`);
+              if (itemDate < start) return false;
+            }
+            if (filterEndDate) {
+              const end = new Date(`${filterEndDate}T23:59:59.999`);
+              if (itemDate > end) return false;
+            }
+          }
+        }
       }
 
       return true;
     });
-  }, [bankDeposits, filterShiftId, filterBank, searchTerm, activeShift]);
+  }, [bankDeposits, filterShiftId, filterBank, filterStartDate, filterEndDate, activeShift]);
 
   // Ledger Summary Totals
   const totalFilteredAmount = useMemo(() => {
@@ -268,18 +360,13 @@ export default function DepositsTab({
     return bankDeposits.reduce((acc, curr) => acc + (curr.deposited_amount || 0), 0);
   }, [bankDeposits]);
 
-  // Handle Quick Amount Chips
-  const handleQuickAmount = (val: number) => {
-    setAmount(String(val));
-  };
-
   // Form Submit Handler
   const handleSubmitDeposit = async (e: React.FormEvent) => {
     e.preventDefault();
     setFormError(null);
 
-    const parsedAmount = parseFloat(amount);
-    if (isNaN(parsedAmount) || parsedAmount <= 0) {
+    const amountNum = parseFloat(depositAmount);
+    if (isNaN(amountNum) || amountNum <= 0) {
       setFormError('Please enter a valid deposit amount greater than Rs. 0.00');
       return;
     }
@@ -302,7 +389,7 @@ export default function DepositsTab({
       await onAddDeposit({
         shift_id: selectedShiftId,
         shift_name: selectedShiftObj?.name || 'Standard Shift',
-        deposited_amount: parsedAmount,
+        deposited_amount: amountNum,
         deposited_by: depositedBy.trim() || user?.name || 'Supervisor',
         bank_name: finalBankName,
         account_number: accountNumber.trim(),
@@ -318,7 +405,7 @@ export default function DepositsTab({
       // Trigger global banner toast
       setToastMessage({
         type: 'success',
-        text: `✓ Successfully recorded deposit of ${formatCurrency(parsedAmount)} to ${finalBankName}`
+        text: `✓ Successfully recorded deposit of ${formatCurrency(amountNum)} to ${finalBankName}`
       });
 
       setTimeout(() => {
@@ -350,20 +437,58 @@ export default function DepositsTab({
   // Export CSV
   const handleExportCSV = () => {
     if (filteredDeposits.length === 0) return;
-    const headers = ['Deposit ID', 'Date & Time', 'Shift ID', 'Shift Name', 'Bank Name', 'Slip / Ref No', 'Deposited By', 'Amount (Rs)', 'Notes'];
-    const rows = filteredDeposits.map(d => [
-      d.id || '',
-      new Date(d.deposit_date || d.created_at || '').toLocaleString(),
-      d.shift_id,
-      d.shift_name || '',
-      `"${d.bank_name || ''}"`,
-      `"${d.slip_no || ''}"`,
-      `"${d.deposited_by || ''}"`,
-      d.deposited_amount,
-      `"${(d.notes || '').replace(/"/g, '""')}"`
-    ]);
+    const headers = [
+      'Deposit ID',
+      'Date & Time',
+      'Shift ID',
+      'Shift Name',
+      'Bank Name',
+      'Slip / Ref No',
+      'Deposited By',
+      'Amount (Rs)',
+      'Notes'
+    ];
 
-    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
+    const escapeCsv = (val: any): string => {
+      if (val === null || val === undefined) return '""';
+      const str = String(val);
+      return `"${str.replace(/"/g, '""')}"`;
+    };
+
+    const formatCsvDateTime = (dateStr?: string | null): string => {
+      if (!dateStr) return '';
+      const d = new Date(dateStr);
+      if (isNaN(d.getTime())) return String(dateStr);
+      const pad = (n: number) => String(n).padStart(2, '0');
+      const year = d.getFullYear();
+      const month = pad(d.getMonth() + 1);
+      const day = pad(d.getDate());
+      let hours = d.getHours();
+      const minutes = pad(d.getMinutes());
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      hours = hours % 12;
+      hours = hours ? hours : 12;
+      const formattedHours = pad(hours);
+      return `${year}-${month}-${day} ${formattedHours}:${minutes} ${ampm}`;
+    };
+
+    const rows = filteredDeposits.map(d => {
+      const formattedDate = formatCsvDateTime(d.deposit_date || d.created_at);
+      const amountVal = Number(d.deposited_amount) || 0;
+      return [
+        escapeCsv(d.id || ''),
+        escapeCsv(formattedDate),
+        escapeCsv(d.shift_id || ''),
+        escapeCsv(d.shift_name || ''),
+        escapeCsv(d.bank_name || ''),
+        escapeCsv(d.slip_no || ''),
+        escapeCsv(d.deposited_by || ''),
+        amountVal.toFixed(2),
+        escapeCsv(d.notes || '')
+      ];
+    });
+
+    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.map(h => `"${h}"`).join(','), ...rows.map(e => e.join(','))].join('\n');
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
     link.setAttribute('href', encodedUri);
@@ -470,9 +595,15 @@ export default function DepositsTab({
               className="px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
             >
               <option value="all">All Shifts</option>
-              {activeShift && <option value="active">Active Shift Only ({activeShift.id})</option>}
+              {activeShift && (
+                <option value="active">
+                  {formatShiftDropdownLabel(activeShift)}
+                </option>
+              )}
               {shiftHistory.map(s => (
-                <option key={`filter-${s.id}`} value={s.id}>Shift {s.id} ({s.name})</option>
+                <option key={`filter-${s.id}`} value={s.id}>
+                  {formatShiftDropdownLabel(s)}
+                </option>
               ))}
             </select>
 
@@ -488,16 +619,37 @@ export default function DepositsTab({
               ))}
             </select>
 
-            {/* Search Bar */}
-            <div className="relative">
-              <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+            {/* Date Range Filters */}
+            <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1">
+              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">From:</span>
               <input
-                type="text"
-                placeholder="Search slips, deposited by..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                className="pl-8 pr-3 py-1.5 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-800 placeholder:text-slate-400 focus:outline-none focus:bg-white focus:ring-2 focus:ring-emerald-500/20 w-44 sm:w-56"
+                type="date"
+                value={filterStartDate}
+                onChange={(e) => setFilterStartDate(e.target.value)}
+                className="bg-transparent text-xs font-semibold text-slate-700 focus:outline-none cursor-pointer"
+                title="Filter Start Date"
               />
+              <span className="text-slate-300">|</span>
+              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">To:</span>
+              <input
+                type="date"
+                value={filterEndDate}
+                onChange={(e) => setFilterEndDate(e.target.value)}
+                className="bg-transparent text-xs font-semibold text-slate-700 focus:outline-none cursor-pointer"
+                title="Filter End Date"
+              />
+              {(filterStartDate || filterEndDate) && (
+                <button
+                  onClick={() => {
+                    setFilterStartDate('');
+                    setFilterEndDate('');
+                  }}
+                  className="text-slate-400 hover:text-slate-600 p-0.5 ml-0.5 rounded cursor-pointer"
+                  title="Clear Date Filters"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -527,17 +679,14 @@ export default function DepositsTab({
             <table className="w-full text-left border-collapse text-xs">
               <thead>
                 <tr className="border-b border-slate-100 bg-slate-50/80 text-[10px] font-extrabold text-slate-500 uppercase tracking-wider sticky top-0 z-10 backdrop-blur-xs">
-                  <th className="py-3 px-4">Date & Time</th>
-                  <th className="py-3 px-3">Shift ID</th>
-                  <th className="py-3 px-4">Destination & Slip Ref</th>
-                  <th className="py-3 px-4">Deposited By</th>
-                  <th className="py-3 px-4 text-right">Amount (LKR)</th>
-                  <th className="py-3 px-3 text-center">Action</th>
+                  <th className="py-2 px-3.5">Date & Time</th>
+                  <th className="py-2 px-3.5">Destination & Slip Ref</th>
+                  <th className="py-2 px-3.5">Deposited By</th>
+                  <th className="py-2 px-3.5 text-right">Amount (LKR)</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {filteredDeposits.map((item) => {
-                  const isActive = activeShift && item.shift_id === activeShift.id;
                   const dateFormatted = new Date(item.deposit_date || item.created_at || '').toLocaleString('en-LK', {
                     year: 'numeric',
                     month: 'short',
@@ -551,83 +700,40 @@ export default function DepositsTab({
                       key={item.id || `row-${Math.random()}`}
                       className="hover:bg-slate-50/70 transition-colors group"
                     >
-                      <td className="py-3.5 px-4 whitespace-nowrap">
-                        <div className="font-extrabold text-slate-800 text-xs">{dateFormatted}</div>
+                      <td className="py-1.5 px-3.5 whitespace-nowrap">
+                        <div className="font-extrabold text-slate-800 text-xs leading-tight">{dateFormatted}</div>
                         {item.notes && (
-                          <div className="text-[11px] text-slate-400 truncate max-w-xs mt-0.5" title={item.notes}>
+                          <div className="text-[10.5px] text-slate-400 truncate max-w-xs mt-0.5" title={item.notes}>
                             {item.notes}
                           </div>
                         )}
                       </td>
 
-                      <td className="py-3.5 px-3 whitespace-nowrap">
-                        <span className={`px-2.5 py-1 rounded-lg font-extrabold text-[11px] tabular-nums border ${
-                          isActive 
-                            ? 'bg-emerald-50 text-emerald-800 border-emerald-200' 
-                            : 'bg-slate-100 text-slate-600 border-slate-200'
-                        }`}>
-                          {item.shift_id}
-                        </span>
-                        {item.shift_name && (
-                          <span className="block text-[10px] text-slate-400 mt-0.5 font-medium">
-                            {item.shift_name}
-                          </span>
-                        )}
-                      </td>
-
-                      <td className="py-3.5 px-4">
-                        <div className="font-extrabold text-slate-900 text-xs flex items-center gap-1.5">
+                      <td className="py-1.5 px-3.5">
+                        <div className="font-extrabold text-slate-900 text-xs flex items-center gap-1.5 leading-tight">
                           <Building2 className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                          <span className="truncate max-w-[200px]">{item.bank_name || 'Commercial Bank'}</span>
+                          <span className="truncate max-w-[220px]">{item.bank_name || 'Commercial Bank'}</span>
                         </div>
-                        <div className="text-[11px] font-medium text-slate-500 flex items-center gap-1 mt-0.5">
+                        <div className="text-[10.5px] font-medium text-slate-500 flex items-center gap-1 mt-0.5">
                           <Receipt className="w-3 h-3 text-slate-400 shrink-0" />
                           <span>{item.slip_no ? `Slip: ${item.slip_no}` : 'No slip attached'}</span>
                           {item.account_number && <span className="text-slate-400">({item.account_number})</span>}
                         </div>
                       </td>
 
-                      <td className="py-3.5 px-4 whitespace-nowrap">
-                        <div className="flex items-center gap-2 font-bold text-slate-700 text-xs">
-                          <div className="w-6 h-6 rounded-full bg-slate-200 text-slate-700 flex items-center justify-center font-black text-[10px]">
+                      <td className="py-1.5 px-3.5 whitespace-nowrap">
+                        <div className="flex items-center gap-1.5 font-bold text-slate-700 text-xs">
+                          <div className="w-5 h-5 rounded-full bg-slate-200 text-slate-700 flex items-center justify-center font-black text-[9.5px]">
                             {(item.deposited_by || 'S').charAt(0)}
                           </div>
-                          <span className="truncate max-w-[130px]">{item.deposited_by || 'Supervisor'}</span>
+                          <span className="truncate max-w-[150px]">{item.deposited_by || 'Supervisor'}</span>
                         </div>
                       </td>
 
-                      <td className="py-3.5 px-4 text-right whitespace-nowrap">
-                        <span className="font-black text-emerald-700 tabular-nums text-sm">
+                      <td className="py-1.5 px-3.5 text-right whitespace-nowrap">
+                        <span className="font-black text-emerald-700 tabular-nums text-xs sm:text-sm">
                           {formatCurrency(item.deposited_amount || 0)}
                         </span>
-                      </td>
-
-                      <td className="py-3.5 px-3 text-center whitespace-nowrap">
-                        {deleteConfirmId === item.id ? (
-                          <div className="flex items-center justify-center gap-1">
-                            <button
-                              onClick={() => item.id && handleDelete(item.id, item.shift_id)}
-                              className="px-2 py-1 bg-red-600 text-white font-extrabold text-[10px] rounded-lg hover:bg-red-700 cursor-pointer shadow-2xs"
-                              title="Confirm Delete"
-                            >
-                              Delete
-                            </button>
-                            <button
-                              onClick={() => setDeleteConfirmId(null)}
-                              className="px-2 py-1 bg-slate-200 text-slate-700 font-extrabold text-[10px] rounded-lg hover:bg-slate-300 cursor-pointer"
-                            >
-                              Cancel
-                            </button>
-                          </div>
-                        ) : (
-                          <button
-                            onClick={() => setDeleteConfirmId(item.id || null)}
-                            className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all cursor-pointer opacity-70 group-hover:opacity-100"
-                            title="Delete Deposit Record"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        )}
                       </td>
                     </tr>
                   );
@@ -716,44 +822,73 @@ export default function DepositsTab({
                   >
                     {activeShift && (
                       <option value={activeShift.id}>
-                        Active Shift: {activeShift.id} ({activeShift.name})
+                        {formatShiftDropdownLabel(activeShift)} (Active)
                       </option>
                     )}
                     {shiftHistory.map(s => (
                       <option key={s.id} value={s.id}>
-                        Past Shift: {s.id} ({s.name}) — {new Date(s.startTime).toLocaleDateString()}
+                        {formatShiftDropdownLabel(s)}
                       </option>
                     ))}
                   </select>
                 </div>
 
-                {/* Deposit Amount Field */}
+                {/* Selected Shift Expected Cash & Banking Summary Card */}
+                <div className="p-3 bg-blue-50/70 border border-blue-200/80 rounded-xl grid grid-cols-3 gap-2 text-center">
+                  <div className="border-r border-blue-200/60 pr-1">
+                    <span className="text-[9.5px] font-bold text-slate-500 uppercase tracking-wider block">
+                      Shift Expected Cash
+                    </span>
+                    <span className="text-xs font-extrabold text-blue-800 tabular-nums block mt-0.5">
+                      {formatCurrency(selectedShiftFinancials.expectedCash)}
+                    </span>
+                  </div>
+                  <div className="border-r border-blue-200/60 px-1">
+                    <span className="text-[9.5px] font-bold text-slate-500 uppercase tracking-wider block">
+                      Already Banked
+                    </span>
+                    <span className="text-xs font-bold text-slate-700 tabular-nums block mt-0.5">
+                      {formatCurrency(selectedShiftFinancials.alreadyBanked)}
+                    </span>
+                  </div>
+                  <div className="pl-1">
+                    <span className="text-[9.5px] font-bold text-slate-500 uppercase tracking-wider block">
+                      Current Unbanked
+                    </span>
+                    <span className="text-xs font-black text-emerald-700 tabular-nums block mt-0.5">
+                      {formatCurrency(selectedShiftFinancials.remainingBeforeEntry)}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Deposit Amount (Rs.) Entry & Live Shift Reconciliation */}
                 <div>
                   <div className="flex items-center justify-between mb-1">
                     <label className="block text-[11px] font-extrabold text-slate-700 uppercase tracking-wider">
                       Deposit Amount (Rs.) *
                     </label>
-                    {activeShiftStats && activeShiftStats.remainingCashInHand > 0 && (
-                      <button
-                        type="button"
-                        onClick={() => handleQuickAmount(Math.round(activeShiftStats.remainingCashInHand))}
-                        className="text-[10px] font-bold text-emerald-700 hover:text-emerald-800 hover:underline cursor-pointer"
-                      >
-                        Safe Balance: {formatCurrency(activeShiftStats.remainingCashInHand)}
-                      </button>
-                    )}
+                    <span className="text-[11px] font-bold text-slate-500">
+                      Remaining Shift Balance:{' '}
+                      <span className={`font-black tabular-nums ${remainingShiftBalance < 0 ? 'text-amber-600' : 'text-emerald-700'}`}>
+                        {remainingShiftBalance < 0 
+                          ? `Over-banked: ${formatCurrency(Math.abs(remainingShiftBalance))}`
+                          : formatCurrency(remainingShiftBalance)}
+                      </span>
+                    </span>
                   </div>
                   <div className="relative">
-                    <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 font-extrabold text-sm">Rs.</span>
+                    <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 font-extrabold text-xs">
+                      Rs.
+                    </span>
                     <input
                       type="number"
                       min="1"
                       step="0.01"
                       placeholder="0.00"
-                      value={amount}
-                      onChange={(e) => setAmount(e.target.value)}
+                      value={depositAmount}
+                      onChange={(e) => setDepositAmount(e.target.value)}
                       autoFocus
-                      className="w-full pl-11 pr-3 py-2.5 bg-white border border-slate-300 rounded-xl text-base font-black text-slate-900 tabular-nums placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/30 focus:border-emerald-600 shadow-2xs"
+                      className="w-full pl-10 pr-3 py-2.5 bg-white border border-slate-300 rounded-xl text-sm font-black text-slate-900 tabular-nums placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/30 focus:border-emerald-600 shadow-2xs"
                       required
                     />
                   </div>
@@ -809,7 +944,8 @@ export default function DepositsTab({
                 {/* Deposited By & Date/Time */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div>
-                    <label className="block text-[11px] font-extrabold text-slate-700 uppercase tracking-wider mb-1">
+                    <label className="block text-[11px] font-extrabold text-slate-700 uppercase tracking-wider mb-1 flex items-center gap-1.5">
+                      <User className="w-3.5 h-3.5 text-slate-500" />
                       Deposited By *
                     </label>
                     <select
@@ -827,15 +963,19 @@ export default function DepositsTab({
                   </div>
 
                   <div>
-                    <label className="block text-[11px] font-extrabold text-slate-700 uppercase tracking-wider mb-1">
-                      Date & Time
+                    <label className="block text-[11px] font-extrabold text-slate-700 uppercase tracking-wider mb-1 flex items-center gap-1.5">
+                      <Calendar className="w-3.5 h-3.5 text-slate-500" />
+                      Deposit Date & Time *
                     </label>
-                    <input
-                      type="datetime-local"
-                      value={depositDateTime}
-                      onChange={(e) => setDepositDateTime(e.target.value)}
-                      className="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-600"
-                    />
+                    <div className="relative">
+                      <input
+                        type="datetime-local"
+                        value={depositDateTime}
+                        onChange={(e) => setDepositDateTime(e.target.value)}
+                        className="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-600 cursor-pointer shadow-2xs"
+                        required
+                      />
+                    </div>
                   </div>
                 </div>
 

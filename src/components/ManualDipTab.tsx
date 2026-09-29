@@ -9,14 +9,15 @@ import {
   TrendingUp, TrendingDown, X, CheckCircle2, Eye, Calendar,
   Clock, User, FileText, Check, ArrowUpDown, ChevronRight,
   Truck, Layers, Gauge, ShieldCheck, Fuel, ArrowRight,
-  Sparkles, CheckCircle, HelpCircle, Activity
+  Sparkles, CheckCircle, HelpCircle, Activity, AlertCircle
 } from 'lucide-react';
-import { FuelTank, DailyDipSession, TankDipEntry, BowserDeliveryDipData } from '../types';
+import { FuelTank, DailyDipSession, TankDipEntry, BowserDeliveryDipData, StockDelivery } from '../types';
 import { supabase } from '../lib/supabase';
 
 interface ManualDipTabProps {
   tanks?: FuelTank[];
   setTanks?: React.Dispatch<React.SetStateAction<FuelTank[]>>;
+  deliveries?: StockDelivery[];
 }
 
 const STORAGE_KEY_SESSIONS = 'fms_daily_dip_sessions';
@@ -69,7 +70,7 @@ export function estimateDipMm(volumeLiters: number, tankCapacity: number): numbe
   return Math.round((low + high) / 2);
 }
 
-export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
+export default function ManualDipTab({ tanks = [], deliveries = [] }: ManualDipTabProps) {
   const [sessions, setSessions] = useState<DailyDipSession[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -79,11 +80,24 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
   const [isBowserDipModalOpen, setIsBowserDipModalOpen] = useState<boolean>(false);
   const [selectedDetailSession, setSelectedDetailSession] = useState<DailyDipSession | null>(null);
   
+  // Stock Deliveries / Purchases State
+  const [stockDeliveries, setStockDeliveries] = useState<StockDelivery[]>(deliveries || []);
+  const [selectedPurchaseInvoiceId, setSelectedPurchaseInvoiceId] = useState<string>('');
+
   // Search & Filter
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedShiftFilter, setSelectedShiftFilter] = useState<string>('all');
-  const [typeFilter, setTypeFilter] = useState<'all' | 'daily_routine' | 'bowser_delivery'>('all');
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [typeFilter, setTypeFilter] = useState<'daily_routine' | 'bowser_delivery'>('daily_routine');
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
+
+  // Separate counts for the 2 main modes
+  const routineCount = useMemo(() => {
+    return sessions.filter(s => s.sessionType !== 'bowser_delivery' && !s.bowserAudit && !s.shift?.includes('Bowser')).length;
+  }, [sessions]);
+
+  const bowserCount = useMemo(() => {
+    return sessions.filter(s => s.sessionType === 'bowser_delivery' || !!s.bowserAudit || s.shift?.includes('Bowser')).length;
+  }, [sessions]);
 
   // Available Tanks (Naturally sorted in ascending order: Tank 01, Tank 02, etc.)
   const availableTanks = useMemo(() => {
@@ -92,6 +106,54 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
       (a.name || a.id || '').localeCompare(b.name || b.id || '', undefined, { numeric: true, sensitivity: 'base' })
     );
   }, [tanks]);
+
+  // Sync deliveries prop
+  useEffect(() => {
+    if (deliveries && deliveries.length > 0) {
+      setStockDeliveries(deliveries);
+    }
+  }, [deliveries]);
+
+  // Fetch recent fuel stock deliveries / purchases from localStorage & Supabase
+  useEffect(() => {
+    const loadPurchases = async () => {
+      try {
+        const stored = localStorage.getItem('fms_deliveries');
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setStockDeliveries(prev => (prev.length > 0 ? prev : parsed));
+          }
+        }
+
+        const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
+        if (isConfigured) {
+          const { data, error } = await supabase
+            .from('stock_deliveries')
+            .select('*')
+            .order('date', { ascending: false });
+
+          if (!error && data && data.length > 0) {
+            const mapped: StockDelivery[] = data.map((d: any) => ({
+              id: d.id,
+              date: d.date,
+              fuelType: d.fueltype || d.fuel_type || 'Petrol 92',
+              tankId: d.tankid || d.tank_id,
+              tankName: d.tankname || d.tank_name || d.destination_tank,
+              destination_tank: d.destination_tank || d.tankname,
+              quantity: Number(d.quantity) || 0,
+              supplier: d.supplier || 'Ceylon Petroleum Corporation',
+              cost: Number(d.cost) || 0
+            }));
+            setStockDeliveries(mapped);
+          }
+        }
+      } catch (err) {
+        console.warn('Notice loading stock deliveries in ManualDipTab:', err);
+      }
+    };
+    loadPurchases();
+  }, []);
 
   // Form State for Multi-Tank Routine Entry Modal
   const [formData, setFormData] = useState({
@@ -130,10 +192,91 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
     postDipLiters: '',
   });
 
-  // Selected tank for Bowser Delivery Audit
+  // Helper to auto-detect tank from a purchase delivery record
+  const getTankForDelivery = (delivery: StockDelivery | null | undefined, tanksList: FuelTank[]): FuelTank | undefined => {
+    if (!delivery || !tanksList.length) return tanksList[0];
+    
+    // 1. Direct tank ID match
+    if (delivery.tankId) {
+      const byId = tanksList.find(t => t.id === delivery.tankId);
+      if (byId) return byId;
+    }
+
+    // 2. Tank name or destination tank match
+    const destName = (delivery.destination_tank || delivery.tankName || '').toLowerCase().trim();
+    if (destName) {
+      const byName = tanksList.find(t => 
+        t.name.toLowerCase() === destName ||
+        destName.includes(t.name.toLowerCase()) ||
+        t.name.toLowerCase().includes(destName)
+      );
+      if (byName) return byName;
+    }
+
+    // 3. Match by Fuel Grade
+    const delFuel = (delivery.fuelType || '').toLowerCase().trim();
+    if (delFuel) {
+      const byFuel = tanksList.find(t => {
+        const tankFuel = (t.fuelType || '').toLowerCase();
+        if (tankFuel === delFuel) return true;
+        if (delFuel.includes('petrol 92') || delFuel.includes('92')) return tankFuel.includes('92');
+        if (delFuel.includes('petrol 95') || delFuel.includes('95')) return tankFuel.includes('95');
+        if (delFuel.includes('super diesel')) return tankFuel.includes('super diesel');
+        if (delFuel.includes('auto diesel') || delFuel === 'diesel') return tankFuel.includes('auto diesel') || (tankFuel.includes('diesel') && !tankFuel.includes('super'));
+        return false;
+      });
+      if (byFuel) return byFuel;
+    }
+
+    return tanksList[0];
+  };
+
+  // Selected purchase invoice object strictly used for volume & tank auto-detection
+  const selectedPurchaseInvoice = useMemo(() => {
+    return (stockDeliveries || []).find(p => p.id === selectedPurchaseInvoiceId) || null;
+  }, [stockDeliveries, selectedPurchaseInvoiceId]);
+
+  // Auto-detected target tank for Bowser Delivery Audit from selected purchase invoice
   const selectedBowserTank = useMemo(() => {
+    if (selectedPurchaseInvoice) {
+      const detected = getTankForDelivery(selectedPurchaseInvoice, availableTanks);
+      if (detected) return detected;
+    }
     return availableTanks.find(t => t.id === bowserForm.tankId) || availableTanks[0];
-  }, [availableTanks, bowserForm.tankId]);
+  }, [availableTanks, selectedPurchaseInvoice, bowserForm.tankId]);
+
+  // Handle selection from recent purchases dropdown
+  const handleSelectPurchaseInvoice = (invoiceId: string) => {
+    setSelectedPurchaseInvoiceId(invoiceId);
+    const foundPurchase = (stockDeliveries || []).find(p => p.id === invoiceId);
+    if (foundPurchase) {
+      const targetTank = getTankForDelivery(foundPurchase, availableTanks);
+      const vol = foundPurchase.quantity ? String(foundPurchase.quantity) : '';
+      const fuel = (targetTank?.fuelType || foundPurchase.fuelType || '').toLowerCase();
+      const densityVal = fuel.includes('diesel') ? '0.835' : '0.745';
+      const tankCap = targetTank ? targetTank.capacity : (availableTanks[0]?.capacity || 10000);
+
+      setBowserForm(prev => {
+        const preMmNum = parseFloat(prev.preDipMm) || 0;
+        const postMmNum = parseFloat(prev.postDipMm) || 0;
+        return {
+          ...prev,
+          tankId: targetTank?.id || prev.tankId,
+          invoicedVolume: vol,
+          invoiceNo: foundPurchase.id || prev.invoiceNo,
+          density: densityVal,
+          preDipLiters: prev.preDipMm !== '' ? calculateDipVolume(preMmNum, tankCap).toString() : '',
+          postDipLiters: prev.postDipMm !== '' ? calculateDipVolume(postMmNum, tankCap).toString() : '',
+        };
+      });
+    } else {
+      setBowserForm(prev => ({
+        ...prev,
+        invoicedVolume: '',
+        invoiceNo: '',
+      }));
+    }
+  };
 
   // Open Daily Routine Dip Modal
   const handleOpenDailyDipModal = () => {
@@ -154,20 +297,22 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
 
   // Open Bowser Delivery Unload Dip Modal
   const handleOpenBowserDipModal = () => {
-    const defaultTank = availableTanks[0];
+    const firstPurchase = stockDeliveries && stockDeliveries.length > 0 ? stockDeliveries[0] : null;
+    const targetTank = getTankForDelivery(firstPurchase, availableTanks);
+    setSelectedPurchaseInvoiceId(firstPurchase?.id || '');
     
     setBowserForm({
       date: new Date().toISOString().slice(0, 10),
       time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }),
       supervisor: 'Supervisor',
-      tankId: defaultTank?.id || '',
-      invoicedVolume: '6600',
+      tankId: targetTank?.id || availableTanks[0]?.id || '',
+      invoicedVolume: firstPurchase ? String(firstPurchase.quantity) : '',
       bowserNo: '',
-      invoiceNo: '',
+      invoiceNo: firstPurchase?.id || '',
       driverName: '',
       sealIntact: true,
       waterTestNegative: true,
-      density: defaultTank?.fuelType.toLowerCase().includes('diesel') ? '0.835' : '0.745',
+      density: (targetTank?.fuelType || '').toLowerCase().includes('diesel') ? '0.835' : '0.745',
       temperature: '29.5',
       remarks: '',
       preDipMm: '',
@@ -179,24 +324,10 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
     setIsBowserDipModalOpen(true);
   };
 
-  // When Bowser Tank changes, update tank selection without pre-filling dip inputs
-  const handleBowserTankChange = (newTankId: string) => {
-    const targetTank = availableTanks.find(t => t.id === newTankId);
-    if (targetTank) {
-      setBowserForm(prev => ({
-        ...prev,
-        tankId: newTankId,
-        density: targetTank.fuelType.toLowerCase().includes('diesel') ? '0.835' : '0.745',
-      }));
-    } else {
-      setBowserForm(prev => ({ ...prev, tankId: newTankId }));
-    }
-  };
-
   // Toast Notification Trigger
-  const showToast = (msg: string) => {
-    setToastMessage(msg);
-    setTimeout(() => setToastMessage(null), 3500);
+  const showToast = (message: string, type: 'success' | 'error' | 'info' = 'success') => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 4000);
   };
 
   // Fetch Dip Sessions directly from Supabase
@@ -432,7 +563,9 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
     }
 
     const maxCapacity = selectedBowserTank.capacity;
-    const invoicedVol = parseFloat(bowserForm.invoicedVolume) || 0;
+    const invoicedVol = selectedPurchaseInvoice 
+      ? (Number(selectedPurchaseInvoice.quantity) || 0) 
+      : (parseFloat(bowserForm.invoicedVolume) || 0);
     
     const preMm = parseFloat(bowserForm.preDipMm) || 0;
     const preLiters = bowserForm.preDipLiters !== '' 
@@ -475,7 +608,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
       postMm,
       maxCapacity,
     };
-  }, [selectedBowserTank, bowserForm]);
+  }, [selectedBowserTank, selectedPurchaseInvoice, bowserForm]);
 
   // Handle Save All-Tanks Daily Routine Dip Record
   const handleSaveDailyDip = async (e: React.FormEvent) => {
@@ -516,18 +649,23 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
     } catch (_) {}
 
     setIsDailyDipModalOpen(false);
-    showToast(`Daily Dip Record (${tankEntries.length} tanks) saved successfully!`);
 
-    // Sync to Supabase
+    // Sync to Supabase with verified daily_dip_sessions schema columns
     try {
-      const payload = {
+      const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
+      if (!isConfigured) {
+        showToast(`Daily Dip Record (${tankEntries.length} tanks) saved locally! (Supabase not configured)`, 'info');
+        return;
+      }
+
+      // Exact columns matching daily_dip_sessions table schema
+      const sessionPayload = {
         id: newSession.id,
         date: newSession.date,
         time: newSession.time,
         shift: newSession.shift,
-        session_type: 'daily_routine',
         supervisor: newSession.supervisor,
-        remarks: newSession.remarks,
+        remarks: newSession.remarks || '',
         entries: newSession.entries,
         total_system_volume: newSession.totalSystemVolume,
         total_physical_dip: newSession.totalPhysicalDip,
@@ -536,15 +674,71 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
         created_at: newSession.createdAt
       };
 
-      const { error } = await supabase.from('daily_dip_sessions').insert([payload]);
-      if (error) {
-        const { error: err2 } = await supabase.from('daily_dip_records').insert([payload]);
-        if (err2) {
-          console.warn("Supabase insert notice for dip records:", err2.message);
+      // Individual entries payload for daily_dip_items if configured
+      const itemsPayload = newSession.entries.map((entry, idx) => ({
+        id: `${newSession.id}_item_${idx + 1}_${entry.tankId}`,
+        session_id: newSession.id,
+        tank_id: entry.tankId,
+        tank_name: entry.tankName,
+        fuel_type: entry.fuelType,
+        system_volume: entry.systemVolume,
+        physical_dip: entry.physicalDip,
+        variance_liters: entry.varianceLiters,
+        variance_percentage: entry.variancePercentage,
+        status: entry.status,
+        dip_mm: entry.dipMm ?? null,
+        notes: entry.notes ?? null,
+        created_at: newSession.createdAt
+      }));
+
+      let saveSuccess = false;
+      let lastErrorMessage = '';
+
+      // 1. Insert into daily_dip_sessions table
+      const { error: sessionError } = await supabase.from('daily_dip_sessions').insert([sessionPayload]);
+      if (!sessionError) {
+        saveSuccess = true;
+      } else {
+        lastErrorMessage = sessionError.message;
+        console.warn("daily_dip_sessions insert notice:", sessionError.message);
+
+        // Fallback: retry with minimal core columns (omitting optional ones)
+        const minimalPayload = {
+          id: newSession.id,
+          date: newSession.date,
+          shift: newSession.shift,
+          supervisor: newSession.supervisor,
+          remarks: newSession.remarks || '',
+          entries: newSession.entries,
+          created_at: newSession.createdAt
+        };
+        const { error: minError } = await supabase.from('daily_dip_sessions').insert([minimalPayload]);
+        if (!minError) {
+          saveSuccess = true;
+        } else {
+          lastErrorMessage = minError.message;
+          console.error("Supabase daily dip insert error:", sessionError, minError);
         }
       }
-    } catch (err) {
-      console.warn("Supabase dip insert error:", err);
+
+      // 2. Insert line items into daily_dip_items if table exists
+      try {
+        const { error: itemsError } = await supabase.from('daily_dip_items').insert(itemsPayload);
+        if (itemsError) {
+          console.log("Notice: daily_dip_items insert notice (optional):", itemsError.message);
+        }
+      } catch (errItems) {
+        console.log("Notice on daily_dip_items:", errItems);
+      }
+
+      if (saveSuccess) {
+        showToast(`Daily Dip Record (${tankEntries.length} tanks) saved to Supabase successfully!`, 'success');
+      } else {
+        showToast(`Saved locally. Supabase error: ${lastErrorMessage || 'Insert failed'}`, 'error');
+      }
+    } catch (err: any) {
+      console.error("Supabase daily dip insert exception:", err);
+      showToast(`Dip saved locally. Supabase error: ${err.message || 'Network error'}`, 'error');
     }
   };
 
@@ -553,7 +747,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
     e.preventDefault();
 
     if (!selectedBowserTank) {
-      showToast("Please select a target fuel tank.");
+      showToast("Please select a target fuel tank.", "error");
       return;
     }
 
@@ -563,12 +757,12 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
     } = bowserAuditCalculations;
 
     if (invoicedVol <= 0) {
-      showToast("Please enter a valid invoiced bowser delivery volume.");
+      showToast("Please select a valid purchase invoice to load the delivery volume.", "error");
       return;
     }
 
     if (postLiters <= preLiters && postMm <= preMm) {
-      showToast("Post-unload dip reading must be greater than pre-unload dip reading.");
+      showToast("Post-unload dip reading must be greater than pre-unload dip reading.", "error");
       return;
     }
 
@@ -632,36 +826,96 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
     } catch (_) {}
 
     setIsBowserDipModalOpen(false);
-    showToast(`Bowser Unload Audit (${selectedBowserTank.name}) saved! Variance: ${varianceLiters >= 0 ? '+' : ''}${varianceLiters.toFixed(1)} L`);
 
-    // Sync to Supabase
+    // Sync to Supabase without unknown columns
     try {
-      const payload = {
+      const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
+      if (!isConfigured) {
+        showToast(`Bowser Unload Audit (${selectedBowserTank.name}) saved locally!`, 'info');
+        return;
+      }
+
+      const primaryPayload: any = {
         id: newSession.id,
         date: newSession.date,
         time: newSession.time,
         shift: newSession.shift,
-        session_type: 'bowser_delivery',
         supervisor: newSession.supervisor,
-        remarks: newSession.remarks,
+        remarks: newSession.remarks || '',
         entries: newSession.entries,
         total_system_volume: newSession.totalSystemVolume,
         total_physical_dip: newSession.totalPhysicalDip,
         total_variance_liters: newSession.totalVarianceLiters,
         tanks_count: 1,
-        created_at: newSession.createdAt,
-        bowser_audit: bowserAuditData
+        bowser_audit: bowserAuditData,
+        created_at: newSession.createdAt
       };
 
-      const { error } = await supabase.from('daily_dip_sessions').insert([payload]);
-      if (error) {
-        const { error: err2 } = await supabase.from('daily_dip_records').insert([payload]);
-        if (err2) {
-          console.warn("Supabase insert notice for bowser dip audit:", err2.message);
+      let saveSuccess = false;
+      let lastErrorMessage = '';
+
+      const { error: err1 } = await supabase.from('daily_dip_sessions').insert([primaryPayload]);
+      if (!err1) {
+        saveSuccess = true;
+      } else {
+        lastErrorMessage = err1.message;
+        console.warn("daily_dip_sessions bowser primary insert notice:", err1.message);
+
+        // Retry without bowser_audit column if table does not have bowser_audit column
+        const fallbackPayload = {
+          id: newSession.id,
+          date: newSession.date,
+          time: newSession.time,
+          shift: newSession.shift,
+          supervisor: newSession.supervisor,
+          remarks: newSession.remarks || '',
+          entries: newSession.entries,
+          total_system_volume: newSession.totalSystemVolume,
+          total_physical_dip: newSession.totalPhysicalDip,
+          total_variance_liters: newSession.totalVarianceLiters,
+          tanks_count: 1,
+          created_at: newSession.createdAt
+        };
+
+        const { error: err2 } = await supabase.from('daily_dip_sessions').insert([fallbackPayload]);
+        if (!err2) {
+          saveSuccess = true;
+        } else {
+          lastErrorMessage = err2.message;
+          console.error("Supabase bowser dip insert error:", err1, err2);
         }
       }
-    } catch (err) {
-      console.warn("Supabase bowser dip insert error:", err);
+
+      // Also try saving item row into daily_dip_items if table exists
+      try {
+        const itemRow = {
+          id: `${newSession.id}_item_1_${selectedBowserTank.id}`,
+          session_id: newSession.id,
+          tank_id: selectedBowserTank.id,
+          tank_name: selectedBowserTank.name,
+          fuel_type: selectedBowserTank.fuelType,
+          system_volume: preLiters,
+          physical_dip: postLiters,
+          variance_liters: varianceLiters,
+          variance_percentage: variancePercentage,
+          status: tankEntry.status,
+          dip_mm: postMm,
+          notes: tankEntry.notes,
+          created_at: newSession.createdAt
+        };
+        await supabase.from('daily_dip_items').insert([itemRow]);
+      } catch (errItem) {
+        console.log("Notice for daily_dip_items bowser audit entry:", errItem);
+      }
+
+      if (saveSuccess) {
+        showToast(`Bowser Unload Audit (${selectedBowserTank.name}) saved to Supabase successfully!`, 'success');
+      } else {
+        showToast(`Saved locally. Supabase error: ${lastErrorMessage || 'Insert failed'}`, 'error');
+      }
+    } catch (err: any) {
+      console.error("Supabase bowser dip insert error:", err);
+      showToast(`Bowser Audit saved locally. Supabase error: ${err.message || 'Network error'}`, 'error');
     }
   };
 
@@ -809,10 +1063,22 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
   return (
     <div className="space-y-6 font-sans">
       {/* Toast Notification */}
-      {toastMessage && (
-        <div className="fixed top-5 right-5 z-50 bg-slate-900 text-white px-4 py-3 rounded-2xl shadow-xl flex items-center gap-2.5 text-xs font-semibold animate-in fade-in slide-in-from-top-2 duration-200">
-          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-          <span>{toastMessage}</span>
+      {toast && (
+        <div className={`fixed top-5 right-5 z-50 px-4 py-3 rounded-2xl shadow-xl flex items-center gap-2.5 text-xs font-semibold animate-in fade-in slide-in-from-top-2 duration-200 border ${
+          toast.type === 'error'
+            ? 'bg-rose-900/95 text-white border-rose-700 shadow-rose-950/20'
+            : toast.type === 'info'
+            ? 'bg-blue-900/95 text-white border-blue-700 shadow-blue-950/20'
+            : 'bg-slate-900 text-white border-slate-700 shadow-slate-950/20'
+        }`}>
+          {toast.type === 'error' ? (
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+          ) : toast.type === 'info' ? (
+            <AlertCircle className="w-4 h-4 text-blue-400 shrink-0" />
+          ) : (
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+          )}
+          <span>{toast.message}</span>
         </div>
       )}
 
@@ -849,7 +1115,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
               className="inline-flex items-center justify-center gap-1.5 px-3.5 sm:px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-xs hover:shadow-sm active:scale-95 whitespace-nowrap"
             >
               <Plus className="w-4 h-4" />
-              <span>+ Record Daily Dip Audit</span>
+              <span>Record Daily Dip Audit</span>
             </button>
 
             {/* Button 2: Bowser Unload Dip Audit */}
@@ -859,7 +1125,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
               className="inline-flex items-center justify-center gap-1.5 px-3.5 sm:px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-xs hover:shadow-sm active:scale-95 whitespace-nowrap"
             >
               <Truck className="w-4 h-4" />
-              <span>+ Bowser Unload Dip Audit</span>
+              <span>Bowser Unload Dip Audit</span>
             </button>
           </div>
         </div>
@@ -870,27 +1136,39 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
         {/* Controls Header & Type Switcher */}
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 pb-3 border-b border-gray-100">
           <div className="flex items-center gap-2 flex-wrap">
-            {/* Type Filter Tabs */}
+            {/* Type Filter Tabs (Strictly 2 Main Tabs: Routine Dips & Bowser Unload Audits) */}
             <div className="inline-flex p-1 bg-gray-100 rounded-xl text-xs font-bold">
               <button
-                onClick={() => setTypeFilter('all')}
-                className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer ${typeFilter === 'all' ? 'bg-white text-blue-600 shadow-2xs' : 'text-gray-600 hover:text-gray-900'}`}
-              >
-                All Audits ({sessions.length})
-              </button>
-              <button
                 onClick={() => setTypeFilter('daily_routine')}
-                className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${typeFilter === 'daily_routine' ? 'bg-white text-blue-600 shadow-2xs' : 'text-gray-600 hover:text-gray-900'}`}
+                className={`px-3.5 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
+                  typeFilter === 'daily_routine'
+                    ? 'bg-white text-blue-600 shadow-2xs'
+                    : 'text-gray-600 hover:text-gray-900'
+                }`}
               >
                 <Layers className="w-3.5 h-3.5" />
                 <span>Routine Dips</span>
+                <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${
+                  typeFilter === 'daily_routine' ? 'bg-blue-100 text-blue-700' : 'bg-gray-200 text-gray-600'
+                }`}>
+                  {routineCount}
+                </span>
               </button>
               <button
                 onClick={() => setTypeFilter('bowser_delivery')}
-                className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${typeFilter === 'bowser_delivery' ? 'bg-white text-amber-700 shadow-2xs' : 'text-gray-600 hover:text-gray-900'}`}
+                className={`px-3.5 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
+                  typeFilter === 'bowser_delivery'
+                    ? 'bg-white text-amber-700 shadow-2xs'
+                    : 'text-gray-600 hover:text-gray-900'
+                }`}
               >
                 <Truck className="w-3.5 h-3.5" />
                 <span>Bowser Unload Audits</span>
+                <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${
+                  typeFilter === 'bowser_delivery' ? 'bg-amber-100 text-amber-800' : 'bg-gray-200 text-gray-600'
+                }`}>
+                  {bowserCount}
+                </span>
               </button>
             </div>
           </div>
@@ -940,14 +1218,12 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
             <table className="w-full text-left text-xs">
               <thead className="bg-gray-50 font-bold text-gray-500 text-[10px] uppercase border-b border-gray-100">
                 <tr>
-                  <th className="p-3.5">Audit Date &amp; Time</th>
-                  <th className="p-3.5">Audit Type / Scope</th>
-                  <th className="p-3.5">Supervisor / Driver</th>
+                  <th className="p-3.5 w-1/4">Audit Date &amp; Time</th>
+                  <th className="p-3.5 w-1/5">Supervisor / Driver</th>
                   <th className="p-3.5">Pre-Dip Level</th>
                   <th className="p-3.5">Post-Dip / Book Level</th>
                   <th className="p-3.5 text-right">Invoiced / Received</th>
                   <th className="p-3.5 text-right">Decanting Variance</th>
-                  <th className="p-3.5 text-center">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100 font-medium text-gray-800">
@@ -963,50 +1239,35 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                   return (
                     <tr 
                       key={session.id} 
-                      className={`transition-colors group cursor-pointer ${isBowser ? 'hover:bg-amber-50/40 bg-amber-50/15' : 'hover:bg-blue-50/30'}`}
+                      className={`transition-colors group cursor-pointer ${isBowser ? 'hover:bg-amber-50/50 bg-amber-50/15' : 'hover:bg-blue-50/40'}`}
                       onClick={() => setSelectedDetailSession(session)}
                     >
                       <td className="p-3.5 whitespace-nowrap">
                         <div className="flex items-center gap-2">
-                          <Calendar className={`w-3.5 h-3.5 ${isBowser ? 'text-amber-600' : 'text-blue-600'}`} />
+                          <Calendar className={`w-3.5 h-3.5 shrink-0 ${isBowser ? 'text-amber-600' : 'text-blue-600'}`} />
                           <span className="font-bold text-slate-900">{session.date}</span>
                           <span className="text-[11px] text-gray-400 font-medium">{session.time}</span>
+                          {isBowser ? (
+                            <span className="ml-1.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 text-[10px] font-bold border border-amber-200">
+                              <Truck className="w-2.5 h-2.5" />
+                              Bowser
+                            </span>
+                          ) : (
+                            <span className="ml-1.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 text-[10px] font-semibold border border-blue-100">
+                              <Layers className="w-2.5 h-2.5" />
+                              Routine
+                            </span>
+                          )}
                         </div>
-                      </td>
-
-                      <td className="p-3.5 whitespace-nowrap">
-                        {isBowser ? (
-                          <div className="flex items-center gap-1.5">
-                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-100/80 text-amber-900 text-[11px] font-bold border border-amber-200">
-                              <Truck className="w-3 h-3 text-amber-700" />
-                              <span>Bowser Unload</span>
-                            </span>
-                            {b && (
-                              <span className="text-[11px] font-semibold text-slate-700">
-                                {b.tankName} ({b.fuelType})
-                              </span>
-                            )}
-                          </div>
-                        ) : (
-                          <div className="flex items-center gap-1.5">
-                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 text-[11px] font-semibold border border-blue-100">
-                              <Layers className="w-3 h-3" />
-                              <span>Routine Audit</span>
-                            </span>
-                            <span className="text-[11px] text-gray-500 font-medium">
-                              ({session.tanksCount || (session.entries?.length ?? 0)} Tanks)
-                            </span>
-                          </div>
-                        )}
                       </td>
 
                       <td className="p-3.5 text-gray-700 font-semibold whitespace-nowrap">
                         <div className="flex items-center gap-1.5">
-                          <User className="w-3.5 h-3.5 text-gray-400" />
-                          <span>{session.supervisor}</span>
+                          <User className="w-3.5 h-3.5 text-gray-400 shrink-0" />
+                          <span className="text-slate-900 font-bold">{session.supervisor}</span>
                         </div>
                         {isBowser && b?.bowserNo && (
-                          <div className="text-[10px] text-amber-800 font-medium pl-5">
+                          <div className="text-[10px] text-amber-800 font-medium pl-5 mt-0.5">
                             Bowser: {b.bowserNo} {b.driverName ? `• ${b.driverName}` : ''}
                           </div>
                         )}
@@ -1019,7 +1280,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                             <span className="font-bold text-slate-900 tabular-nums">
                               {b.preDipLiters.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
                             </span>
-                            <span className="text-[10px] text-gray-400 font-medium ml-1">
+                            <span className="text-[10.5px] text-gray-400 font-medium ml-1">
                               ({b.preDipMm} mm)
                             </span>
                           </div>
@@ -1037,7 +1298,7 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                             <span className="font-bold text-slate-900 tabular-nums">
                               {b.postDipLiters.toLocaleString('en-LK', { maximumFractionDigits: 1 })} L
                             </span>
-                            <span className="text-[10px] text-gray-400 font-medium ml-1">
+                            <span className="text-[10.5px] text-gray-400 font-medium ml-1">
                               ({b.postDipMm} mm)
                             </span>
                           </div>
@@ -1070,59 +1331,38 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                       <td className="p-3.5 text-right whitespace-nowrap">
                         {isBowser && b ? (
                           b.status === 'Exact Match' || Math.abs(b.varianceLiters) < 0.5 ? (
-                            <span className="inline-flex items-center gap-1 font-bold text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200 text-[11px]">
+                            <span className="inline-flex items-center gap-1 font-bold text-emerald-800 bg-emerald-50 px-2.5 py-1 rounded-md border border-emerald-200 text-[11px]">
                               <CheckCircle className="w-3 h-3 text-emerald-600" />
                               <span>Exact Match (0L)</span>
                             </span>
                           ) : b.status === 'Excess' || b.varianceLiters > 0 ? (
-                            <span className="inline-flex items-center gap-1 font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200 text-[11px]">
+                            <span className="inline-flex items-center gap-1 font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-md border border-emerald-200 text-[11px]">
                               <TrendingUp className="w-3 h-3 shrink-0" />
                               <span>Excess (+{b.varianceLiters.toFixed(1)}L)</span>
                             </span>
                           ) : (
-                            <span className="inline-flex items-center gap-1 font-bold text-rose-700 bg-rose-50 px-2 py-0.5 rounded-md border border-rose-200 text-[11px]">
+                            <span className="inline-flex items-center gap-1 font-bold text-rose-700 bg-rose-50 px-2.5 py-1 rounded-md border border-rose-200 text-[11px]">
                               <TrendingDown className="w-3 h-3 shrink-0" />
                               <span>Shortage ({b.varianceLiters.toFixed(1)}L)</span>
                             </span>
                           )
                         ) : (
                           isLoss ? (
-                            <span className="inline-flex items-center gap-1 font-bold text-rose-600 bg-rose-50 px-2 py-0.5 rounded-md border border-rose-200 text-[11px]">
+                            <span className="inline-flex items-center gap-1 font-bold text-rose-600 bg-rose-50 px-2.5 py-1 rounded-md border border-rose-200 text-[11px]">
                               <TrendingDown className="w-3 h-3 shrink-0" />
                               <span>{session.totalVarianceLiters.toFixed(1)} L ({varPct.toFixed(2)}%)</span>
                             </span>
                           ) : isGain ? (
-                            <span className="inline-flex items-center gap-1 font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200 text-[11px]">
+                            <span className="inline-flex items-center gap-1 font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-md border border-emerald-200 text-[11px]">
                               <TrendingUp className="w-3 h-3 shrink-0" />
                               <span>+{session.totalVarianceLiters.toFixed(1)} L (+{varPct.toFixed(2)}%)</span>
                             </span>
                           ) : (
-                            <span className="inline-flex items-center gap-1 font-semibold text-gray-600 bg-gray-50 px-2 py-0.5 rounded-md border border-gray-200 text-[11px]">
+                            <span className="inline-flex items-center gap-1 font-semibold text-gray-600 bg-gray-50 px-2.5 py-1 rounded-md border border-gray-200 text-[11px]">
                               <span>0.0 L (0.00%)</span>
                             </span>
                           )
                         )}
-                      </td>
-
-                      <td className="p-3.5 text-center whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
-                        <div className="flex items-center justify-center gap-1.5">
-                          <button
-                            onClick={() => setSelectedDetailSession(session)}
-                            className="inline-flex items-center gap-1 px-2.5 py-1 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-lg text-[11px] font-bold transition-all cursor-pointer"
-                            title="View Full Breakdown & Audit Details"
-                          >
-                            <Eye className="w-3 h-3" />
-                            <span>Audit Details</span>
-                          </button>
-
-                          <button
-                            onClick={() => exportSingleSessionCSV(session)}
-                            className="p-1 text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors cursor-pointer"
-                            title="Export CSV"
-                          >
-                            <Download className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
                       </td>
                     </tr>
                   );
@@ -1145,14 +1385,14 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-sm active:scale-95"
               >
                 <Plus className="w-4 h-4" />
-                <span>+ Record Daily Dip Audit</span>
+                <span>Record Daily Dip Audit</span>
               </button>
               <button
                 onClick={handleOpenBowserDipModal}
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-sm active:scale-95"
               >
                 <Truck className="w-4 h-4" />
-                <span>+ Bowser Unload Dip Audit</span>
+                <span>Bowser Unload Dip Audit</span>
               </button>
             </div>
           </div>
@@ -1454,65 +1694,93 @@ export default function ManualDipTab({ tanks = [] }: ManualDipTabProps) {
 
             {/* Bowser Form Content */}
             <form onSubmit={handleSaveBowserDeliveryAudit} className="space-y-4">
-              {/* 1. Tank Selection & Invoiced Quantity */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200/80">
-                {/* Tank Select */}
+              {/* 1. Recent Purchase Invoice Selection & Auto-Detected Target Tank */}
+              <div className="space-y-3 bg-slate-50 p-3.5 sm:p-4 rounded-xl border border-slate-200/80">
+                {/* Dynamic Purchase Invoice Dropdown */}
                 <div>
                   <label className="block text-xs font-bold text-slate-700 mb-1 flex items-center gap-1">
-                    <Fuel className="w-3.5 h-3.5 text-amber-600" />
-                    <span>Select Tank</span>
+                    <FileText className="w-3.5 h-3.5 text-blue-600" />
+                    <span>Select Recent Purchase Invoice / Volume *</span>
                   </label>
                   <select
-                    value={bowserForm.tankId}
-                    onChange={(e) => handleBowserTankChange(e.target.value)}
-                    className="w-full px-3 py-2 bg-white border border-gray-300 rounded-xl text-xs font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-amber-500/20 focus:border-amber-500"
+                    value={selectedPurchaseInvoiceId}
+                    onChange={(e) => handleSelectPurchaseInvoice(e.target.value)}
+                    required
+                    className="w-full px-3 py-2 bg-white border border-blue-200 rounded-xl text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 truncate"
                   >
-                    {availableTanks.map(tank => (
-                      <option key={tank.id} value={tank.id}>
-                        {tank.name} ({tank.fuelType}) — Cap: {tank.capacity.toLocaleString()} L
-                      </option>
-                    ))}
+                    <option value="">-- Select Recent Purchase Invoice --</option>
+                    {stockDeliveries.map(p => {
+                      const invNo = p.id;
+                      const volFormatted = (Number(p.quantity) || 0).toLocaleString();
+                      const dateFormatted = p.date ? p.date.slice(0, 10) : '';
+                      return (
+                        <option key={p.id} value={p.id}>
+                          {invNo} • {volFormatted} L • {dateFormatted}
+                        </option>
+                      );
+                    })}
                   </select>
+                  {stockDeliveries.length === 0 && (
+                    <span className="text-[10.5px] text-gray-400 mt-1 block">
+                      No recent purchase delivery logs found.
+                    </span>
+                  )}
                 </div>
 
-                {/* Invoiced Bowser Volume */}
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1">
-                    Invoiced Volume (Liters) *
-                  </label>
-                  <div className="relative">
-                    <input
-                      type="number"
-                      step="any"
-                      required
-                      min="1"
-                      placeholder="e.g. 6600"
-                      value={bowserForm.invoicedVolume}
-                      onChange={(e) => setBowserForm(p => ({ ...p, invoicedVolume: e.target.value }))}
-                      className="w-full px-3 py-2 bg-white border border-amber-300 rounded-xl text-xs font-extrabold text-slate-900 focus:outline-none focus:ring-2 focus:ring-amber-500/30 focus:border-amber-500 tabular-nums"
-                    />
-                    <span className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 font-semibold text-[11px]">
-                      L
-                    </span>
+                {/* Verified Invoice & Auto-Detected Target Tank Summary Card */}
+                {selectedPurchaseInvoice ? (
+                  <div className="bg-white p-3.5 rounded-xl border border-emerald-200 shadow-2xs space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2.5">
+                        <div className="p-2 bg-emerald-50 text-emerald-700 rounded-xl border border-emerald-200">
+                          <CheckCircle2 className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="text-[10px] font-extrabold text-emerald-800 uppercase tracking-wider bg-emerald-100/80 px-1.5 py-0.5 rounded">
+                              Verified Invoice
+                            </span>
+                            <span className="text-[11px] font-bold text-slate-800">
+                              Invoice #{selectedPurchaseInvoice.id}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-gray-500 font-medium mt-0.5">
+                            {selectedPurchaseInvoice.supplier || 'CPC'} • {selectedPurchaseInvoice.date ? new Date(selectedPurchaseInvoice.date).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }) : 'Recent'}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block">Invoiced Volume</span>
+                        <span className="text-base font-extrabold text-emerald-700 tabular-nums">
+                          {(Number(selectedPurchaseInvoice.quantity) || 0).toLocaleString()} L
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Auto-detected Target Tank & Calibration Specs */}
+                    <div className="pt-2 border-t border-gray-100 flex items-center justify-between text-xs bg-slate-50/80 -mx-3.5 -mb-3.5 px-3.5 py-2 rounded-b-xl">
+                      <div className="flex items-center gap-1.5">
+                        <Fuel className="w-3.5 h-3.5 text-blue-600" />
+                        <span className="font-semibold text-gray-600">Target Tank:</span>
+                        <span className="font-extrabold text-slate-900 bg-blue-50 text-blue-800 px-2 py-0.5 rounded border border-blue-200 text-[11px]">
+                          {selectedBowserTank ? `${selectedBowserTank.name} — ${selectedBowserTank.fuelType}` : (selectedPurchaseInvoice.fuelType || 'Auto-Detected Tank')}
+                        </span>
+                      </div>
+                      {selectedBowserTank && (
+                        <span className="text-[10.5px] text-slate-500 font-medium">
+                          Cap: <strong className="text-slate-800 font-bold">{selectedBowserTank.capacity.toLocaleString()} L</strong> • Max Dip: <strong className="text-slate-800 font-bold">{getTankMaxDipMm(selectedBowserTank.capacity)} mm</strong>
+                        </span>
+                      )}
+                    </div>
                   </div>
-                  {/* Quick CPC standard preset buttons */}
-                  <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
-                    {['6600', '13200', '19800', '33000'].map(vol => (
-                      <button
-                        key={vol}
-                        type="button"
-                        onClick={() => setBowserForm(p => ({ ...p, invoicedVolume: vol }))}
-                        className={`px-2 py-0.5 text-[10px] font-bold rounded-md transition-colors cursor-pointer ${
-                          bowserForm.invoicedVolume === vol
-                            ? 'bg-amber-600 text-white'
-                            : 'bg-white border border-gray-200 text-slate-700 hover:bg-gray-100'
-                        }`}
-                      >
-                        {vol === '6600' ? '6.6k L' : vol === '13200' ? '13.2k L' : vol === '19800' ? '19.8k L' : '33k L'}
-                      </button>
-                    ))}
+                ) : (
+                  <div className="bg-amber-50/70 p-3 rounded-xl border border-dashed border-amber-200 text-center">
+                    <p className="text-xs font-semibold text-amber-800 flex items-center justify-center gap-1.5">
+                      <AlertCircle className="w-3.5 h-3.5 text-amber-600" />
+                      <span>Please select a recent purchase invoice from the dropdown to auto-detect the linked tank and calibration specs.</span>
+                    </p>
                   </div>
-                </div>
+                )}
               </div>
 
               {/* 2. Before & After Dip Reading Inputs (Side-by-Side) */}

@@ -1,5 +1,5 @@
 import { supabase, getTanksTableName } from './supabase';
-import { PumpReading, FuelTank, OilTank, Customer, CustomerLedgerEntry, Shift, ShiftBankDeposit } from '../types';
+import { PumpReading, FuelTank, OilTank, Customer, CustomerLedgerEntry, Shift, ShiftBankDeposit, PumperShortageExcessRecord } from '../types';
 
 export { supabase };
 
@@ -1476,6 +1476,194 @@ export async function recordShiftBankDeposit(
 
   return { success: true };
 }
+
+/**
+ * Saves Pumper Shortage & Excess records to Supabase 'pumper_shortages_excess' table
+ * with local fallback support.
+ */
+export async function savePumperShortageExcessRecords(
+  client: any,
+  records: PumperShortageExcessRecord[]
+): Promise<{ success: boolean; data?: any; error?: any }> {
+  if (!records || records.length === 0) return { success: true };
+
+  // Always update localStorage cache
+  try {
+    const existingRaw = localStorage.getItem('fms_pumper_shortages_excess');
+    const existing: PumperShortageExcessRecord[] = existingRaw ? JSON.parse(existingRaw) : [];
+    const recordMap = new Map<string, PumperShortageExcessRecord>();
+    existing.forEach(r => recordMap.set(r.id, r));
+    records.forEach(r => recordMap.set(r.id, r));
+    const merged = Array.from(recordMap.values()).sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
+    localStorage.setItem('fms_pumper_shortages_excess', JSON.stringify(merged));
+  } catch (_) {}
+
+  const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
+  if (!isConfigured) return { success: true };
+
+  try {
+    const payloads = records.map(r => ({
+      id: r.id,
+      shift_id: r.shift_id,
+      shift_name: r.shift_name || '',
+      pumper_id: r.pumper_id,
+      pumper_name: r.pumper_name,
+      date: r.date,
+      expected_amount: r.expected_amount,
+      collected_amount: r.collected_amount,
+      variance_amount: r.variance_amount,
+      type: r.type,
+      status: r.status,
+      settled_at: r.settled_at || null,
+      settled_by: r.settled_by || null,
+      notes: r.notes || '',
+      created_at: r.created_at || new Date().toISOString()
+    }));
+
+    const { data, error } = await client
+      .from('pumper_shortages_excess')
+      .upsert(payloads, { onConflict: 'id' });
+
+    if (error) {
+      console.warn('pumper_shortages_excess upsert warning (falling back if needed):', error.message || error);
+      const fallbackPayloads = records.map(r => ({
+        id: r.id,
+        shift_id: r.shift_id,
+        pumper_id: r.pumper_id,
+        pumper_name: r.pumper_name,
+        date: r.date,
+        expected_amount: r.expected_amount,
+        collected_amount: r.collected_amount,
+        variance_amount: r.variance_amount,
+        status: r.status
+      }));
+      await client.from('pumper_shortages_excess').upsert(fallbackPayloads, { onConflict: 'id' }).catch(() => {});
+    }
+
+    return { success: !error, data, error };
+  } catch (err) {
+    console.warn('savePumperShortageExcessRecords exception:', err);
+    return { success: false, error: err };
+  }
+}
+
+/**
+ * Fetches all Pumper Shortage & Excess records from Supabase with localStorage merge.
+ */
+export async function fetchPumperShortagesExcess(
+  client: any
+): Promise<PumperShortageExcessRecord[]> {
+  let localRecords: PumperShortageExcessRecord[] = [];
+  try {
+    const raw = localStorage.getItem('fms_pumper_shortages_excess');
+    if (raw) localRecords = JSON.parse(raw);
+  } catch (_) {}
+
+  const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
+  if (!isConfigured) return localRecords;
+
+  try {
+    const { data, error } = await client
+      .from('pumper_shortages_excess')
+      .select('*')
+      .order('date', { ascending: false });
+
+    if (data && !error && Array.isArray(data)) {
+      const mapped: PumperShortageExcessRecord[] = data.map((d: any) => ({
+        id: d.id,
+        shift_id: d.shift_id || d.shiftId || '',
+        shift_name: d.shift_name || d.shiftName || '',
+        pumper_id: d.pumper_id || d.pumperId || '',
+        pumper_name: d.pumper_name || d.pumperName || 'Pumper',
+        date: d.date || new Date().toISOString().slice(0, 10),
+        expected_amount: Number(d.expected_amount ?? d.expectedAmount ?? 0),
+        collected_amount: Number(d.collected_amount ?? d.collectedAmount ?? 0),
+        variance_amount: Number(d.variance_amount ?? d.varianceAmount ?? (Number(d.collected_amount ?? 0) - Number(d.expected_amount ?? 0))),
+        type: (d.type || (Number(d.variance_amount ?? 0) < -0.5 ? 'SHORTAGE' : Number(d.variance_amount ?? 0) > 0.5 ? 'EXCESS' : 'BALANCED')) as any,
+        status: (d.status || 'PENDING') as any,
+        settled_at: d.settled_at || d.settledAt || undefined,
+        settled_by: d.settled_by || d.settledBy || undefined,
+        notes: d.notes || '',
+        created_at: d.created_at || d.createdAt || undefined
+      }));
+
+      // Merge with local records
+      const recordMap = new Map<string, PumperShortageExcessRecord>();
+      localRecords.forEach(r => recordMap.set(r.id, r));
+      mapped.forEach(r => recordMap.set(r.id, r));
+      const finalResult = Array.from(recordMap.values()).sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
+      
+      try {
+        localStorage.setItem('fms_pumper_shortages_excess', JSON.stringify(finalResult));
+      } catch (_) {}
+
+      return finalResult;
+    }
+  } catch (err) {
+    console.warn('fetchPumperShortagesExcess error:', err);
+  }
+
+  return localRecords;
+}
+
+/**
+ * Updates settlement status of a Pumper Shortage & Excess record
+ */
+export async function updatePumperShortageExcessStatus(
+  client: any,
+  id: string,
+  status: 'PENDING' | 'SETTLED',
+  settledBy?: string,
+  notes?: string
+): Promise<{ success: boolean; error?: any }> {
+  const settledAt = status === 'SETTLED' ? new Date().toISOString() : undefined;
+
+  // Update local storage
+  try {
+    const raw = localStorage.getItem('fms_pumper_shortages_excess');
+    if (raw) {
+      const records: PumperShortageExcessRecord[] = JSON.parse(raw);
+      const updated = records.map(r => {
+        if (r.id === id) {
+          return {
+            ...r,
+            status,
+            settled_at: settledAt,
+            settled_by: settledBy || r.settled_by,
+            notes: notes !== undefined ? notes : r.notes
+          };
+        }
+        return r;
+      });
+      localStorage.setItem('fms_pumper_shortages_excess', JSON.stringify(updated));
+    }
+  } catch (_) {}
+
+  const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
+  if (!isConfigured) return { success: true };
+
+  try {
+    const updatePayload: any = {
+      status,
+      settled_at: settledAt || null,
+      settled_by: settledBy || null
+    };
+    if (notes !== undefined) {
+      updatePayload.notes = notes;
+    }
+
+    const { error } = await client
+      .from('pumper_shortages_excess')
+      .update(updatePayload)
+      .eq('id', id);
+
+    return { success: !error, error };
+  } catch (err) {
+    console.warn('updatePumperShortageExcessStatus error:', err);
+    return { success: false, error: err };
+  }
+}
+
 
 
 

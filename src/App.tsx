@@ -27,10 +27,11 @@ import EmployeesTab from './components/EmployeesTab';
 import AdminControlTab from './components/AdminControlTab';
 import PriceManagementTab from './components/PriceManagementTab';
 import DepositsTab from './components/DepositsTab';
+import PumperShortExcessTab from './components/PumperShortExcessTab';
 import LoginPage, { LoginModal } from './components/LoginPage';
-import { AuthUser, Employee, FuelTank, OilTank, Pump, PumpMachine, Shift, StockDelivery, PriceSchedule, Customer, CreditTransaction, CreditPayment, LPGasItem, ShiftBankDeposit, resolveUserRole } from './types';
+import { AuthUser, Employee, FuelTank, OilTank, Pump, PumpMachine, Shift, StockDelivery, PriceSchedule, Customer, CreditTransaction, CreditPayment, LPGasItem, ShiftBankDeposit, resolveUserRole, PumperShortageExcessRecord } from './types';
 import { supabase, getTanksTableName, setTanksTableName } from './lib/supabase';
-import { upsertPumpReadings, syncCreditAndCardSales, syncAllNonCashSales, updateNozzleMeterCarryover, saveOilTank, recordShiftBankDeposit, fetchShiftBankDeposits, saveIndividualBankDeposit, deleteIndividualBankDeposit, isPumpReadingActiveOrAssigned, saveShiftLogs } from './lib/supabaseClient';
+import { upsertPumpReadings, syncCreditAndCardSales, syncAllNonCashSales, updateNozzleMeterCarryover, saveOilTank, recordShiftBankDeposit, fetchShiftBankDeposits, saveIndividualBankDeposit, deleteIndividualBankDeposit, isPumpReadingActiveOrAssigned, saveShiftLogs, savePumperShortageExcessRecords } from './lib/supabaseClient';
 
 export const defaultPumpMachines: PumpMachine[] = [];
 export const defaultPumps: Pump[] = [];
@@ -1516,6 +1517,66 @@ export default function App() {
           saveShiftLogs(supabase, closedShift, activePumpReadings);
         }
       }
+
+      // Record shift-closing individual pumper balances in pumper_shortages_excess table
+      if (closedShift.pumpReadings && closedShift.pumpReadings.length > 0) {
+        const shiftDate = closedShift.startTime ? closedShift.startTime.slice(0, 10) : new Date().toISOString().slice(0, 10);
+        const pumperMap = new Map<string, {
+          pumperName: string;
+          expectedAmount: number;
+          actualCash: number;
+          nonCashSales: number;
+        }>();
+
+        closedShift.pumpReadings.forEach(r => {
+          if (!r.assignedPumperId) return;
+          const pId = r.assignedPumperId;
+          const pName = employees.find(e => e.id === pId)?.name || 'Pumper';
+          const isOil = r.pumpId === 'pump-oil-bay' || r.fuelType === 'Oil & Lubricants';
+          const grossSold = isOil ? 0 : Math.max(0, (r.endMeter || 0) - (r.startMeter || 0));
+          const netSold = isOil ? 0 : Math.max(0, grossSold - (r.testingQty || 0));
+          const unitPrice = r.unitPrice || 0;
+          const grossRev = (netSold * unitPrice) + (r.oilSalesAmount || 0);
+          const nonCash = (r.creditSalesAmount || 0) + (r.cardSalesAmount || 0) + (r.touchCardSalesAmount || 0) + (r.voucherSalesAmount || 0);
+          const cash = r.actualCash || 0;
+
+          const cur = pumperMap.get(pId) || { pumperName: pName, expectedAmount: 0, actualCash: 0, nonCashSales: 0 };
+          pumperMap.set(pId, {
+            pumperName: pName,
+            expectedAmount: cur.expectedAmount + grossRev,
+            actualCash: cur.actualCash + cash,
+            nonCashSales: cur.nonCashSales + nonCash
+          });
+        });
+
+        const pumperRecords: PumperShortageExcessRecord[] = [];
+        pumperMap.forEach((val, pId) => {
+          const totalCollected = val.actualCash + val.nonCashSales;
+          const variance = totalCollected - val.expectedAmount;
+          const rType: 'SHORTAGE' | 'EXCESS' | 'BALANCED' = 
+            variance < -0.5 ? 'SHORTAGE' : variance > 0.5 ? 'EXCESS' : 'BALANCED';
+
+          pumperRecords.push({
+            id: `p_var_${closedShift.id}_${pId}`,
+            shift_id: closedShift.id,
+            shift_name: closedShift.name,
+            pumper_id: pId,
+            pumper_name: val.pumperName,
+            date: shiftDate,
+            expected_amount: val.expectedAmount,
+            collected_amount: totalCollected,
+            variance_amount: variance,
+            type: rType,
+            status: rType === 'BALANCED' ? 'SETTLED' : 'PENDING',
+            notes: `Shift Closing auto-reconciliation (${closedShift.name || closedShift.id})`,
+            created_at: new Date().toISOString()
+          });
+        });
+
+        if (pumperRecords.length > 0) {
+          savePumperShortageExcessRecords(supabase, pumperRecords);
+        }
+      }
     }
 
     // 3. Reset assigned pumper states in the employees directory back to Active/Off-duty
@@ -1802,6 +1863,15 @@ export default function App() {
               />
             )}
 
+            {activeTab === 'pumper-short-excess' && (
+              <PumperShortExcessTab
+                employees={employees}
+                shiftHistory={shiftHistory}
+                activeShift={activeShift}
+                user={user}
+              />
+            )}
+
             {activeTab === 'deposits' && (
               <DepositsTab
                 activeShift={activeShift}
@@ -1879,6 +1949,8 @@ export default function App() {
             {activeTab === 'manual-dip-record' && (
               <ManualDipTab
                 tanks={tanks}
+                setTanks={setTanks}
+                deliveries={deliveries}
               />
             )}
 

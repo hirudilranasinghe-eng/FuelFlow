@@ -520,3 +520,21 @@ export interface BulkOilTransfer {
   remarks?: string;
 }
 
+export interface PumperShortageExcessRecord {
+  id: string;
+  shift_id: string;
+  shift_name?: string;
+  pumper_id: string;
+  pumper_name: string;
+  date: string;
+  expected_amount: number;
+  collected_amount: number;
+  variance_amount: number;
+  type: 'SHORTAGE' | 'EXCESS' | 'BALANCED';
+  status: 'PENDING' | 'SETTLED';
+  settled_at?: string;
+  settled_by?: string;
+  notes?: string;
+  created_at?: string;
+}
+
