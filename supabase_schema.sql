@@ -336,3 +336,49 @@ CREATE POLICY "Enable all access for pumper_non_cash_sales" ON pumper_non_cash_s
 
 DROP POLICY IF EXISTS "Enable all access for card_sales" ON card_sales;
 CREATE POLICY "Enable all access for card_sales" ON card_sales FOR ALL TO public USING (true) WITH CHECK (true);
+
+-- Pumper Shortage & Excess Ledger Table
+CREATE TABLE IF NOT EXISTS pumper_shortage_excess (
+    id TEXT PRIMARY KEY,
+    shift_id TEXT,
+    shift_name TEXT,
+    pumper_id TEXT,
+    pumper_name TEXT NOT NULL,
+    date TEXT NOT NULL,
+    expected_amount NUMERIC DEFAULT 0,
+    collected_amount NUMERIC DEFAULT 0,
+    variance_amount NUMERIC DEFAULT 0,
+    type TEXT CHECK (type IN ('SHORTAGE', 'EXCESS', 'BALANCED')),
+    status TEXT CHECK (status IN ('PENDING', 'SETTLED')),
+    settled_at TIMESTAMPTZ,
+    settled_by TEXT,
+    notes TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE pumper_shortage_excess DISABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Enable all access for pumper_shortage_excess" ON pumper_shortage_excess;
+CREATE POLICY "Enable all access for pumper_shortage_excess" ON pumper_shortage_excess FOR ALL TO public USING (true) WITH CHECK (true);
+
+-- Alias view/table for plural naming compatibility
+CREATE TABLE IF NOT EXISTS pumper_shortages_excess (
+    id TEXT PRIMARY KEY,
+    shift_id TEXT,
+    shift_name TEXT,
+    pumper_id TEXT,
+    pumper_name TEXT NOT NULL,
+    date TEXT NOT NULL,
+    expected_amount NUMERIC DEFAULT 0,
+    collected_amount NUMERIC DEFAULT 0,
+    variance_amount NUMERIC DEFAULT 0,
+    type TEXT CHECK (type IN ('SHORTAGE', 'EXCESS', 'BALANCED')),
+    status TEXT CHECK (status IN ('PENDING', 'SETTLED')),
+    settled_at TIMESTAMPTZ,
+    settled_by TEXT,
+    notes TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE pumper_shortages_excess DISABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Enable all access for pumper_shortages_excess" ON pumper_shortages_excess;
+CREATE POLICY "Enable all access for pumper_shortages_excess" ON pumper_shortages_excess FOR ALL TO public USING (true) WITH CHECK (true);

@@ -5,7 +5,7 @@
 
 import React, { useState, useEffect, useMemo } from 'react';
 import { 
-  Calendar, Download, Search, RefreshCw, Eye, X, Fuel, Droplet, 
+  Calendar, Download, FileSpreadsheet, Search, RefreshCw, X, Fuel, Droplet, 
   DollarSign, TrendingUp, AlertTriangle, CheckCircle2, ChevronRight,
   Clock, User, Layers, Receipt, ArrowUpDown, Filter, BarChart3,
   CreditCard, ShieldAlert, Sparkles, FileText, ChevronDown, Check,
@@ -102,6 +102,13 @@ export default function DailySalesTab({
 
   // Slide-over / modal state for single shift audit
   const [selectedShiftRecord, setSelectedShiftRecord] = useState<IndividualShiftRecord | null>(null);
+
+  // Open Comprehensive Shift Summary Report for a specific shift
+  const openComprehensiveSummary = (shift: IndividualShiftRecord) => {
+    setSelectedSummaryShiftId(shift.id);
+    setSelectedShiftRecord(null);
+    setViewMode('summary_report');
+  };
 
   // Helper for Sri Lankan Rupee currency formatting
   const formatRs = (amount: number | undefined | null): string => {
@@ -736,61 +743,6 @@ export default function DailySalesTab({
     });
   }, [allIndividualShiftRecords, startDate, endDate, searchQuery, statusFilter]);
 
-  // High-level KPI aggregations across filtered shifts
-  const kpiTotals = useMemo(() => {
-    let totalShifts = filteredShiftRecords.length;
-    let totalFuelVolume = 0;
-    let totalGrossRevenue = 0;
-    let totalHandedOverCash = 0;
-    let totalExpectedCash = 0;
-    let totalCreditSales = 0;
-    let totalCardSales = 0;
-    let totalTouchCardSales = 0;
-    let totalVoucherSales = 0;
-    let totalNonCashSales = 0;
-    let totalOilSales = 0;
-    let totalCashBanked = 0;
-
-    let totalEffectivePhysical = 0;
-
-    filteredShiftRecords.forEach((r) => {
-      totalFuelVolume += r.totalFuelVolume;
-      totalGrossRevenue += r.grossRevenue;
-      totalHandedOverCash += r.handedOverCash;
-      totalExpectedCash += r.expectedCash;
-      totalCreditSales += r.creditSales;
-      totalCardSales += r.cardSales;
-      totalTouchCardSales += r.touchCardSales;
-      totalVoucherSales += r.voucherSales;
-      totalNonCashSales += r.totalNonCash;
-      totalOilSales += r.totalForecourtOilSales;
-      totalCashBanked += r.cashBanked;
-      totalEffectivePhysical += (r.handedOverCash > 0 ? r.handedOverCash : r.cashBanked);
-    });
-
-    const netVariance = totalEffectivePhysical - totalExpectedCash;
-    let varianceStatus: 'Balanced' | 'Shortage' | 'Excess' = 'Balanced';
-    if (netVariance < -0.01) varianceStatus = 'Shortage';
-    else if (netVariance > 0.01) varianceStatus = 'Excess';
-
-    return {
-      totalShifts,
-      totalFuelVolume,
-      totalGrossRevenue,
-      totalHandedOverCash,
-      totalExpectedCash,
-      totalCreditSales,
-      totalCardSales,
-      totalTouchCardSales,
-      totalVoucherSales,
-      totalNonCashSales,
-      totalOilSales,
-      totalCashBanked,
-      netVariance,
-      varianceStatus,
-    };
-  }, [filteredShiftRecords]);
-
   // CSV Export Utility
   const downloadCSV = (filename: string, headers: string[], rows: (string | number)[][]) => {
     const csvContent = [
@@ -809,7 +761,45 @@ export default function DailySalesTab({
     URL.revokeObjectURL(url);
   };
 
-  // Export all individual shift rows to CSV
+  // Export displayed/filtered shift sales records to CSV per user specification
+  const exportDailySalesCSV = () => {
+    if (filteredShiftRecords.length === 0) return;
+
+    const headers = [
+      'Shift ID',
+      'Date',
+      'Supervisor',
+      'Total Fuel Volume (L)',
+      'Gross Fuel Revenue (Rs.)',
+      'Oil Sales (Rs.)',
+      'Credit/Card Sales (Rs.)',
+      'Expected Cash (Rs.)',
+      'Status'
+    ];
+
+    const rows = filteredShiftRecords.map((r) => {
+      const shiftDate = r.formattedDate || (r.startTime ? r.startTime.slice(0, 10) : todayStr);
+      const oilSales = (r.totalForecourtOilSales || 0) + (r.totalPackagedLubeSales || 0);
+      const creditCardSales = (r.creditSales || 0) + (r.cardSales || 0) + (r.touchCardSales || 0);
+
+      return [
+        r.id,
+        shiftDate,
+        r.supervisorName || 'Supervisor',
+        r.totalFuelVolume.toFixed(2),
+        (r.grossFuelRevenue || 0).toFixed(2),
+        oilSales.toFixed(2),
+        creditCardSales.toFixed(2),
+        (r.expectedCash || 0).toFixed(2),
+        r.isActive ? 'Active' : 'Completed'
+      ];
+    });
+
+    const fileDate = startDate && endDate ? `${startDate}_to_${endDate}` : (startDate || todayStr);
+    downloadCSV(`Daily_Sales_Shift_Ledger_${fileDate}.csv`, headers, rows);
+  };
+
+  // Export all individual shift rows to CSV (Extended Master format)
   const exportMasterShiftsCSV = () => {
     if (filteredShiftRecords.length === 0) return;
 
@@ -978,61 +968,16 @@ export default function DailySalesTab({
   return (
     <div id="daily-sales-tab-root" className="space-y-5 animate-fade-in pb-12">
       {/* ========================================================================= */}
-      {/* 1. TOP HEADER & FILTER BAR */}
+      {/* 1. TOP TITLE */}
       {/* ========================================================================= */}
-      <div className="flex flex-col gap-4">
-        {/* Title and Top Right Actions */}
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-          <div>
-            <h1 className="text-lg font-bold text-slate-900 tracking-tight font-sans flex items-center gap-2">
-              <BarChart3 className="w-4.5 h-4.5 text-blue-600 shrink-0" />
-              <span>Shift Sales History &amp; Settlement Ledger</span>
-            </h1>
-            <p className="text-slate-500 text-xs mt-0.5 font-sans">
-              Individual shift-by-shift records with distinct Shift IDs, fuel volumes, oil sales, credit/card deductions, and cash reconciliations
-            </p>
-          </div>
-
-          {/* View Mode Toggle Tabs & Action buttons */}
-          <div className="flex items-center gap-2 shrink-0 flex-wrap">
-            <div className="inline-flex rounded-xl bg-gray-100 p-0.5 text-xs font-semibold">
-              <button
-                onClick={() => setViewMode('ledger')}
-                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all cursor-pointer ${
-                  viewMode === 'ledger'
-                    ? 'bg-white text-slate-900 font-bold shadow-2xs'
-                    : 'text-gray-600 hover:text-gray-900'
-                }`}
-              >
-                <BarChart3 className="w-3.5 h-3.5" />
-                <span>Shift Ledger</span>
-              </button>
-              <button
-                onClick={() => setViewMode('summary_report')}
-                className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg transition-all cursor-pointer ${
-                  viewMode === 'summary_report'
-                    ? 'bg-indigo-600 text-white font-bold shadow-2xs'
-                    : 'text-gray-600 hover:text-gray-900'
-                }`}
-              >
-                <FileText className="w-3.5 h-3.5" />
-                <span>Comprehensive Shift Summary Report</span>
-              </button>
-            </div>
-
-            {viewMode === 'ledger' && (
-              <button
-                id="btn-export-daily-sales-csv"
-                onClick={exportMasterShiftsCSV}
-                disabled={filteredShiftRecords.length === 0}
-                className="inline-flex items-center gap-2 px-3.5 py-1.5 bg-slate-900 hover:bg-black text-white rounded-xl text-xs font-bold transition-all shadow-xs cursor-pointer disabled:opacity-50"
-              >
-                <Download className="w-3.5 h-3.5 text-emerald-400" />
-                <span>Export</span>
-              </button>
-            )}
-          </div>
-        </div>
+      <div>
+        <h1 className="text-lg font-bold text-slate-900 tracking-tight font-sans flex items-center gap-2">
+          <BarChart3 className="w-4.5 h-4.5 text-blue-600 shrink-0" />
+          <span>Shift Sales History &amp; Settlement Ledger</span>
+        </h1>
+        <p className="text-slate-500 text-xs mt-0.5 font-sans">
+          Individual shift-by-shift records with distinct Shift IDs, fuel volumes, oil sales, credit/card deductions, and cash reconciliations
+        </p>
       </div>
 
       {viewMode === 'summary_report' ? (
@@ -1045,7 +990,7 @@ export default function DailySalesTab({
           onBack={() => setViewMode('ledger')}
         />
       ) : (
-        <>
+        <div className="space-y-3.5">
           {/* Date Filter, Status Toggle & Search Controls Bar */}
           <div className="flex flex-wrap items-center justify-between gap-3 bg-white p-2.5 sm:p-3 rounded-2xl border border-gray-200/80 shadow-2xs">
           {/* Left: Date Range Filter & Status Filter */}
@@ -1123,72 +1068,36 @@ export default function DailySalesTab({
             )}
           </div>
 
-          {/* Right: Search Box */}
-          <div className="relative min-w-[220px] flex-1 sm:flex-initial">
-            <Search className="w-3.5 h-3.5 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              placeholder="Search Shift ID, supervisor, pumper..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-8.5 pr-8 py-1.5 bg-gray-50 border border-gray-200/80 rounded-xl text-xs text-gray-800 placeholder-gray-400 outline-none focus:bg-white focus:ring-1 focus:ring-blue-500 transition-all"
-            />
-            {searchQuery && (
-              <button
-                onClick={() => setSearchQuery('')}
-                className="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 text-gray-400 hover:text-gray-600 cursor-pointer"
-              >
-                <X className="w-3 h-3" />
-              </button>
-            )}
-          </div>
-        </div>
+          {/* Right: Search Box & Export CSV Button */}
+          <div className="flex items-center gap-2 w-full sm:w-auto">
+            <div className="relative min-w-[220px] flex-1 sm:flex-initial">
+              <Search className="w-3.5 h-3.5 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                placeholder="Search Shift ID, supervisor, pumper..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full pl-8.5 pr-8 py-1.5 bg-gray-50 border border-gray-200/80 rounded-xl text-xs text-gray-800 placeholder-gray-400 outline-none focus:bg-white focus:ring-1 focus:ring-blue-500 transition-all"
+              />
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery('')}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 text-gray-400 hover:text-gray-600 cursor-pointer"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              )}
+            </div>
 
-        {/* High-Level Overview Metrics Bar */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
-          <div className="p-3 bg-white rounded-xl border border-gray-200/80 shadow-2xs">
-            <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block">Total Shifts</span>
-            <span className="text-sm font-extrabold text-slate-900 tabular-nums mt-0.5 block">
-              {kpiTotals.totalShifts} {kpiTotals.totalShifts === 1 ? 'Shift' : 'Shifts'}
-            </span>
-          </div>
-
-          <div className="p-3 bg-white rounded-xl border border-gray-200/80 shadow-2xs">
-            <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block">Total Fuel Sold</span>
-            <span className="text-sm font-extrabold text-blue-600 tabular-nums mt-0.5 block">
-              {formatLiters(kpiTotals.totalFuelVolume)}
-            </span>
-          </div>
-
-          <div className="p-3 bg-white rounded-xl border border-gray-200/80 shadow-2xs">
-            <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block">Total Gross Sales</span>
-            <span className="text-sm font-extrabold text-slate-900 tabular-nums mt-0.5 block">
-              {formatRs(kpiTotals.totalGrossRevenue)}
-            </span>
-          </div>
-
-          <div className="p-3 bg-white rounded-xl border border-gray-200/80 shadow-2xs">
-            <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block">Non-Cash (Credit/POS)</span>
-            <span className="text-sm font-bold text-amber-700 tabular-nums mt-0.5 block">
-              {formatRs(kpiTotals.totalCreditSales + kpiTotals.totalCardSales)}
-            </span>
-          </div>
-
-          <div className="p-3 bg-white rounded-xl border border-gray-200/80 shadow-2xs">
-            <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block">Cash Banked</span>
-            <span className="text-sm font-extrabold text-purple-700 tabular-nums mt-0.5 block">
-              {formatRs(kpiTotals.totalCashBanked)}
-            </span>
-          </div>
-
-          <div className="p-3 bg-white rounded-xl border border-gray-200/80 shadow-2xs">
-            <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block">Net Cash Variance</span>
-            <span className={`text-sm font-extrabold tabular-nums mt-0.5 block ${
-              kpiTotals.varianceStatus === 'Shortage' ? 'text-rose-600' : kpiTotals.varianceStatus === 'Excess' ? 'text-amber-600' : 'text-emerald-600'
-            }`}>
-              {kpiTotals.netVariance >= 0 && kpiTotals.netVariance > 0.01 ? '+' : ''}
-              {formatRs(kpiTotals.netVariance)}
-            </span>
+            <button
+              onClick={exportDailySalesCSV}
+              disabled={filteredShiftRecords.length === 0}
+              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-white hover:bg-gray-50 text-slate-700 border border-gray-200/90 rounded-xl text-xs font-bold transition-all shadow-2xs hover:shadow-xs cursor-pointer disabled:opacity-50 shrink-0"
+              title="Export filtered records to CSV"
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Export CSV</span>
+            </button>
           </div>
         </div>
 
@@ -1244,7 +1153,6 @@ export default function DailySalesTab({
                   <th className="py-1.5 px-3 text-right">Handed Cash</th>
                   <th className="py-1.5 px-3 text-right">Banked</th>
                   <th className="py-1.5 px-2 text-center">Variance</th>
-                  <th className="py-1.5 px-2 text-center">Action</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100 text-xs">
@@ -1252,8 +1160,8 @@ export default function DailySalesTab({
                   return (
                     <tr
                       key={shift.id}
-                      onClick={() => setSelectedShiftRecord(shift)}
-                      className="hover:bg-blue-50/40 transition-colors cursor-pointer group"
+                      onClick={() => openComprehensiveSummary(shift)}
+                      className="cursor-pointer hover:bg-slate-50 transition-colors group"
                     >
                       {/* Shift ID & Status Pill */}
                       <td className="py-1.5 px-3">
@@ -1341,20 +1249,6 @@ export default function DailySalesTab({
                           {formatRs(shift.variance)}
                         </span>
                       </td>
-
-                      {/* Action Button */}
-                      <td className="py-1.5 px-2 text-center leading-tight">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setSelectedShiftRecord(shift);
-                          }}
-                          className="inline-flex items-center gap-1 px-2 py-0.5 bg-white group-hover:bg-blue-600 group-hover:text-white text-gray-700 border border-gray-200 rounded text-[10px] font-bold transition-all shadow-2xs cursor-pointer leading-none"
-                        >
-                          <Eye className="w-2.5 h-2.5" />
-                          <span>Audit</span>
-                        </button>
-                      </td>
                     </tr>
                   );
                 })}
@@ -1363,7 +1257,7 @@ export default function DailySalesTab({
           </div>
         )}
       </div>
-      </>
+      </div>
       )}
 
       {/* ========================================================================= */}

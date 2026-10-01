@@ -1520,12 +1520,20 @@ export async function savePumperShortageExcessRecords(
       created_at: r.created_at || new Date().toISOString()
     }));
 
-    const { data, error } = await client
-      .from('pumper_shortages_excess')
+    let { data, error } = await client
+      .from('pumper_shortage_excess')
       .upsert(payloads, { onConflict: 'id' });
 
+    if (error && (error.code === '42P01' || error.message?.includes('does not exist') || error.message?.includes('pumper_shortage_excess'))) {
+      const fb = await client
+        .from('pumper_shortages_excess')
+        .upsert(payloads, { onConflict: 'id' });
+      data = fb.data;
+      error = fb.error;
+    }
+
     if (error) {
-      console.warn('pumper_shortages_excess upsert warning (falling back if needed):', error.message || error);
+      console.warn('pumper_shortage_excess upsert warning (falling back if needed):', error.message || error);
       const fallbackPayloads = records.map(r => ({
         id: r.id,
         shift_id: r.shift_id,
@@ -1537,6 +1545,7 @@ export async function savePumperShortageExcessRecords(
         variance_amount: r.variance_amount,
         status: r.status
       }));
+      await client.from('pumper_shortage_excess').upsert(fallbackPayloads, { onConflict: 'id' }).catch(() => {});
       await client.from('pumper_shortages_excess').upsert(fallbackPayloads, { onConflict: 'id' }).catch(() => {});
     }
 
@@ -1556,26 +1565,43 @@ export async function fetchPumperShortagesExcess(
   let localRecords: PumperShortageExcessRecord[] = [];
   try {
     const raw = localStorage.getItem('fms_pumper_shortages_excess');
-    if (raw) localRecords = JSON.parse(raw);
+    if (raw) {
+      if (raw.includes('Aberathne') || raw.includes('SH-20260923') || raw.includes('rec_SH-')) {
+        localStorage.removeItem('fms_pumper_shortages_excess');
+      } else {
+        localRecords = JSON.parse(raw);
+      }
+    }
   } catch (_) {}
 
   const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
   if (!isConfigured) return localRecords;
 
   try {
-    const { data, error } = await client
-      .from('pumper_shortages_excess')
+    let { data, error } = await client
+      .from('pumper_shortage_excess')
       .select('*')
-      .order('date', { ascending: false });
+      .order('created_at', { ascending: false });
+
+    if (error && (error.code === '42P01' || error.message?.includes('does not exist') || error.message?.includes('pumper_shortage_excess'))) {
+      const fb = await client
+        .from('pumper_shortages_excess')
+        .select('*')
+        .order('created_at', { ascending: false });
+      if (!fb.error) {
+        data = fb.data;
+        error = null;
+      }
+    }
 
     if (data && !error && Array.isArray(data)) {
       const mapped: PumperShortageExcessRecord[] = data.map((d: any) => ({
         id: d.id,
         shift_id: d.shift_id || d.shiftId || '',
-        shift_name: d.shift_name || d.shiftName || '',
+        shift_name: d.shift_name || d.shiftName || (d.shift_id ? `Shift ${d.shift_id}` : ''),
         pumper_id: d.pumper_id || d.pumperId || '',
         pumper_name: d.pumper_name || d.pumperName || 'Pumper',
-        date: d.date || new Date().toISOString().slice(0, 10),
+        date: d.date || (d.created_at ? d.created_at.slice(0, 10) : new Date().toISOString().slice(0, 10)),
         expected_amount: Number(d.expected_amount ?? d.expectedAmount ?? 0),
         collected_amount: Number(d.collected_amount ?? d.collectedAmount ?? 0),
         variance_amount: Number(d.variance_amount ?? d.varianceAmount ?? (Number(d.collected_amount ?? 0) - Number(d.expected_amount ?? 0))),
@@ -1587,17 +1613,11 @@ export async function fetchPumperShortagesExcess(
         created_at: d.created_at || d.createdAt || undefined
       }));
 
-      // Merge with local records
-      const recordMap = new Map<string, PumperShortageExcessRecord>();
-      localRecords.forEach(r => recordMap.set(r.id, r));
-      mapped.forEach(r => recordMap.set(r.id, r));
-      const finalResult = Array.from(recordMap.values()).sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
-      
       try {
-        localStorage.setItem('fms_pumper_shortages_excess', JSON.stringify(finalResult));
+        localStorage.setItem('fms_pumper_shortages_excess', JSON.stringify(mapped));
       } catch (_) {}
 
-      return finalResult;
+      return mapped;
     }
   } catch (err) {
     console.warn('fetchPumperShortagesExcess error:', err);
@@ -1652,10 +1672,18 @@ export async function updatePumperShortageExcessStatus(
       updatePayload.notes = notes;
     }
 
-    const { error } = await client
-      .from('pumper_shortages_excess')
+    let { error } = await client
+      .from('pumper_shortage_excess')
       .update(updatePayload)
       .eq('id', id);
+
+    if (error && (error.code === '42P01' || error.message?.includes('does not exist') || error.message?.includes('pumper_shortage_excess'))) {
+      const fb = await client
+        .from('pumper_shortages_excess')
+        .update(updatePayload)
+        .eq('id', id);
+      error = fb.error;
+    }
 
     return { success: !error, error };
   } catch (err) {

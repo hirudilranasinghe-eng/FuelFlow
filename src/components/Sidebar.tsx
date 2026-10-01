@@ -7,8 +7,8 @@ import React, { useState, useEffect } from 'react';
 import { 
   LayoutDashboard, Clock, Fuel, BarChart3, FileText, Users, 
   ShieldCheck, ChevronLeft, ChevronRight, ChevronDown,
-  Droplet, CreditCard, TrendingUp, Droplets, Truck,
-  Database, Gauge, Tag, ArrowLeftRight, Flame, Landmark,
+  Droplet, Droplets, Truck,
+  Database, Gauge, Tag, Flame, Landmark,
   Scale
 } from 'lucide-react';
 
@@ -79,11 +79,6 @@ export default function Sidebar({
 
   const reportSubItems = [
     { id: 'daily-sales', name: 'Daily Sales', fullName: 'Daily Sales History', icon: BarChart3 },
-    { id: 'shift-meter', name: 'Shift & Meter Audits', fullName: 'Shift & Meter Audits', icon: Clock },
-    { id: 'tank-stock', name: 'Tank & Stock Reconcile', fullName: 'Tank & Stock Reconciliation', icon: Droplet },
-    { id: 'oil-movement', name: 'Oil Movement', fullName: 'Bulk Oil & Transfer Movements', icon: ArrowLeftRight },
-    { id: 'credit-customer', name: 'Credit Statements', fullName: 'Credit & Customer Statements', icon: CreditCard },
-    { id: 'financials', name: 'Financials & Profit', fullName: 'Financials & Profitability', icon: TrendingUp },
   ];
 
   const adminSubItems = [
@@ -137,7 +132,7 @@ export default function Sidebar({
                 <div key={item.id} className="relative group">
                   <button
                     id={`tab-btn-${item.id}`}
-                    onClick={() => setActiveTab('reports', activeReportSubTab || 'daily-sales')}
+                    onClick={() => setActiveTab('reports', 'daily-sales')}
                     className={`w-full flex items-center justify-center px-0 py-3 rounded-2xl text-sm font-medium transition-all duration-200 border border-transparent cursor-pointer ${
                       isActive
                         ? 'bg-gray-100/80 text-[#1C1C1C] font-semibold shadow-2xs'
@@ -157,7 +152,7 @@ export default function Sidebar({
                         <FileText className="w-3.5 h-3.5 text-blue-600" />
                         Reports Operations
                       </span>
-                      <span className="text-[10px] font-bold bg-blue-50 text-blue-700 px-2 py-0.5 rounded-full">6 Modules</span>
+                      <span className="text-[10px] font-bold bg-blue-50 text-blue-700 px-2 py-0.5 rounded-full">Daily Sales</span>
                     </div>
                     <div className="space-y-1 mt-1">
                       {reportSubItems.map((sub) => {
@@ -193,11 +188,11 @@ export default function Sidebar({
                 <button
                   id={`tab-btn-${item.id}`}
                   onClick={() => {
-                    if (activeTab !== 'reports') {
-                      setActiveTab('reports', activeReportSubTab || 'daily-sales');
-                      setIsReportsExpanded(true);
-                    } else {
+                    setActiveTab('reports', 'daily-sales');
+                    if (activeTab === 'reports') {
                       setIsReportsExpanded(!isReportsExpanded);
+                    } else {
+                      setIsReportsExpanded(true);
                     }
                   }}
                   className={`w-full flex items-center justify-between px-4 py-3 rounded-2xl text-sm font-medium transition-all duration-200 border border-transparent cursor-pointer ${
