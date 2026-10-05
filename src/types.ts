@@ -68,8 +68,10 @@ export interface ChamberReading {
   chamberNumber: number;
   grade: string;
   openingLiters: number;
+  receivedLiters?: number;
   closingLiters: number;
   openingLevel?: number;
+  receivedLevel?: number;
   closingLevel?: number;
   soldLiters: number;
   ratePerLiter: number;

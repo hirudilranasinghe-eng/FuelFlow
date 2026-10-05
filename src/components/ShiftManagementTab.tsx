@@ -26,7 +26,11 @@ import {
   fetchTouchCardSalesByShift,
   fetchVoucherSalesByShift,
   upsertPumpReadings,
-  isPumpReadingActiveOrAssigned
+  isPumpReadingActiveOrAssigned,
+  savePumperReconciliation,
+  fetchPumperReconciliations,
+  saveForecourtOilReconciliation,
+  fetchForecourtOilReconciliation
 } from '../lib/supabaseClient';
 import { Employee, FuelTank, OilTank, Pump, PumpMachine, PumpReading, Shift, FuelType, ChamberReading, ShiftCounterSales, ShiftGasSale, ShiftLubeSale, PackagedOilItem, ShiftBankDeposit } from '../types';
 import { deductPackagedStock, fetchPackagedLubricants } from '../lib/lubricantsClient';
@@ -49,18 +53,17 @@ interface ShiftManagementTabProps {
   onStartShift: (newShift: Omit<Shift, 'totalFuelSold' | 'totalNetSold' | 'totalNetSales'>) => void;
 }
 
-// Calculate sold liters supporting positive meter progression (closing > opening)
-// and stock depletion mode (closing < opening when closing > 0)
-export const calculateChamberSoldLiters = (opening: number, closing: number): number => {
-  if (closing === undefined || closing === null || closing <= 0 || closing === opening) {
+// Calculate sold liters for 4-chamber dispenser:
+// Net Sales / Dispensed Volume (L) = (Opening Stock + Received Stock) - Closing Stock
+export const calculateChamberSoldLiters = (opening: number, closing: number, received: number = 0): number => {
+  if (closing === undefined || closing === null || closing <= 0) {
     return 0;
   }
-  if (closing > opening) {
-    // Meter progression mode (e.g. Opening: 50, Closing: 60 -> Sold: 10 L)
-    return Number((closing - opening).toFixed(2));
-  }
-  // Stock depletion mode (e.g. Opening: 60 L, Closing: 50 L -> Sold: 10 L)
-  return Number((opening - closing).toFixed(2));
+  const op = Number(opening) || 0;
+  const rec = Number(received) || 0;
+  const cl = Number(closing) || 0;
+  const totalStock = Math.round((op + rec) * 100) / 100;
+  return Math.max(0, Math.round((totalStock - cl) * 100) / 100);
 };
 
 // Deterministic natural sorting helper for pumps and pump readings
@@ -135,6 +138,8 @@ export default function ShiftManagementTab({
   const [lockedStartMeters, setLockedStartMeters] = useState<Record<string, boolean>>({});
   const [lockedEndMeters, setLockedEndMeters] = useState<Record<string, boolean>>({});
   const [finalizedPumperCards, setFinalizedPumperCards] = useState<Record<string, boolean>>({});
+  const [pumperCashInputs, setPumperCashInputs] = useState<Record<string, string>>({});
+  const [pumperNonCashInputs, setPumperNonCashInputs] = useState<Record<string, string>>({});
 
   // Helper to retrieve locks from localStorage
   const getStoredLocks = (shiftId: string) => {
@@ -531,58 +536,127 @@ export default function ShiftManagementTab({
   // Track settled pumpers per active shift
   const [settledPumperIds, setSettledPumperIds] = useState<Record<string, boolean>>({});
 
-// Default 4-chamber dispenser configuration helper
-const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
-  const chambers = (oilTanksList || []).filter(t => t.type === 'chamber' || t.name.toLowerCase().includes('chamber'));
-  const defaultGrades = ['DS 40', 'DS 50', '2T', 'SP 4T'];
-  const defaultRates = [1050, 1100, 950, 1200];
+  // Helper: Retrieve previous shift's recorded closing stock for a specific forecourt chamber
+  const getPreviousClosingForChamber = (chamberId: string, chamberNumber?: number): number | null => {
+    // 1. Check shiftHistory if available (sorted most recent first)
+    if (shiftHistory && Array.isArray(shiftHistory) && shiftHistory.length > 0) {
+      for (const shift of shiftHistory) {
+        if (!shift.pumpReadings) continue;
+        const oilBay = shift.pumpReadings.find(
+          r => r.pumpId === 'pump-oil-bay' || r.fuelType === 'Oil & Lubricants' || r.pumpName?.toLowerCase().includes('dispenser') || r.pumpName?.toLowerCase().includes('oil')
+        );
+        let chList = oilBay?.chamberReadings;
+        if (!chList || !Array.isArray(chList) || chList.length === 0) {
+          try {
+            const cached = localStorage.getItem(`fuelflow_forecourt_oil_${shift.id}`);
+            if (cached) chList = JSON.parse(cached);
+          } catch (_) {}
+        }
+        if (chList && Array.isArray(chList)) {
+          const matchedCh = chList.find(
+            (cr: any) => cr.chamberId === chamberId || cr.chamber_id === chamberId || (chamberNumber && (cr.chamberNumber === chamberNumber || cr.chamber_number === chamberNumber))
+          );
+          if (matchedCh) {
+            const cl = Number(matchedCh.closingLevel ?? matchedCh.closingLiters ?? (matchedCh as any).closing_liters ?? 0);
+            if (cl > 0) return cl;
+          }
+        }
+      }
+    }
 
-  if (chambers.length > 0) {
-    // Sort chambers numerically by chamber number or natural name
-    const sortedChambers = [...chambers].sort((a, b) => {
-      const numA = a.chamberNumber || parseInt((a.name || '').replace(/\D/g, ''), 10) || 0;
-      const numB = b.chamberNumber || parseInt((b.name || '').replace(/\D/g, ''), 10) || 0;
-      return numA - numB;
-    });
+    // 2. Check localStorage cached forecourt chamber closing
+    try {
+      const stored = localStorage.getItem(`fuelflow_chamber_closing_${chamberId}`);
+      if (stored) {
+        const val = parseFloat(stored);
+        if (!isNaN(val) && val > 0) return val;
+      }
+      if (chamberNumber) {
+        const storedByNum = localStorage.getItem(`fuelflow_chamber_closing_ch-0${chamberNumber}`) || localStorage.getItem(`fuelflow_chamber_closing_${chamberNumber}`);
+        if (storedByNum) {
+          const valByNum = parseFloat(storedByNum);
+          if (!isNaN(valByNum) && valByNum > 0) return valByNum;
+        }
+      }
+    } catch (_) {}
 
-    return sortedChambers.map((ch, idx) => {
-      const opLevel = ch.currentLevel !== undefined && ch.currentLevel > 0 ? ch.currentLevel : 60;
+    // 3. Check oilTanks currentLevel
+    const matchedTank = (oilTanks || []).find(
+      t => t.id === chamberId || (chamberNumber && t.chamberNumber === chamberNumber)
+    );
+    if (matchedTank && matchedTank.currentLevel !== undefined && matchedTank.currentLevel > 0) {
+      return matchedTank.currentLevel;
+    }
+
+    return null;
+  };
+
+  // Default 4-chamber dispenser configuration helper with automatic carry-forward
+  const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
+    const chambers = (oilTanksList || []).filter(t => t.type === 'chamber' || t.name.toLowerCase().includes('chamber'));
+    const defaultGrades = ['DS 40', 'DS 50', '2T', 'SP 4T'];
+    const defaultRates = [1050, 1100, 950, 1200];
+
+    if (chambers.length > 0) {
+      // Sort chambers numerically by chamber number or natural name
+      const sortedChambers = [...chambers].sort((a, b) => {
+        const numA = a.chamberNumber || parseInt((a.name || '').replace(/\D/g, ''), 10) || 0;
+        const numB = b.chamberNumber || parseInt((b.name || '').replace(/\D/g, ''), 10) || 0;
+        return numA - numB;
+      });
+
+      return sortedChambers.map((ch, idx) => {
+        const chNum = ch.chamberNumber || (idx + 1);
+        const prevClosing = getPreviousClosingForChamber(ch.id, chNum);
+        const opLevel = prevClosing !== null && prevClosing > 0
+          ? prevClosing
+          : (ch.currentLevel !== undefined && ch.currentLevel > 0 ? ch.currentLevel : 60);
+
+        return {
+          chamberId: ch.id,
+          chamberNumber: chNum,
+          grade: ch.grade || defaultGrades[idx % 4],
+          openingLiters: opLevel,
+          openingLevel: opLevel,
+          receivedLiters: 0,
+          receivedLevel: 0,
+          closingLiters: 0,
+          closingLevel: 0,
+          soldLiters: 0,
+          ratePerLiter: ch.pricePerLiter || defaultRates[idx % 4],
+          totalAmount: 0
+        };
+      });
+    }
+
+    // Default 4 forecourt dispenser chambers (Ch 01 DS 40, Ch 02 DS 50, Ch 03 2T, Ch 04 SP 4T)
+    const defaultForecourtChambers = [
+      { id: 'ch-01', chamberNumber: 1, grade: 'DS 40', currentLevel: 60, pricePerLiter: 1050 },
+      { id: 'ch-02', chamberNumber: 2, grade: 'DS 50', currentLevel: 60, pricePerLiter: 1100 },
+      { id: 'ch-03', chamberNumber: 3, grade: '2T', currentLevel: 60, pricePerLiter: 950 },
+      { id: 'ch-04', chamberNumber: 4, grade: 'SP 4T', currentLevel: 60, pricePerLiter: 1200 }
+    ];
+
+    return defaultForecourtChambers.map(ch => {
+      const prevClosing = getPreviousClosingForChamber(ch.id, ch.chamberNumber);
+      const opLevel = prevClosing !== null && prevClosing > 0 ? prevClosing : ch.currentLevel;
+
       return {
         chamberId: ch.id,
-        chamberNumber: ch.chamberNumber || (idx + 1),
-        grade: ch.grade || defaultGrades[idx % 4],
+        chamberNumber: ch.chamberNumber,
+        grade: ch.grade,
         openingLiters: opLevel,
-        closingLiters: 0,
         openingLevel: opLevel,
+        receivedLiters: 0,
+        receivedLevel: 0,
+        closingLiters: 0,
         closingLevel: 0,
         soldLiters: 0,
-        ratePerLiter: ch.pricePerLiter || defaultRates[idx % 4],
+        ratePerLiter: ch.pricePerLiter,
         totalAmount: 0
       };
     });
-  }
-
-  // Default 4 forecourt dispenser chambers (Ch 01 DS 40, Ch 02 DS 50, Ch 03 2T, Ch 04 SP 4T)
-  const defaultForecourtChambers = [
-    { id: 'ch-01', chamberNumber: 1, grade: 'DS 40', currentLevel: 60, pricePerLiter: 1050 },
-    { id: 'ch-02', chamberNumber: 2, grade: 'DS 50', currentLevel: 60, pricePerLiter: 1100 },
-    { id: 'ch-03', chamberNumber: 3, grade: '2T', currentLevel: 60, pricePerLiter: 950 },
-    { id: 'ch-04', chamberNumber: 4, grade: 'SP 4T', currentLevel: 60, pricePerLiter: 1200 }
-  ];
-
-  return defaultForecourtChambers.map(ch => ({
-    chamberId: ch.id,
-    chamberNumber: ch.chamberNumber,
-    grade: ch.grade,
-    openingLiters: ch.currentLevel,
-    closingLiters: 0,
-    openingLevel: ch.currentLevel,
-    closingLevel: 0,
-    soldLiters: 0,
-    ratePerLiter: ch.pricePerLiter,
-    totalAmount: 0
-  }));
-};
+  };
 
   // Sync draft states when activeShift changes
   const lastSyncedShiftIdRef = React.useRef<string | null>(null);
@@ -604,6 +678,8 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       const initialLockedStarts: Record<string, boolean> = {};
       const initialLockedEnds: Record<string, boolean> = {};
       const initialFinalized: Record<string, boolean> = {};
+      const initialCashInputs: Record<string, string> = {};
+      const initialNonCashInputs: Record<string, string> = {};
 
       const storedLocks = getStoredLocks(activeShift.id);
       if (storedLocks) {
@@ -611,6 +687,48 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         if (storedLocks.lockedEndMeters) Object.assign(initialLockedEnds, storedLocks.lockedEndMeters);
         if (storedLocks.finalizedPumperCards) Object.assign(initialFinalized, storedLocks.finalizedPumperCards);
       }
+
+      // Synchronously re-hydrate local reconciliation cache for instant zero-latency paint
+      try {
+        const prefix = `fuelflow_pumper_reconciliation_${activeShift.id}_`;
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (key && key.startsWith(prefix)) {
+            const raw = localStorage.getItem(key);
+            if (raw) {
+              const rec = JSON.parse(raw);
+              const pid = rec.pumper_id || rec.pumperId;
+              if (pid) {
+                const handedCash = Number(rec.handed_over_cash ?? rec.handedovercash ?? rec.actual_cash ?? rec.actualcash) || 0;
+                const credit = Number(rec.credit_sales ?? rec.creditsales) || 0;
+                const card = Number(rec.card_sales ?? rec.cardsales) || 0;
+                const touchCard = Number(rec.touch_card_sales ?? rec.touchcardsales) || 0;
+                const voucher = Number(rec.voucher_sales ?? rec.vouchersales) || 0;
+                const isCompleted = rec.status === 'Completed';
+
+                if (isCompleted || handedCash > 0) {
+                  initialCashInputs[pid] = (Math.round(handedCash * 100) / 100).toString();
+                }
+                if (isCompleted || credit > 0) {
+                  initialNonCashInputs[`${pid}_credit`] = (Math.round(credit * 100) / 100).toString();
+                }
+                if (isCompleted || card > 0) {
+                  initialNonCashInputs[`${pid}_card`] = (Math.round(card * 100) / 100).toString();
+                }
+                if (isCompleted || touchCard > 0) {
+                  initialNonCashInputs[`${pid}_touchCard`] = (Math.round(touchCard * 100) / 100).toString();
+                }
+                if (isCompleted || voucher > 0) {
+                  initialNonCashInputs[`${pid}_voucher`] = (Math.round(voucher * 100) / 100).toString();
+                }
+                if (isCompleted) {
+                  initialFinalized[pid] = true;
+                }
+              }
+            }
+          }
+        }
+      } catch (_) {}
 
       currentReadings.forEach(r => {
         if (r.isStartSaved || initialLockedStarts[r.pumpId] || (r.isLocked && r.startMeter !== undefined && r.startMeter >= 0)) {
@@ -621,6 +739,28 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         }
         if (r.assignedPumperId && (r.isCardFinalized || initialFinalized[r.assignedPumperId] || (r.isLocked && r.status === 'Completed'))) {
           initialFinalized[r.assignedPumperId] = true;
+        }
+        if (r.assignedPumperId) {
+          const actCash = Number(r.actualCash) || 0;
+          if (actCash > 0 && initialCashInputs[r.assignedPumperId] === undefined) {
+            initialCashInputs[r.assignedPumperId] = (Math.round(actCash * 100) / 100).toString();
+          }
+          const cred = Number(r.creditSalesAmount) || 0;
+          if (cred > 0 && initialNonCashInputs[`${r.assignedPumperId}_credit`] === undefined) {
+            initialNonCashInputs[`${r.assignedPumperId}_credit`] = (Math.round(cred * 100) / 100).toString();
+          }
+          const card = Number(r.cardSalesAmount) || 0;
+          if (card > 0 && initialNonCashInputs[`${r.assignedPumperId}_card`] === undefined) {
+            initialNonCashInputs[`${r.assignedPumperId}_card`] = (Math.round(card * 100) / 100).toString();
+          }
+          const tc = Number(r.touchCardSalesAmount) || 0;
+          if (tc > 0 && initialNonCashInputs[`${r.assignedPumperId}_touchCard`] === undefined) {
+            initialNonCashInputs[`${r.assignedPumperId}_touchCard`] = (Math.round(tc * 100) / 100).toString();
+          }
+          const vc = Number(r.voucherSalesAmount) || 0;
+          if (vc > 0 && initialNonCashInputs[`${r.assignedPumperId}_voucher`] === undefined) {
+            initialNonCashInputs[`${r.assignedPumperId}_voucher`] = (Math.round(vc * 100) / 100).toString();
+          }
         }
       });
 
@@ -634,23 +774,35 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
           if (isOil) {
             let chReadings = existing.chamberReadings;
             if (!chReadings || chReadings.length === 0) {
+              try {
+                const cached = localStorage.getItem(`fuelflow_forecourt_oil_${activeShift.id}`);
+                if (cached) {
+                  const parsed = JSON.parse(cached);
+                  if (Array.isArray(parsed) && parsed.length > 0) chReadings = parsed;
+                }
+              } catch (_) {}
+            }
+            if (!chReadings || chReadings.length === 0) {
               chReadings = getDefaultChambers(oilTanks);
             } else if (!isCardFinalized && existing.status !== 'Completed') {
               // Ensure closing stock defaults to 0 instead of defaulting to opening stock (60)
               chReadings = chReadings.map(ch => {
                 const op = ch.openingLevel ?? ch.openingLiters ?? 0;
+                const rec = ch.receivedLevel ?? ch.receivedLiters ?? 0;
                 const cl = ch.closingLevel ?? ch.closingLiters ?? 0;
                 // If closing was defaulted to opening (old 60 default) with no sales, reset closing to 0
                 const effectiveCl = (cl === op && (!ch.soldLiters || ch.soldLiters === 0)) ? 0 : cl;
-                const sold = calculateChamberSoldLiters(op, effectiveCl);
+                const sold = calculateChamberSoldLiters(op, effectiveCl, rec);
                 return {
                   ...ch,
                   openingLevel: op,
                   openingLiters: op,
+                  receivedLevel: rec,
+                  receivedLiters: rec,
                   closingLevel: effectiveCl,
                   closingLiters: effectiveCl,
                   soldLiters: sold,
-                  totalAmount: sold * (ch.ratePerLiter || 0)
+                  totalAmount: Math.round(sold * (ch.ratePerLiter || 0) * 100) / 100
                 };
               });
             }
@@ -747,44 +899,164 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       setLockedStartMeters(initialLockedStarts);
       setLockedEndMeters(initialLockedEnds);
       setFinalizedPumperCards(initialFinalized);
+      setPumperCashInputs(initialCashInputs);
+      setPumperNonCashInputs(initialNonCashInputs);
 
-      // Load saved Credit, Card POS, Touch Card & Voucher sales from Supabase for this active shift
+      // Load saved Credit, Card POS, Touch Card, Voucher sales & Pumper Reconciliations from Supabase for this active shift
       const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
       if (isConfigured && activeShift?.id) {
         Promise.all([
           fetchCreditSalesByShift(supabase, activeShift.id),
           fetchCardSalesByShift(supabase, activeShift.id),
           fetchTouchCardSalesByShift(supabase, activeShift.id),
-          fetchVoucherSalesByShift(supabase, activeShift.id)
-        ]).then(([cData, cardData, tcData, vData]) => {
-          if ((cData && cData.length > 0) || (cardData && cardData.length > 0) || (tcData && tcData.length > 0) || (vData && vData.length > 0)) {
+          fetchVoucherSalesByShift(supabase, activeShift.id),
+          fetchPumperReconciliations(supabase, activeShift.id),
+          fetchForecourtOilReconciliation(supabase, activeShift.id)
+        ]).then(([cData, cardData, tcData, vData, reconciledList, forecourtOilList]) => {
+          if (reconciledList && reconciledList.length > 0) {
+            const rehydratedCash: Record<string, string> = {};
+            const rehydratedNonCash: Record<string, string> = {};
+            const rehydratedFinalized: Record<string, boolean> = {};
+
+            reconciledList.forEach((rec: any) => {
+              const pid = rec.pumper_id || rec.pumperId;
+              if (!pid) return;
+
+              const handedCash = Number(rec.handed_over_cash ?? rec.handedovercash ?? rec.actual_cash ?? rec.actualcash) || 0;
+              const credit = Number(rec.credit_sales ?? rec.creditsales) || 0;
+              const card = Number(rec.card_sales ?? rec.cardsales) || 0;
+              const touchCard = Number(rec.touch_card_sales ?? rec.touchcardsales) || 0;
+              const voucher = Number(rec.voucher_sales ?? rec.vouchersales) || 0;
+              const isCompleted = rec.status === 'Completed';
+
+              if (isCompleted || handedCash > 0) {
+                rehydratedCash[pid] = (Math.round(handedCash * 100) / 100).toString();
+              }
+              if (isCompleted || credit > 0) {
+                rehydratedNonCash[`${pid}_credit`] = (Math.round(credit * 100) / 100).toString();
+              }
+              if (isCompleted || card > 0) {
+                rehydratedNonCash[`${pid}_card`] = (Math.round(card * 100) / 100).toString();
+              }
+              if (isCompleted || touchCard > 0) {
+                rehydratedNonCash[`${pid}_touchCard`] = (Math.round(touchCard * 100) / 100).toString();
+              }
+              if (isCompleted || voucher > 0) {
+                rehydratedNonCash[`${pid}_voucher`] = (Math.round(voucher * 100) / 100).toString();
+              }
+              if (isCompleted) {
+                rehydratedFinalized[pid] = true;
+              }
+            });
+
+            setPumperCashInputs(prev => ({ ...rehydratedCash, ...prev }));
+            setPumperNonCashInputs(prev => ({ ...rehydratedNonCash, ...prev }));
+            setFinalizedPumperCards(prev => ({ ...prev, ...rehydratedFinalized }));
+            setSavedPumperCards(prev => ({ ...prev, ...rehydratedFinalized }));
+          }
+
+          if ((cData && cData.length > 0) || (cardData && cardData.length > 0) || (tcData && tcData.length > 0) || (vData && vData.length > 0) || (reconciledList && reconciledList.length > 0) || (forecourtOilList && forecourtOilList.length > 0)) {
             setDraftReadings(prev => {
               if (!prev || prev.length === 0) return prev;
               let hasChanges = false;
               const updated = prev.map(r => {
+                const isOil = r.pumpId === 'pump-oil-bay' || r.fuelType === 'Oil & Lubricants' || r.pumpName?.toLowerCase().includes('dispenser') || r.pumpName?.toLowerCase().includes('oil');
+                let updatedChambers = r.chamberReadings;
+
+                if (isOil && forecourtOilList && forecourtOilList.length > 0) {
+                  const baseChambers = (r.chamberReadings && r.chamberReadings.length > 0)
+                    ? r.chamberReadings
+                    : getDefaultChambers(oilTanks);
+
+                  updatedChambers = baseChambers.map((baseCh, idx) => {
+                    const chId = baseCh.chamberId || `ch_${idx + 1}`;
+                    const chNum = baseCh.chamberNumber || (idx + 1);
+                    const matched = forecourtOilList.find((f: any) =>
+                      (f.chamber_id && f.chamber_id === chId) ||
+                      (f.chamberId && f.chamberId === chId) ||
+                      (f.chamber_number && Number(f.chamber_number) === chNum) ||
+                      (f.chamberNumber && Number(f.chamberNumber) === chNum)
+                    );
+                    if (!matched) return baseCh;
+
+                    const op = Number(matched.opening_liters ?? matched.openingLiters ?? matched.opening_level ?? matched.openingLevel ?? baseCh.openingLevel ?? baseCh.openingLiters ?? 0);
+                    const rec = Number(matched.received_liters ?? matched.receivedLiters ?? matched.received_level ?? matched.receivedLevel ?? baseCh.receivedLevel ?? baseCh.receivedLiters ?? 0);
+                    const cl = Number(matched.closing_liters ?? matched.closingLiters ?? matched.closing_level ?? matched.closingLevel ?? baseCh.closingLevel ?? baseCh.closingLiters ?? 0);
+                    const sold = calculateChamberSoldLiters(op, cl, rec);
+                    const rate = Number(matched.rate_per_liter ?? matched.ratePerLiter ?? baseCh.ratePerLiter ?? 0);
+                    const total = Math.round(sold * rate * 100) / 100;
+
+                    return {
+                      ...baseCh,
+                      chamberId: chId,
+                      chamberNumber: chNum,
+                      grade: matched.grade || baseCh.grade,
+                      openingLiters: op,
+                      openingLevel: op,
+                      receivedLiters: rec,
+                      receivedLevel: rec,
+                      closingLiters: cl,
+                      closingLevel: cl,
+                      soldLiters: sold,
+                      ratePerLiter: rate,
+                      totalAmount: total
+                    };
+                  });
+                }
+
                 const cMatch = cData?.find((c: any) => (c.pump_id || c.pumpid) === r.pumpId || (r.assignedPumperId && (c.pumper_id || c.pumperid) === r.assignedPumperId));
                 const cardMatch = cardData?.find((cd: any) => (cd.pump_id || cd.pumpid) === r.pumpId || (r.assignedPumperId && (cd.pumper_id || cd.pumperid) === r.assignedPumperId));
                 const tcMatch = tcData?.find((t: any) => (t.pump_id || t.pumpid) === r.pumpId || (r.assignedPumperId && (t.pumper_id || t.pumperid) === r.assignedPumperId));
                 const vMatch = vData?.find((v: any) => (v.pump_id || v.pumpid) === r.pumpId || (r.assignedPumperId && (v.pumper_id || v.pumperid) === r.assignedPumperId));
+                const recMatch = reconciledList?.find((rec: any) => (rec.pumper_id || rec.pumperId) === r.assignedPumperId);
 
-                const cAmount = cMatch ? Number(cMatch.amount || cMatch.credit_amount || cMatch.total_amount) : r.creditSalesAmount;
-                const cardAmount = cardMatch ? Number(cardMatch.amount || cardMatch.card_amount || cardMatch.total_amount) : r.cardSalesAmount;
-                const tcAmount = tcMatch ? Number(tcMatch.amount || tcMatch.touch_card_amount || tcMatch.total_amount) : r.touchCardSalesAmount;
-                const vAmount = vMatch ? Number(vMatch.amount || vMatch.voucher_amount || vMatch.total_amount) : r.voucherSalesAmount;
+                const cAmount = cMatch ? Number(cMatch.amount || cMatch.credit_amount || cMatch.total_amount) : (recMatch ? Number(recMatch.credit_sales ?? recMatch.creditsales) : r.creditSalesAmount);
+                const cardAmount = cardMatch ? Number(cardMatch.amount || cardMatch.card_amount || cardMatch.total_amount) : (recMatch ? Number(recMatch.card_sales ?? recMatch.cardsales) : r.cardSalesAmount);
+                const tcAmount = tcMatch ? Number(tcMatch.amount || tcMatch.touch_card_amount || tcMatch.total_amount) : (recMatch ? Number(recMatch.touch_card_sales ?? recMatch.touchcardsales) : r.touchCardSalesAmount);
+                const vAmount = vMatch ? Number(vMatch.amount || vMatch.voucher_amount || vMatch.total_amount) : (recMatch ? Number(recMatch.voucher_sales ?? recMatch.vouchersales) : r.voucherSalesAmount);
+
+                const recCash = recMatch ? (Number(recMatch.handed_over_cash ?? recMatch.handedovercash ?? recMatch.actual_cash ?? recMatch.actualcash) || 0) : 0;
+                const recCompleted = recMatch?.status === 'Completed';
+
+                const assignedPumps = prev.filter(p => p.assignedPumperId === r.assignedPumperId);
+                const pCount = assignedPumps.length || 1;
+                const targetCash = (r.actualCash && r.actualCash > 0) ? r.actualCash : (pCount === 1 ? recCash : Math.round((recCash / pCount) * 100) / 100);
+
+                const nextActualCash = targetCash > 0 ? targetCash : r.actualCash;
+                const nextCredit = cAmount !== undefined && cAmount > 0 ? cAmount : r.creditSalesAmount;
+                const nextCard = cardAmount !== undefined && cardAmount > 0 ? cardAmount : r.cardSalesAmount;
+                const nextTc = tcAmount !== undefined && tcAmount > 0 ? tcAmount : r.touchCardSalesAmount;
+                const nextVoucher = vAmount !== undefined && vAmount > 0 ? vAmount : r.voucherSalesAmount;
+                const nextIsFinalized = recCompleted ? true : r.isCardFinalized;
+                const nextIsLocked = recCompleted ? true : r.isLocked;
+                const nextStatus = recCompleted ? 'Completed' as const : r.status;
+                const nextOilSales = updatedChambers ? updatedChambers.reduce((sum, ch) => sum + (ch.totalAmount || 0), 0) : (r.oilSalesAmount || 0);
 
                 if (
-                  (cAmount !== undefined && cAmount !== r.creditSalesAmount) ||
-                  (cardAmount !== undefined && cardAmount !== r.cardSalesAmount) ||
-                  (tcAmount !== undefined && tcAmount !== r.touchCardSalesAmount) ||
-                  (vAmount !== undefined && vAmount !== r.voucherSalesAmount)
+                  nextActualCash !== r.actualCash ||
+                  nextCredit !== r.creditSalesAmount ||
+                  nextCard !== r.cardSalesAmount ||
+                  nextTc !== r.touchCardSalesAmount ||
+                  nextVoucher !== r.voucherSalesAmount ||
+                  nextIsFinalized !== r.isCardFinalized ||
+                  nextIsLocked !== r.isLocked ||
+                  nextStatus !== r.status ||
+                  nextOilSales !== r.oilSalesAmount ||
+                  updatedChambers !== r.chamberReadings
                 ) {
                   hasChanges = true;
                   return {
                     ...r,
-                    creditSalesAmount: cAmount ?? r.creditSalesAmount,
-                    cardSalesAmount: cardAmount ?? r.cardSalesAmount,
-                    touchCardSalesAmount: tcAmount ?? r.touchCardSalesAmount,
-                    voucherSalesAmount: vAmount ?? r.voucherSalesAmount
+                    actualCash: nextActualCash,
+                    creditSalesAmount: nextCredit,
+                    cardSalesAmount: nextCard,
+                    touchCardSalesAmount: nextTc,
+                    voucherSalesAmount: nextVoucher,
+                    isCardFinalized: nextIsFinalized,
+                    isLocked: nextIsLocked,
+                    status: nextStatus,
+                    chamberReadings: updatedChambers,
+                    oilSalesAmount: nextOilSales
                   };
                 }
                 return r;
@@ -793,7 +1065,7 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
             });
           }
         }).catch(err => {
-          console.warn("Notice: Error loading non-cash sales for active shift:", err);
+          console.warn("Notice: Error loading non-cash sales & pumper reconciliations for active shift:", err);
         });
       }
     } else {
@@ -1205,31 +1477,32 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
     const totalLubeSales = draftCounterSales.totalLubeSales !== undefined 
       ? draftCounterSales.totalLubeSales 
       : (draftCounterSales.lubeSales || []).reduce((sum, l) => sum + (Number(l.totalAmount) || 0), 0);
-    const totalCounterRevenue = totalGasSales + totalLubeSales;
-    const totalGrossSales = totalFuelSales + totalOilSales + totalGasSales + totalLubeSales;
+    const totalCounterRevenue = Math.round((totalGasSales + totalLubeSales) * 100) / 100;
+    const totalGrossSales = Math.round((totalFuelSales + totalOilSales + totalGasSales + totalLubeSales) * 100) / 100;
     const totalNetSales = totalGrossSales;
-    const totalNonCashSales = totalCreditSales + totalCardSales + totalTouchCardSales + totalVoucherSales;
-    const totalExpectedCash = Math.max(0, totalGrossSales - totalNonCashSales);
-    const totalCashVariance = totalActualCash - totalExpectedCash;
+    const totalNonCashSales = Math.round((totalCreditSales + totalCardSales + totalTouchCardSales + totalVoucherSales) * 100) / 100;
+    const totalExpectedCash = Math.max(0, Math.round((totalGrossSales - totalNonCashSales) * 100) / 100);
+    const roundedActualCash = Math.round(totalActualCash * 100) / 100;
+    const totalCashVariance = Math.round((roundedActualCash - totalExpectedCash) * 100) / 100;
 
     return {
       runningPumps,
       totalFuelSold,
       totalNetSold,
-      totalFuelSales,
-      totalOilSales,
-      totalGasSales,
-      totalLubeSales,
-      totalPackagedLubeSales: totalLubeSales,
-      totalCreditSales,
-      totalCardSales,
-      totalTouchCardSales,
-      totalVoucherSales,
+      totalFuelSales: Math.round(totalFuelSales * 100) / 100,
+      totalOilSales: Math.round(totalOilSales * 100) / 100,
+      totalGasSales: Math.round(totalGasSales * 100) / 100,
+      totalLubeSales: Math.round(totalLubeSales * 100) / 100,
+      totalPackagedLubeSales: Math.round(totalLubeSales * 100) / 100,
+      totalCreditSales: Math.round(totalCreditSales * 100) / 100,
+      totalCardSales: Math.round(totalCardSales * 100) / 100,
+      totalTouchCardSales: Math.round(totalTouchCardSales * 100) / 100,
+      totalVoucherSales: Math.round(totalVoucherSales * 100) / 100,
       totalNonCashSales,
       totalExpectedCash,
       expectedCash: totalExpectedCash,
-      totalActualCash,
-      actualCash: totalActualCash,
+      totalActualCash: roundedActualCash,
+      actualCash: roundedActualCash,
       totalCashVariance,
       cashVariance: totalCashVariance,
       totalCounterRevenue,
@@ -1410,23 +1683,24 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         totalActualCash += actCash;
       });
 
-      const totalNonCash = totalCreditSales + totalCardSales + totalTouchCardSales + totalVoucherSales;
-      const totalNetExpCash = Math.max(0, totalGrossRevenue - totalNonCash);
-      const totalCashVariance = totalActualCash - totalNetExpCash;
+      const totalNonCash = Math.round((totalCreditSales + totalCardSales + totalTouchCardSales + totalVoucherSales) * 100) / 100;
+      const totalNetExpCash = Math.max(0, Math.round((totalGrossRevenue - totalNonCash) * 100) / 100);
+      const roundedActualCash = Math.round(totalActualCash * 100) / 100;
+      const totalCashVariance = Math.round((roundedActualCash - totalNetExpCash) * 100) / 100;
 
       return {
         ...pumper,
-        totalGrossRevenue,
-        totalFuelRevenue,
-        totalOilSales,
-        totalNetLiters,
+        totalGrossRevenue: Math.round(totalGrossRevenue * 100) / 100,
+        totalFuelRevenue: Math.round(totalFuelRevenue * 100) / 100,
+        totalOilSales: Math.round(totalOilSales * 100) / 100,
+        totalNetLiters: Math.round(totalNetLiters * 100) / 100,
         totalNonCash,
-        totalCreditSales,
-        totalCardSales,
-        totalTouchCardSales,
-        totalVoucherSales,
+        totalCreditSales: Math.round(totalCreditSales * 100) / 100,
+        totalCardSales: Math.round(totalCardSales * 100) / 100,
+        totalTouchCardSales: Math.round(totalTouchCardSales * 100) / 100,
+        totalVoucherSales: Math.round(totalVoucherSales * 100) / 100,
         totalNetExpCash,
-        totalActualCash,
+        totalActualCash: roundedActualCash,
         totalCashVariance,
         overallVariance: totalCashVariance
       };
@@ -1441,6 +1715,9 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
     if (!activeShift) return;
     if (finalizedPumperCards[pumperId]) return;
 
+    // Cleanly round incoming cash to 2 decimals
+    const cleanTotalCash = Math.round(Number(newTotalCash || 0) * 100) / 100;
+
     const pumperReadings = draftReadings.filter(r => r.assignedPumperId === pumperId);
     if (pumperReadings.length === 0) return;
 
@@ -1449,37 +1726,37 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       const isOil = r.pumpId === 'pump-oil-bay' || r.fuelType === 'Oil & Lubricants' || r.pumpName?.toLowerCase().includes('oil');
       const fuelSold = isOil ? 0 : Math.max(0, r.endMeter - r.startMeter);
       const netSold = isOil ? 0 : Math.max(0, fuelSold - r.testingQty);
-      const grossFuelRev = netSold * fuelPrice;
-      const oilSales = r.oilSalesAmount || 0;
-      const grossTotalRev = grossFuelRev + oilSales;
-      const creditVal = r.creditSalesAmount || 0;
-      const cardVal = r.cardSalesAmount || 0;
-      const touchCardVal = r.touchCardSalesAmount || 0;
-      const voucherVal = r.voucherSalesAmount || 0;
-      const totalPumpNonCash = creditVal + cardVal + touchCardVal + voucherVal;
-      const rawNetExpCash = grossTotalRev - totalPumpNonCash;
+      const grossFuelRev = Math.round((netSold * fuelPrice) * 100) / 100;
+      const oilSales = Math.round((r.oilSalesAmount || 0) * 100) / 100;
+      const grossTotalRev = Math.round((grossFuelRev + oilSales) * 100) / 100;
+      const creditVal = Math.round((r.creditSalesAmount || 0) * 100) / 100;
+      const cardVal = Math.round((r.cardSalesAmount || 0) * 100) / 100;
+      const touchCardVal = Math.round((r.touchCardSalesAmount || 0) * 100) / 100;
+      const voucherVal = Math.round((r.voucherSalesAmount || 0) * 100) / 100;
+      const totalPumpNonCash = Math.round((creditVal + cardVal + touchCardVal + voucherVal) * 100) / 100;
+      const rawNetExpCash = Math.round((grossTotalRev - totalPumpNonCash) * 100) / 100;
       return { pumpId: r.pumpId, grossTotalRev, creditVal, cardVal, touchCardVal, voucherVal, totalPumpNonCash, rawNetExpCash, status: r.status };
     });
 
-    const totalGrossRevenue = pumpData.reduce((acc, p) => acc + p.grossTotalRev, 0);
-    const totalNonCash = pumpData.reduce((acc, p) => acc + p.totalPumpNonCash, 0);
-    const totalNetExpCash = Math.max(0, totalGrossRevenue - totalNonCash);
+    const totalGrossRevenue = Math.round(pumpData.reduce((acc, p) => acc + p.grossTotalRev, 0) * 100) / 100;
+    const totalNonCash = Math.round(pumpData.reduce((acc, p) => acc + p.totalPumpNonCash, 0) * 100) / 100;
+    const totalNetExpCash = Math.max(0, Math.round((totalGrossRevenue - totalNonCash) * 100) / 100);
 
     let allocatedSoFar = 0;
     const newCashPerPump: Record<string, number> = {};
 
     pumpData.forEach((p, idx) => {
       if (idx === pumpData.length - 1) {
-        newCashPerPump[p.pumpId] = Math.max(0, Math.round((newTotalCash - allocatedSoFar) * 100) / 100);
+        newCashPerPump[p.pumpId] = Math.max(0, Math.round((cleanTotalCash - allocatedSoFar) * 100) / 100);
       } else {
         let allocated = 0;
         if (totalGrossRevenue > 0) {
-          allocated = Math.round((p.grossTotalRev / totalGrossRevenue) * newTotalCash * 100) / 100;
+          allocated = Math.round((p.grossTotalRev / totalGrossRevenue) * cleanTotalCash * 100) / 100;
         } else {
-          allocated = Math.round((newTotalCash / pumpData.length) * 100) / 100;
+          allocated = Math.round((cleanTotalCash / pumpData.length) * 100) / 100;
         }
         newCashPerPump[p.pumpId] = allocated;
-        allocatedSoFar += allocated;
+        allocatedSoFar = Math.round((allocatedSoFar + allocated) * 100) / 100;
       }
     });
 
@@ -1492,17 +1769,17 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         const isOil = r.pumpId === 'pump-oil-bay' || r.fuelType === 'Oil & Lubricants' || r.pumpName?.toLowerCase().includes('oil');
         const fuelSold = isOil ? 0 : Math.max(0, r.endMeter - r.startMeter);
         const netSold = isOil ? 0 : Math.max(0, fuelSold - r.testingQty);
-        const grossFuelRev = netSold * fuelPrice;
-        const oilSales = r.oilSalesAmount || 0;
-        const grossTotalRev = grossFuelRev + oilSales;
-        const creditVal = r.creditSalesAmount || 0;
-        const cardVal = r.cardSalesAmount || 0;
-        const touchCardVal = r.touchCardSalesAmount || 0;
-        const voucherVal = r.voucherSalesAmount || 0;
-        const totalPumpNonCash = creditVal + cardVal + touchCardVal + voucherVal;
-        const rawNet = grossTotalRev - totalPumpNonCash;
+        const grossFuelRev = Math.round((netSold * fuelPrice) * 100) / 100;
+        const oilSales = Math.round((r.oilSalesAmount || 0) * 100) / 100;
+        const grossTotalRev = Math.round((grossFuelRev + oilSales) * 100) / 100;
+        const creditVal = Math.round((r.creditSalesAmount || 0) * 100) / 100;
+        const cardVal = Math.round((r.cardSalesAmount || 0) * 100) / 100;
+        const touchCardVal = Math.round((r.touchCardSalesAmount || 0) * 100) / 100;
+        const voucherVal = Math.round((r.voucherSalesAmount || 0) * 100) / 100;
+        const totalPumpNonCash = Math.round((creditVal + cardVal + touchCardVal + voucherVal) * 100) / 100;
+        const rawNet = Math.round((grossTotalRev - totalPumpNonCash) * 100) / 100;
         const netExpCash = (rawNet < 0 && pumperHasExcessRevenue) ? rawNet : Math.max(0, rawNet);
-        const computedVariance = actCash - netExpCash;
+        const computedVariance = Math.round((actCash - netExpCash) * 100) / 100;
 
         return {
           ...r,
@@ -1535,6 +1812,159 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       totalNetSold: totalNet,
       totalNetSales: totalSales
     });
+  };
+
+  // Handle consolidated single non-cash entry (Credit, Card, Touch Card, Voucher) per pumper
+  const handleUpdateConsolidatedNonCashForPumper = (
+    pumperId: string,
+    field: 'creditSalesAmount' | 'cardSalesAmount' | 'touchCardSalesAmount' | 'voucherSalesAmount',
+    newAmount: number
+  ) => {
+    if (!activeShift) return;
+    if (finalizedPumperCards[pumperId]) return;
+
+    const cleanAmount = Math.max(0, Math.round(Number(newAmount || 0) * 100) / 100);
+
+    const pumperReadings = draftReadings.filter(r => r.assignedPumperId === pumperId);
+    if (pumperReadings.length === 0) return;
+
+    const pumpData = pumperReadings.map(r => {
+      const fuelPrice = getPriceForFuelType(r.fuelType);
+      const isOil = r.pumpId === 'pump-oil-bay' || r.fuelType === 'Oil & Lubricants' || r.pumpName?.toLowerCase().includes('oil');
+      const fuelSold = isOil ? 0 : Math.max(0, r.endMeter - r.startMeter);
+      const netSold = isOil ? 0 : Math.max(0, fuelSold - r.testingQty);
+      const grossFuelRev = Math.round((netSold * fuelPrice) * 100) / 100;
+      const oilSales = Math.round((r.oilSalesAmount || 0) * 100) / 100;
+      const grossTotalRev = Math.round((grossFuelRev + oilSales) * 100) / 100;
+      return { pumpId: r.pumpId, grossTotalRev, netSold, fuelType: r.fuelType };
+    });
+
+    const totalGrossRevenue = Math.round(pumpData.reduce((acc, p) => acc + p.grossTotalRev, 0) * 100) / 100;
+
+    let allocatedSoFar = 0;
+    const newFieldPerPump: Record<string, number> = {};
+
+    pumpData.forEach((p, idx) => {
+      if (idx === pumpData.length - 1) {
+        newFieldPerPump[p.pumpId] = Math.max(0, Math.round((cleanAmount - allocatedSoFar) * 100) / 100);
+      } else {
+        let allocated = 0;
+        if (totalGrossRevenue > 0) {
+          allocated = Math.round((p.grossTotalRev / totalGrossRevenue) * cleanAmount * 100) / 100;
+        } else {
+          allocated = Math.round((cleanAmount / pumpData.length) * 100) / 100;
+        }
+        newFieldPerPump[p.pumpId] = allocated;
+        allocatedSoFar = Math.round((allocatedSoFar + allocated) * 100) / 100;
+      }
+    });
+
+    const updatedReadings = draftReadings.map(r => {
+      if (r.assignedPumperId === pumperId && newFieldPerPump[r.pumpId] !== undefined) {
+        const val = newFieldPerPump[r.pumpId];
+        const fuelPrice = getPriceForFuelType(r.fuelType);
+        const isOil = r.pumpId === 'pump-oil-bay' || r.fuelType === 'Oil & Lubricants' || r.pumpName?.toLowerCase().includes('oil');
+        const fuelSold = isOil ? 0 : Math.max(0, r.endMeter - r.startMeter);
+        const netSold = isOil ? 0 : Math.max(0, fuelSold - r.testingQty);
+        const grossFuelRev = Math.round((netSold * fuelPrice) * 100) / 100;
+        const oilSales = Math.round((r.oilSalesAmount || 0) * 100) / 100;
+        const grossTotalRev = Math.round((grossFuelRev + oilSales) * 100) / 100;
+
+        const creditVal = field === 'creditSalesAmount' ? val : Math.round((r.creditSalesAmount || 0) * 100) / 100;
+        const cardVal = field === 'cardSalesAmount' ? val : Math.round((r.cardSalesAmount || 0) * 100) / 100;
+        const touchCardVal = field === 'touchCardSalesAmount' ? val : Math.round((r.touchCardSalesAmount || 0) * 100) / 100;
+        const voucherVal = field === 'voucherSalesAmount' ? val : Math.round((r.voucherSalesAmount || 0) * 100) / 100;
+
+        const totalPumpNonCash = Math.round((creditVal + cardVal + touchCardVal + voucherVal) * 100) / 100;
+        const rawNet = Math.round((grossTotalRev - totalPumpNonCash) * 100) / 100;
+        const actCash = Math.round((r.actualCash || 0) * 100) / 100;
+        const computedVariance = Math.round((actCash - rawNet) * 100) / 100;
+
+        return {
+          ...r,
+          [field]: val,
+          creditSalesAmount: creditVal,
+          cardSalesAmount: cardVal,
+          touchCardSalesAmount: touchCardVal,
+          voucherSalesAmount: voucherVal,
+          cashVariance: computedVariance
+        };
+      }
+      return r;
+    });
+
+    setDraftReadings(updatedReadings);
+
+    // Sync activeShift
+    let totalFuel = 0;
+    let totalNet = 0;
+    let totalSales = 0;
+
+    updatedReadings.forEach(dr => {
+      const fuel = Math.max(0, dr.endMeter - dr.startMeter);
+      const net = Math.max(0, fuel - dr.testingQty);
+      totalFuel += fuel;
+      totalNet += net;
+      totalSales += (net * getPriceForFuelType(dr.fuelType));
+    });
+
+    setActiveShift({
+      ...activeShift,
+      pumpReadings: updatedReadings,
+      totalFuelSold: totalFuel,
+      totalNetSold: totalNet,
+      totalNetSales: totalSales
+    });
+
+    // Debounce remote Supabase sync for the non-cash sale
+    const primaryReading = pumperReadings[0];
+    if (primaryReading) {
+      const syncKey = `${pumperId}_${field}_sync`;
+      if (debounceTimersRef.current[syncKey]) {
+        clearTimeout(debounceTimersRef.current[syncKey]);
+      }
+      debounceTimersRef.current[syncKey] = setTimeout(() => {
+        if (field === 'creditSalesAmount' && cleanAmount > 0) {
+          saveCreditSale(supabase, {
+            shift_id: activeShift.id,
+            pump_id: primaryReading.pumpId,
+            customer_name: 'Credit Customer',
+            fuel_type: primaryReading.fuelType || 'Fuel',
+            liters: 0,
+            amount: Number(cleanAmount),
+            status: 'Approved'
+          });
+        }
+        if (field === 'cardSalesAmount' && cleanAmount > 0) {
+          saveCardSale(supabase, {
+            shift_id: activeShift.id,
+            pump_id: primaryReading.pumpId,
+            card_type: 'POS Card',
+            amount: Number(cleanAmount),
+            status: 'Settled'
+          });
+        }
+        if (field === 'touchCardSalesAmount' && cleanAmount > 0) {
+          saveTouchCardSale(supabase, {
+            shift_id: activeShift.id,
+            pump_id: primaryReading.pumpId,
+            pumper_id: pumperId,
+            card_type: 'Touch Card',
+            amount: Number(cleanAmount),
+            status: 'Settled'
+          });
+        }
+        if (field === 'voucherSalesAmount' && cleanAmount > 0) {
+          saveVoucherSale(supabase, {
+            shift_id: activeShift.id,
+            pump_id: primaryReading.pumpId,
+            voucher_no: 'VOUCHER',
+            amount: Number(cleanAmount),
+            status: 'Redeemed'
+          });
+        }
+      }, 500);
+    }
   };
 
   // Handle live updates to a specific pump's readings in local draft state
@@ -1716,14 +2146,23 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         const updatedChambers = currentChambers.map(ch => {
           if (ch.chamberId === chamberId) {
             const opLevel = ch.openingLevel ?? ch.openingLiters ?? 0;
-            const soldLiters = calculateChamberSoldLiters(opLevel, closingLevel);
-            const totalAmount = soldLiters * (ch.ratePerLiter || 0);
+            const recLevel = ch.receivedLevel ?? ch.receivedLiters ?? 0;
+            const cleanCl = Math.max(0, Math.round(Number(closingLevel || 0) * 100) / 100);
+            const soldLiters = calculateChamberSoldLiters(opLevel, cleanCl, recLevel);
+            const totalAmount = Math.round(soldLiters * (ch.ratePerLiter || 0) * 100) / 100;
+            if (cleanCl > 0) {
+              try {
+                localStorage.setItem(`fuelflow_chamber_closing_${chamberId}`, String(cleanCl));
+              } catch (_) {}
+            }
             return {
               ...ch,
               openingLiters: opLevel,
-              closingLiters: closingLevel,
               openingLevel: opLevel,
-              closingLevel,
+              receivedLiters: recLevel,
+              receivedLevel: recLevel,
+              closingLiters: cleanCl,
+              closingLevel: cleanCl,
               soldLiters,
               totalAmount
             };
@@ -1755,6 +2194,99 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         }
         debounceTimersRef.current[syncKey] = setTimeout(() => {
           upsertPumpReadings(supabase, [updatedReading], activeShift.id);
+          saveForecourtOilReconciliation(supabase, activeShift.id, updatedChambers);
+        }, 500);
+
+        return updatedReading;
+      }
+      return r;
+    });
+
+    setDraftReadings(updatedReadings);
+
+    let totalFuel = 0;
+    let totalNet = 0;
+    let totalSales = 0;
+
+    updatedReadings.forEach(dr => {
+      const isOil = dr.pumpId === 'pump-oil-bay' || dr.fuelType === 'Oil & Lubricants' || dr.pumpName?.toLowerCase().includes('dispenser') || dr.pumpName?.toLowerCase().includes('oil');
+      const fuel = isOil ? 0 : Math.max(0, dr.endMeter - dr.startMeter);
+      const net = isOil ? 0 : Math.max(0, fuel - dr.testingQty);
+      const fuelRev = isOil ? 0 : (net * getPriceForFuelType(dr.fuelType));
+      const oilRev = dr.oilSalesAmount || 0;
+      totalFuel += fuel;
+      totalNet += net;
+      totalSales += (fuelRev + oilRev);
+    });
+
+    setActiveShift({
+      ...activeShift,
+      pumpReadings: updatedReadings,
+      totalFuelSold: totalFuel,
+      totalNetSold: totalNet,
+      totalNetSales: totalSales
+    });
+  };
+
+  // Handle live updates to a specific chamber's received level in Forecourt Dispenser Station
+  const handleUpdateChamberReceivedLevel = (pumpId: string, chamberId: string, receivedLevel: number) => {
+    if (!activeShift) return;
+
+    const updatedReadings = draftReadings.map(r => {
+      if (r.pumpId === pumpId) {
+        if (r.assignedPumperId && finalizedPumperCards[r.assignedPumperId]) return r;
+
+        const currentChambers = r.chamberReadings && r.chamberReadings.length > 0
+          ? r.chamberReadings
+          : getDefaultChambers(oilTanks);
+
+        const updatedChambers = currentChambers.map(ch => {
+          if (ch.chamberId === chamberId) {
+            const opLevel = ch.openingLevel ?? ch.openingLiters ?? 0;
+            const clLevel = ch.closingLevel ?? ch.closingLiters ?? 0;
+            const cleanRec = Math.max(0, Math.round(Number(receivedLevel || 0) * 100) / 100);
+            const soldLiters = calculateChamberSoldLiters(opLevel, clLevel, cleanRec);
+            const totalAmount = Math.round(soldLiters * (ch.ratePerLiter || 0) * 100) / 100;
+            return {
+              ...ch,
+              openingLiters: opLevel,
+              openingLevel: opLevel,
+              receivedLiters: cleanRec,
+              receivedLevel: cleanRec,
+              closingLiters: clLevel,
+              closingLevel: clLevel,
+              soldLiters,
+              totalAmount
+            };
+          }
+          return ch;
+        });
+
+        const totalOilSales = updatedChambers.reduce((sum, ch) => sum + ch.totalAmount, 0);
+        const creditVal = r.creditSalesAmount || 0;
+        const cardVal = r.cardSalesAmount || 0;
+        const touchCardVal = r.touchCardSalesAmount || 0;
+        const voucherVal = r.voucherSalesAmount || 0;
+        const actCash = r.actualCash || 0;
+        const totalPumpNonCash = creditVal + cardVal + touchCardVal + voucherVal;
+        const netExpectedCash = Math.max(0, totalOilSales - totalPumpNonCash);
+        const computedVariance = actCash - netExpectedCash;
+
+        const updatedReading: PumpReading = {
+          ...r,
+          chamberReadings: updatedChambers,
+          oilSalesAmount: totalOilSales,
+          cashVariance: computedVariance
+        };
+
+        // Remote sync debounce
+        const syncKey = `${pumpId}_sync`;
+        if (debounceTimersRef.current[syncKey]) {
+          clearTimeout(debounceTimersRef.current[syncKey]);
+        }
+        debounceTimersRef.current[syncKey] = setTimeout(() => {
+          upsertPumpReadings(supabase, [updatedReading], activeShift.id);
+          saveForecourtOilReconciliation(supabase, activeShift.id, updatedChambers);
         }, 500);
 
         return updatedReading;
@@ -1803,13 +2335,17 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         const updatedChambers = currentChambers.map(ch => {
           if (ch.chamberId === chamberId) {
             const clLevel = ch.closingLevel ?? ch.closingLiters ?? 0;
-            const soldLiters = calculateChamberSoldLiters(openingLevel, clLevel);
-            const totalAmount = soldLiters * (ch.ratePerLiter || 0);
+            const recLevel = ch.receivedLevel ?? ch.receivedLiters ?? 0;
+            const cleanOp = Math.max(0, Math.round(Number(openingLevel || 0) * 100) / 100);
+            const soldLiters = calculateChamberSoldLiters(cleanOp, clLevel, recLevel);
+            const totalAmount = Math.round(soldLiters * (ch.ratePerLiter || 0) * 100) / 100;
             return {
               ...ch,
-              openingLiters: openingLevel,
+              openingLiters: cleanOp,
+              openingLevel: cleanOp,
+              receivedLiters: recLevel,
+              receivedLevel: recLevel,
               closingLiters: clLevel,
-              openingLevel,
               closingLevel: clLevel,
               soldLiters,
               totalAmount
@@ -1834,6 +2370,16 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
           oilSalesAmount: totalOilSales,
           cashVariance: computedVariance
         };
+
+        // Remote sync debounce
+        const syncKey = `${pumpId}_sync`;
+        if (debounceTimersRef.current[syncKey]) {
+          clearTimeout(debounceTimersRef.current[syncKey]);
+        }
+        debounceTimersRef.current[syncKey] = setTimeout(() => {
+          upsertPumpReadings(supabase, [updatedReading], activeShift.id);
+          saveForecourtOilReconciliation(supabase, activeShift.id, updatedChambers);
+        }, 500);
 
         return updatedReading;
       }
@@ -2014,38 +2560,66 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       console.warn('Pump readings & non-cash sync note:', err);
     }
 
-    // Save pumper assignment & handed over cash summary to Supabase shift_pumper_assignments
+    // Save pumper assignment & handed over cash summary to Supabase shift_pumper_assignments / shift_pumper_reconciliations
     const pumperCard = pumperCardsData.find(p => p.pumperId === pumperId);
-    const actualCash = pumperCard ? (pumperCard.totalActualCash || 0) : 0;
+    const handedOverCash = pumperCashInputs[pumperId] !== undefined && pumperCashInputs[pumperId] !== ''
+      ? Math.round(Number(pumperCashInputs[pumperId]) * 100) / 100
+      : pumperCard ? (pumperCard.totalActualCash || 0) : 0;
+
+    const creditSales = pumperNonCashInputs[`${pumperId}_credit`] !== undefined && pumperNonCashInputs[`${pumperId}_credit`] !== ''
+      ? Math.round(Number(pumperNonCashInputs[`${pumperId}_credit`]) * 100) / 100
+      : pumperCard ? (pumperCard.totalCreditSales || 0) : 0;
+
+    const cardSales = pumperNonCashInputs[`${pumperId}_card`] !== undefined && pumperNonCashInputs[`${pumperId}_card`] !== ''
+      ? Math.round(Number(pumperNonCashInputs[`${pumperId}_card`]) * 100) / 100
+      : pumperCard ? (pumperCard.totalCardSales || 0) : 0;
+
+    const touchCardSales = pumperNonCashInputs[`${pumperId}_touchCard`] !== undefined && pumperNonCashInputs[`${pumperId}_touchCard`] !== ''
+      ? Math.round(Number(pumperNonCashInputs[`${pumperId}_touchCard`]) * 100) / 100
+      : pumperCard ? (pumperCard.totalTouchCardSales || 0) : 0;
+
+    const voucherSales = pumperNonCashInputs[`${pumperId}_voucher`] !== undefined && pumperNonCashInputs[`${pumperId}_voucher`] !== ''
+      ? Math.round(Number(pumperNonCashInputs[`${pumperId}_voucher`]) * 100) / 100
+      : pumperCard ? (pumperCard.totalVoucherSales || 0) : 0;
+
     const expCash = pumperCard ? (pumperCard.totalExpectedCash || 0) : 0;
-    const variance = pumperCard ? (pumperCard.cashVariance || 0) : 0;
+    const variance = Math.round((handedOverCash - expCash) * 100) / 100;
+
+    // Cache clean formatted values in local input states
+    setPumperCashInputs(prev => ({
+      ...prev,
+      [pumperId]: (Math.round(handedOverCash * 100) / 100).toString()
+    }));
+    setPumperNonCashInputs(prev => ({
+      ...prev,
+      [`${pumperId}_credit`]: (Math.round(creditSales * 100) / 100).toString(),
+      [`${pumperId}_card`]: (Math.round(cardSales * 100) / 100).toString(),
+      [`${pumperId}_touchCard`]: (Math.round(touchCardSales * 100) / 100).toString(),
+      [`${pumperId}_voucher`]: (Math.round(voucherSales * 100) / 100).toString()
+    }));
+
+    const reconPayload = {
+      id: `${activeShift.id}_${pumperId}`,
+      shift_id: activeShift.id,
+      pumper_id: pumperId,
+      pumper_name: pumperName,
+      handed_over_cash: handedOverCash,
+      actual_cash: handedOverCash,
+      expected_cash: expCash,
+      cash_variance: variance,
+      credit_sales: creditSales,
+      card_sales: cardSales,
+      touch_card_sales: touchCardSales,
+      voucher_sales: voucherSales,
+      assigned_pumps_count: pumperReadings.length,
+      status: 'Completed',
+      updated_at: new Date().toISOString()
+    };
 
     try {
-      const assignmentPayload = {
-        id: `${activeShift.id}_${pumperId}`,
-        shift_id: activeShift.id,
-        pumper_id: pumperId,
-        pumper_name: pumperName,
-        actual_cash: actualCash,
-        expected_cash: expCash,
-        cash_variance: variance,
-        assigned_pumps_count: pumperReadings.length,
-        status: 'Completed',
-        updated_at: new Date().toISOString()
-      };
-
-      const { error } = await supabase.from('shift_pumper_assignments').upsert([assignmentPayload]);
-      if (error && (error.code === 'PGRST205' || error.message?.includes('schema cache') || error.message?.includes('Could not find'))) {
-        await supabase.from('pumper_assignments').upsert([{
-          id: `${activeShift.id}_${pumperId}`,
-          shift_id: activeShift.id,
-          pumper_id: pumperId,
-          actual_cash: actualCash,
-          status: 'Completed'
-        }]);
-      }
+      await savePumperReconciliation(supabase, reconPayload);
     } catch (err) {
-      console.warn('shift_pumper_assignments sync note:', err);
+      console.warn('savePumperReconciliation error:', err);
     }
 
     // Update activeShift state in React
@@ -2085,6 +2659,19 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
     const newFinalized = { ...finalizedPumperCards };
     delete newFinalized[pumperId];
     setFinalizedPumperCards(newFinalized);
+    setPumperCashInputs(prev => {
+      const next = { ...prev };
+      delete next[pumperId];
+      return next;
+    });
+    setPumperNonCashInputs(prev => {
+      const next = { ...prev };
+      delete next[`${pumperId}_credit`];
+      delete next[`${pumperId}_card`];
+      delete next[`${pumperId}_touchCard`];
+      delete next[`${pumperId}_voucher`];
+      return next;
+    });
 
     const newLockedEnds = { ...lockedEndMeters };
     draftReadings.filter(r => r.assignedPumperId === pumperId).forEach(r => {
@@ -2617,24 +3204,25 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
         totalActualCash += actCash;
       });
 
-      const totalNonCash = totalCreditSales + totalCardSales + totalTouchCardSales + totalVoucherSales;
-      const totalExpectedCash = Math.max(0, totalGrossRevenue - totalNonCash);
-      const cashVariance = totalActualCash - totalExpectedCash;
+      const totalNonCash = Math.round((totalCreditSales + totalCardSales + totalTouchCardSales + totalVoucherSales) * 100) / 100;
+      const totalExpectedCash = Math.max(0, Math.round((totalGrossRevenue - totalNonCash) * 100) / 100);
+      const roundedActualCash = Math.round(totalActualCash * 100) / 100;
+      const cashVariance = Math.round((roundedActualCash - totalExpectedCash) * 100) / 100;
 
       return {
         pumperId,
         pumperName: emp?.name || 'Unassigned Pumper',
         avatarColor: emp?.avatarColor || 'bg-blue-600',
         assignedReadings,
-        totalNetLiters,
-        totalGrossRevenue,
+        totalNetLiters: Math.round(totalNetLiters * 100) / 100,
+        totalGrossRevenue: Math.round(totalGrossRevenue * 100) / 100,
         totalNonCash,
-        totalCreditSales,
-        totalCardSales,
-        totalTouchCardSales,
-        totalVoucherSales,
+        totalCreditSales: Math.round(totalCreditSales * 100) / 100,
+        totalCardSales: Math.round(totalCardSales * 100) / 100,
+        totalTouchCardSales: Math.round(totalTouchCardSales * 100) / 100,
+        totalVoucherSales: Math.round(totalVoucherSales * 100) / 100,
         totalExpectedCash,
-        totalActualCash,
+        totalActualCash: roundedActualCash,
         cashVariance
       };
     }).filter(p => {
@@ -2712,6 +3300,11 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
     const combinedShiftName = 'Full Day Shift (08:00 AM - 08:00 AM)';
     const selectedDateObj = new Date(Number(y), Number(m) - 1, Number(d), 8, 0, 0);
     const fullISOStart = !isNaN(selectedDateObj.getTime()) ? selectedDateObj.toISOString() : new Date().toISOString();
+
+    const oilBayPump = newPumpReadings.find(p => p.pumpId === 'pump-oil-bay' || p.fuelType === 'Oil & Lubricants' || p.pumpName?.toLowerCase().includes('dispenser') || p.pumpName?.toLowerCase().includes('oil'));
+    if (oilBayPump && oilBayPump.chamberReadings && oilBayPump.chamberReadings.length > 0) {
+      saveForecourtOilReconciliation(supabase, newShiftId, oilBayPump.chamberReadings);
+    }
 
     onStartShift({
       id: newShiftId,
@@ -2918,6 +3511,24 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
       }
 
       syncAllNonCashSales(supabase, activeReadings, closedShift.id);
+
+      // Persist final chamber closing stocks to localStorage and Supabase for seamless carry-forward to the next shift
+      const oilBayReading = finalReadings.find(r => r.pumpId === 'pump-oil-bay' || r.fuelType === 'Oil & Lubricants' || r.pumpName?.toLowerCase().includes('dispenser') || r.pumpName?.toLowerCase().includes('oil'));
+      if (oilBayReading && oilBayReading.chamberReadings && oilBayReading.chamberReadings.length > 0) {
+        saveForecourtOilReconciliation(supabase, closedShift.id, oilBayReading.chamberReadings);
+        oilBayReading.chamberReadings.forEach(ch => {
+          const cl = Number(ch.closingLevel ?? ch.closingLiters ?? 0);
+          if (cl > 0) {
+            try {
+              localStorage.setItem(`fuelflow_chamber_closing_${ch.chamberId}`, String(cl));
+              if (ch.chamberNumber) {
+                localStorage.setItem(`fuelflow_chamber_closing_ch-0${ch.chamberNumber}`, String(cl));
+                localStorage.setItem(`fuelflow_chamber_closing_${ch.chamberNumber}`, String(cl));
+              }
+            } catch (_) {}
+          }
+        });
+      }
 
       // Delegate authoritative shift closure, database update, and single deposit record insertion to parent handler
       onCloseShift(closedShift);
@@ -3775,34 +4386,7 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                               const fuelPrice = getPriceForFuelType(r.fuelType);
                               const fuelSold = isOilBay ? 0 : Math.max(0, r.endMeter - r.startMeter);
                               const netSold = isOilBay ? 0 : Math.max(0, fuelSold - r.testingQty);
-                              const fuelRevenue = netSold * fuelPrice;
-                              const oilRevenue = r.oilSalesAmount || 0;
-                              const totalPumpGross = fuelRevenue + oilRevenue;
-                              const creditSales = r.creditSalesAmount || 0;
-                              const cardSales = r.cardSalesAmount || 0;
-                              const touchCardSales = r.touchCardSalesAmount || 0;
-                              const voucherSales = r.voucherSalesAmount || 0;
-                              const totalPumpNonCash = creditSales + cardSales + touchCardSales + voucherSales;
-                              const rawPumpExpCash = totalPumpGross - totalPumpNonCash;
-
-                              // Calculate if other pumps assigned to this pumper have excess revenue to offset non-cash deductions
-                              const otherPumpsExcess = assignedReadings
-                                .filter(other => other.pumpId !== r.pumpId)
-                                .reduce((sum, other) => {
-                                  const oPrice = getPriceForFuelType(other.fuelType);
-                                  const oIsOil = other.pumpId === 'pump-oil-bay' || other.fuelType === 'Oil & Lubricants' || other.pumpName.toLowerCase().includes('oil');
-                                  const oFuelSold = oIsOil ? 0 : Math.max(0, other.endMeter - other.startMeter);
-                                  const oNetSold = oIsOil ? 0 : Math.max(0, oFuelSold - other.testingQty);
-                                  const oGross = (oNetSold * oPrice) + (other.oilSalesAmount || 0);
-                                  const oNonCash = (other.creditSalesAmount || 0) + (other.cardSalesAmount || 0) + (other.touchCardSalesAmount || 0) + (other.voucherSalesAmount || 0);
-                                  return sum + Math.max(0, oGross - oNonCash);
-                                }, 0);
-
-                              // Do not clip individual pump expected cash to zero prematurely if another pump in the same pumper's shift has excess revenue to offset non-cash deductions
-                              const pumpExpCash = rawPumpExpCash < 0
-                                ? (otherPumpsExcess > 0 ? rawPumpExpCash : 0)
-                                : rawPumpExpCash;
-
+                              const fuelRevenue = Math.round((netSold * fuelPrice) * 100) / 100;
                               const fuelBadge = getFuelBadgeStyles(r.fuelType);
 
                               return (
@@ -3996,6 +4580,7 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                               <tr className="bg-amber-50/60 border-b border-amber-200 text-[10px] text-amber-950 uppercase font-black tracking-wider">
                                                 <th className="py-2 px-2.5">Chamber & Product</th>
                                                 <th className="py-2 px-2 text-right">Opening (L)</th>
+                                                <th className="py-2 px-2 text-right">Received (L)</th>
                                                 <th className="py-2 px-2 text-right">Closing (L)</th>
                                                 <th className="py-2 px-2 text-right">Sold (L)</th>
                                                 <th className="py-2 px-2.5 text-right">Total (Rs.)</th>
@@ -4005,8 +4590,9 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                               {(r.chamberReadings && r.chamberReadings.length > 0 ? r.chamberReadings : getDefaultChambers(oilTanks)).map((ch, chIdx) => {
                                                 const chamberNum = ch.chamberNumber || chIdx + 1;
                                                 const opLiters = ch.openingLevel ?? ch.openingLiters ?? 0;
+                                                const recLiters = ch.receivedLevel ?? ch.receivedLiters ?? 0;
                                                 const clLiters = ch.closingLevel ?? ch.closingLiters ?? 0;
-                                                const soldLiters = calculateChamberSoldLiters(opLiters, clLiters);
+                                                const soldLiters = calculateChamberSoldLiters(opLiters, clLiters, recLiters);
                                                 const rowTotal = soldLiters * (ch.ratePerLiter || 0);
                                                 const isChamberOpeningLocked = !!r.isStartSaved || !!lockedStartMeters[r.pumpId] || isPumperFinalized;
 
@@ -4058,6 +4644,18 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                                         type="number"
                                                         step="any"
                                                         disabled={isPumperFinalized}
+                                                        value={recLiters === 0 ? '' : recLiters}
+                                                        placeholder="0"
+                                                        onFocus={(e) => e.target.select()}
+                                                        onChange={(e) => handleUpdateChamberReceivedLevel(r.pumpId, ch.chamberId, parseFloat(e.target.value) || 0)}
+                                                        className="w-16 px-1.5 py-0.5 bg-white border border-blue-200 rounded text-right font-bold text-slate-900 tabular-nums focus:outline-none focus:border-blue-500 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed text-[11px]"
+                                                      />
+                                                    </td>
+                                                    <td className="py-2 px-2 text-right">
+                                                      <input
+                                                        type="number"
+                                                        step="any"
+                                                        disabled={isPumperFinalized}
                                                         value={clLiters === 0 ? '' : clLiters}
                                                         placeholder="0"
                                                         onFocus={(e) => e.target.select()}
@@ -4077,14 +4675,15 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                             </tbody>
                                             <tfoot>
                                               <tr className="bg-amber-50/80 border-t border-amber-200 text-xs font-bold">
-                                                <td colSpan={3} className="py-2 px-2.5 text-amber-950 font-extrabold">
+                                                <td colSpan={4} className="py-2 px-2.5 text-amber-950 font-extrabold">
                                                   Total Forecourt Bulk Oil Sales:
                                                 </td>
                                                 <td className="py-2 px-2 text-right text-amber-950 font-extrabold tabular-nums">
                                                   {((r.chamberReadings || getDefaultChambers(oilTanks)).reduce((sum, ch) => {
                                                     const op = ch.openingLevel ?? ch.openingLiters ?? 0;
+                                                    const rec = ch.receivedLevel ?? ch.receivedLiters ?? 0;
                                                     const cl = ch.closingLevel ?? ch.closingLiters ?? 0;
-                                                    return sum + calculateChamberSoldLiters(op, cl);
+                                                    return sum + calculateChamberSoldLiters(op, cl, rec);
                                                   }, 0)).toFixed(2)} L
                                                 </td>
                                                 <td className="py-2 px-2.5 text-right text-emerald-800 font-black tabular-nums text-xs">
@@ -4097,70 +4696,17 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                       </div>
                                     )}
 
-                                    {/* Non-Cash Collections */}
-                                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs pt-1 border-t border-slate-200/80">
-                                      <div>
-                                        <label className="text-[10px] font-extrabold text-purple-700 block mb-0.5 uppercase">Credit Sales (Rs.)</label>
-                                        <input
-                                          type="number"
-                                          step="any"
-                                          disabled={isPumperFinalized}
-                                          value={r.creditSalesAmount === 0 ? '' : (r.creditSalesAmount ?? '')}
-                                          placeholder="0"
-                                          onFocus={(e) => e.target.select()}
-                                          onChange={(e) => handleUpdateReading(r.pumpId, 'creditSalesAmount', parseFloat(e.target.value) || 0)}
-                                          className="w-full px-2 py-1 bg-white border border-purple-200 rounded-lg text-xs font-bold text-right tabular-nums focus:bg-white focus:outline-none focus:border-purple-500 text-purple-900 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
-                                        />
-                                      </div>
-                                      <div>
-                                        <label className="text-[10px] font-extrabold text-indigo-700 block mb-0.5 uppercase">Card Sale (Rs.)</label>
-                                        <input
-                                          type="number"
-                                          step="any"
-                                          disabled={isPumperFinalized}
-                                          value={r.cardSalesAmount === 0 ? '' : (r.cardSalesAmount ?? '')}
-                                          placeholder="0"
-                                          onFocus={(e) => e.target.select()}
-                                          onChange={(e) => handleUpdateReading(r.pumpId, 'cardSalesAmount', parseFloat(e.target.value) || 0)}
-                                          className="w-full px-2 py-1 bg-white border border-indigo-200 rounded-lg text-xs font-bold text-right tabular-nums focus:outline-none focus:border-indigo-500 text-indigo-900 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
-                                        />
-                                      </div>
-                                      <div>
-                                        <label className="text-[10px] font-extrabold text-teal-700 block mb-0.5 uppercase">Touch Card Sale (Rs.)</label>
-                                        <input
-                                          type="number"
-                                          step="any"
-                                          disabled={isPumperFinalized}
-                                          value={r.touchCardSalesAmount === 0 ? '' : (r.touchCardSalesAmount ?? '')}
-                                          placeholder="0"
-                                          onFocus={(e) => e.target.select()}
-                                          onChange={(e) => handleUpdateReading(r.pumpId, 'touchCardSalesAmount', parseFloat(e.target.value) || 0)}
-                                          className="w-full px-2 py-1 bg-white border border-teal-200 rounded-lg text-xs font-bold text-right tabular-nums focus:outline-none focus:border-teal-500 text-teal-900 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
-                                        />
-                                      </div>
-                                      <div>
-                                        <label className="text-[10px] font-extrabold text-amber-700 block mb-0.5 uppercase">Voucher Sale (Rs.)</label>
-                                        <input
-                                          type="number"
-                                          step="any"
-                                          disabled={isPumperFinalized}
-                                          value={r.voucherSalesAmount === 0 ? '' : (r.voucherSalesAmount ?? '')}
-                                          placeholder="0"
-                                          onFocus={(e) => e.target.select()}
-                                          onChange={(e) => handleUpdateReading(r.pumpId, 'voucherSalesAmount', parseFloat(e.target.value) || 0)}
-                                          className="w-full px-2 py-1 bg-white border border-amber-200 rounded-lg text-xs font-bold text-right tabular-nums focus:outline-none focus:border-amber-500 text-amber-900 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
-                                        />
-                                      </div>
-                                    </div>
-
-                                    {/* Pump Level Totals */}
-                                    <div className="flex items-center justify-between pt-0.5 text-xs gap-2">
-                                      <div className="flex items-center gap-3 text-[11px] flex-wrap">
+                                    {/* Pump Level Summary: Net Liters & Gross Sales */}
+                                    <div className="flex items-center justify-between pt-1 border-t border-slate-200/80 text-xs">
+                                      <div className="flex items-center gap-4 text-[11px] flex-wrap">
                                         <span className="text-slate-500">
-                                          Net Liters: <strong className="text-slate-900 tabular-nums">{netSold.toFixed(2)} L</strong>
+                                          Net Liters: <strong className="text-slate-900 tabular-nums font-bold">{netSold.toFixed(2)} L</strong>
                                         </span>
                                         <span className="text-slate-500">
-                                          Expected Cash: <strong className="text-blue-700 tabular-nums">{formatCurrency(pumpExpCash)}</strong>
+                                          {isOilBay ? 'Gross Oil Sales:' : 'Gross Fuel Sales:'}{' '}
+                                          <strong className="text-emerald-700 tabular-nums font-bold">
+                                            {formatCurrency(isOilBay ? (r.oilSalesAmount || 0) : fuelRevenue)}
+                                          </strong>
                                         </span>
                                       </div>
                                     </div>
@@ -4175,6 +4721,201 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                       {/* Pumper Cash Reconciliation Footer */}
                       {assignedReadings.length > 0 && (
                         <div className="p-3 bg-gray-50/90 border border-gray-200/90 rounded-xl space-y-2.5 mt-3">
+                          {/* Consolidated Pumper Non-Cash Sales Section */}
+                          <div className="p-2.5 bg-white rounded-xl border border-slate-200 shadow-2xs space-y-2">
+                            <div className="flex items-center justify-between">
+                              <span className="text-[10px] font-black text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
+                                <CreditCard className="w-3.5 h-3.5 text-purple-600 shrink-0" />
+                                <span>Pumper Non-Cash Sales</span>
+                              </span>
+                              <span className="text-[10px] font-bold text-purple-700 bg-purple-50 px-2 py-0.5 rounded border border-purple-200 tabular-nums">
+                                Total: {formatCurrency(p.totalNonCash)}
+                              </span>
+                            </div>
+
+                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+                              <div>
+                                <label className="text-[10px] font-extrabold text-purple-700 block mb-0.5 uppercase">
+                                  Credit Sales (Rs.)
+                                </label>
+                                <input
+                                  type="number"
+                                  step="any"
+                                  disabled={isPumperFinalized}
+                                  value={
+                                    pumperNonCashInputs[`${pumperId}_credit`] !== undefined
+                                      ? pumperNonCashInputs[`${pumperId}_credit`]
+                                      : p.totalCreditSales === 0 || p.totalCreditSales === undefined
+                                      ? ''
+                                      : (Math.round((p.totalCreditSales || 0) * 100) / 100).toString()
+                                  }
+                                  placeholder="0"
+                                  onFocus={(e) => e.target.select()}
+                                  onChange={(e) => {
+                                    const rawVal = e.target.value;
+                                    setPumperNonCashInputs(prev => ({ ...prev, [`${pumperId}_credit`]: rawVal }));
+                                    const num = parseFloat(rawVal);
+                                    const cleanNum = isNaN(num) ? 0 : Math.round(num * 100) / 100;
+                                    handleUpdateConsolidatedNonCashForPumper(pumperId, 'creditSalesAmount', cleanNum);
+                                  }}
+                                  onBlur={() => {
+                                    setPumperNonCashInputs(prev => {
+                                      const next = { ...prev };
+                                      const cur = next[`${pumperId}_credit`];
+                                      if (cur === '' || cur === undefined) {
+                                        delete next[`${pumperId}_credit`];
+                                      } else {
+                                        const n = parseFloat(cur);
+                                        if (!isNaN(n)) {
+                                          next[`${pumperId}_credit`] = (Math.round(n * 100) / 100).toString();
+                                        } else {
+                                          delete next[`${pumperId}_credit`];
+                                        }
+                                      }
+                                      return next;
+                                    });
+                                  }}
+                                  className="w-full px-2 py-1 bg-white border border-purple-200 rounded-lg text-xs font-bold text-right tabular-nums focus:bg-white focus:outline-none focus:border-purple-500 text-purple-900 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
+                                />
+                              </div>
+
+                              <div>
+                                <label className="text-[10px] font-extrabold text-indigo-700 block mb-0.5 uppercase">
+                                  Card Sale (Rs.)
+                                </label>
+                                <input
+                                  type="number"
+                                  step="any"
+                                  disabled={isPumperFinalized}
+                                  value={
+                                    pumperNonCashInputs[`${pumperId}_card`] !== undefined
+                                      ? pumperNonCashInputs[`${pumperId}_card`]
+                                      : p.totalCardSales === 0 || p.totalCardSales === undefined
+                                      ? ''
+                                      : (Math.round((p.totalCardSales || 0) * 100) / 100).toString()
+                                  }
+                                  placeholder="0"
+                                  onFocus={(e) => e.target.select()}
+                                  onChange={(e) => {
+                                    const rawVal = e.target.value;
+                                    setPumperNonCashInputs(prev => ({ ...prev, [`${pumperId}_card`]: rawVal }));
+                                    const num = parseFloat(rawVal);
+                                    const cleanNum = isNaN(num) ? 0 : Math.round(num * 100) / 100;
+                                    handleUpdateConsolidatedNonCashForPumper(pumperId, 'cardSalesAmount', cleanNum);
+                                  }}
+                                  onBlur={() => {
+                                    setPumperNonCashInputs(prev => {
+                                      const next = { ...prev };
+                                      const cur = next[`${pumperId}_card`];
+                                      if (cur === '' || cur === undefined) {
+                                        delete next[`${pumperId}_card`];
+                                      } else {
+                                        const n = parseFloat(cur);
+                                        if (!isNaN(n)) {
+                                          next[`${pumperId}_card`] = (Math.round(n * 100) / 100).toString();
+                                        } else {
+                                          delete next[`${pumperId}_card`];
+                                        }
+                                      }
+                                      return next;
+                                    });
+                                  }}
+                                  className="w-full px-2 py-1 bg-white border border-indigo-200 rounded-lg text-xs font-bold text-right tabular-nums focus:outline-none focus:border-indigo-500 text-indigo-900 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
+                                />
+                              </div>
+
+                              <div>
+                                <label className="text-[10px] font-extrabold text-teal-700 block mb-0.5 uppercase">
+                                  Touch Card (Rs.)
+                                </label>
+                                <input
+                                  type="number"
+                                  step="any"
+                                  disabled={isPumperFinalized}
+                                  value={
+                                    pumperNonCashInputs[`${pumperId}_touchCard`] !== undefined
+                                      ? pumperNonCashInputs[`${pumperId}_touchCard`]
+                                      : p.totalTouchCardSales === 0 || p.totalTouchCardSales === undefined
+                                      ? ''
+                                      : (Math.round((p.totalTouchCardSales || 0) * 100) / 100).toString()
+                                  }
+                                  placeholder="0"
+                                  onFocus={(e) => e.target.select()}
+                                  onChange={(e) => {
+                                    const rawVal = e.target.value;
+                                    setPumperNonCashInputs(prev => ({ ...prev, [`${pumperId}_touchCard`]: rawVal }));
+                                    const num = parseFloat(rawVal);
+                                    const cleanNum = isNaN(num) ? 0 : Math.round(num * 100) / 100;
+                                    handleUpdateConsolidatedNonCashForPumper(pumperId, 'touchCardSalesAmount', cleanNum);
+                                  }}
+                                  onBlur={() => {
+                                    setPumperNonCashInputs(prev => {
+                                      const next = { ...prev };
+                                      const cur = next[`${pumperId}_touchCard`];
+                                      if (cur === '' || cur === undefined) {
+                                        delete next[`${pumperId}_touchCard`];
+                                      } else {
+                                        const n = parseFloat(cur);
+                                        if (!isNaN(n)) {
+                                          next[`${pumperId}_touchCard`] = (Math.round(n * 100) / 100).toString();
+                                        } else {
+                                          delete next[`${pumperId}_touchCard`];
+                                        }
+                                      }
+                                      return next;
+                                    });
+                                  }}
+                                  className="w-full px-2 py-1 bg-white border border-teal-200 rounded-lg text-xs font-bold text-right tabular-nums focus:outline-none focus:border-teal-500 text-teal-900 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
+                                />
+                              </div>
+
+                              <div>
+                                <label className="text-[10px] font-extrabold text-amber-700 block mb-0.5 uppercase">
+                                  Voucher Sale (Rs.)
+                                </label>
+                                <input
+                                  type="number"
+                                  step="any"
+                                  disabled={isPumperFinalized}
+                                  value={
+                                    pumperNonCashInputs[`${pumperId}_voucher`] !== undefined
+                                      ? pumperNonCashInputs[`${pumperId}_voucher`]
+                                      : p.totalVoucherSales === 0 || p.totalVoucherSales === undefined
+                                      ? ''
+                                      : (Math.round((p.totalVoucherSales || 0) * 100) / 100).toString()
+                                  }
+                                  placeholder="0"
+                                  onFocus={(e) => e.target.select()}
+                                  onChange={(e) => {
+                                    const rawVal = e.target.value;
+                                    setPumperNonCashInputs(prev => ({ ...prev, [`${pumperId}_voucher`]: rawVal }));
+                                    const num = parseFloat(rawVal);
+                                    const cleanNum = isNaN(num) ? 0 : Math.round(num * 100) / 100;
+                                    handleUpdateConsolidatedNonCashForPumper(pumperId, 'voucherSalesAmount', cleanNum);
+                                  }}
+                                  onBlur={() => {
+                                    setPumperNonCashInputs(prev => {
+                                      const next = { ...prev };
+                                      const cur = next[`${pumperId}_voucher`];
+                                      if (cur === '' || cur === undefined) {
+                                        delete next[`${pumperId}_voucher`];
+                                      } else {
+                                        const n = parseFloat(cur);
+                                        if (!isNaN(n)) {
+                                          next[`${pumperId}_voucher`] = (Math.round(n * 100) / 100).toString();
+                                        } else {
+                                          delete next[`${pumperId}_voucher`];
+                                        }
+                                      }
+                                      return next;
+                                    });
+                                  }}
+                                  className="w-full px-2 py-1 bg-white border border-amber-200 rounded-lg text-xs font-bold text-right tabular-nums focus:outline-none focus:border-amber-500 text-amber-900 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
+                                />
+                              </div>
+                            </div>
+                          </div>
+
                           <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-xs">
                             <div className="p-1.5 bg-white rounded-lg border border-gray-200">
                               <span className="text-[9px] font-extrabold text-gray-400 uppercase block">Total Net Fuel</span>
@@ -4204,9 +4945,42 @@ const getDefaultChambers = (oilTanksList?: OilTank[]): ChamberReading[] => {
                                 type="number"
                                 step="any"
                                 disabled={isPumperFinalized}
-                                value={p.totalActualCash === 0 ? '' : (p.totalActualCash ?? '')}
+                                value={
+                                  pumperCashInputs[pumperId] !== undefined
+                                    ? pumperCashInputs[pumperId]
+                                    : p.totalActualCash === 0 || p.totalActualCash === undefined || p.totalActualCash === null
+                                    ? ''
+                                    : (Math.round((p.totalActualCash || 0) * 100) / 100).toString()
+                                }
                                 onFocus={(e) => e.target.select()}
-                                onChange={(e) => handleUpdateConsolidatedCashForPumper(pumperId, parseFloat(e.target.value) || 0)}
+                                onChange={(e) => {
+                                  const rawVal = e.target.value;
+                                  setPumperCashInputs(prev => ({ ...prev, [pumperId]: rawVal }));
+                                  if (rawVal === '') {
+                                    handleUpdateConsolidatedCashForPumper(pumperId, 0);
+                                    return;
+                                  }
+                                  const num = parseFloat(rawVal);
+                                  const cleanNum = isNaN(num) ? 0 : Math.round(num * 100) / 100;
+                                  handleUpdateConsolidatedCashForPumper(pumperId, cleanNum);
+                                }}
+                                onBlur={() => {
+                                  setPumperCashInputs(prev => {
+                                    const next = { ...prev };
+                                    const cur = next[pumperId];
+                                    if (cur === '' || cur === undefined) {
+                                      delete next[pumperId];
+                                    } else {
+                                      const n = parseFloat(cur);
+                                      if (!isNaN(n)) {
+                                        next[pumperId] = (Math.round(n * 100) / 100).toString();
+                                      } else {
+                                        delete next[pumperId];
+                                      }
+                                    }
+                                    return next;
+                                  });
+                                }}
                                 className="px-2.5 py-1 bg-white border border-gray-300 rounded-lg text-xs font-extrabold text-right tabular-nums text-gray-900 focus:outline-none focus:border-blue-600 w-32 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
                                 placeholder="0"
                               />

@@ -36,7 +36,9 @@ import {
   DailyDipSession,
   ShiftCounterSales,
   ShiftGasSale,
-  ShiftLubeSale
+  ShiftLubeSale,
+  LPGasItem,
+  PriceSchedule
 } from '../types';
 import { supabase } from '../lib/supabase';
 
@@ -67,6 +69,8 @@ interface DailyShiftSummaryProps {
   tanks?: FuelTank[];
   employees?: Employee[];
   deliveries?: StockDelivery[];
+  priceSchedules?: PriceSchedule[];
+  gasStock?: LPGasItem[];
   onBack?: () => void;
 }
 
@@ -77,6 +81,8 @@ export default function DailyShiftSummary({
   tanks = [],
   employees = [],
   deliveries = [],
+  priceSchedules = [],
+  gasStock = [],
   onBack,
 }: DailyShiftSummaryProps) {
   // Currently active/inspected shift ID
@@ -251,6 +257,243 @@ export default function DailyShiftSummary({
 
     fetchDbCounterSales();
   }, [currentShift?.id]);
+
+  // Dynamic LP Gas price schedule map
+  const [gasPriceMap, setGasPriceMap] = useState<Record<string, number>>(() => {
+    const pMap: Record<string, number> = {
+      '12.5kg': 3690,
+      '37.5kg': 11200,
+      '5kg': 1482,
+      '5.0kg': 1482,
+      '2.3kg': 694,
+      'gas-12.5kg': 3690,
+      'gas-37.5kg': 11200,
+      'gas-5kg': 1482,
+      'gas-5.0kg': 1482,
+      'gas-2.3kg': 694,
+    };
+
+    // Hydrate from props if passed
+    if (gasStock && Array.isArray(gasStock)) {
+      gasStock.forEach((item: any) => {
+        const p = Number(item.selling_price || item.unit_price) || 0;
+        if (p > 0) {
+          if (item.size === '12.5 kg' || item.id === 'gas-12.5kg') {
+            pMap['12.5kg'] = p;
+            pMap['gas-12.5kg'] = p;
+          }
+          if (item.size === '37.5 kg' || item.id === 'gas-37.5kg') {
+            pMap['37.5kg'] = p;
+            pMap['gas-37.5kg'] = p;
+          }
+          if (item.size === '5.0 kg' || item.size === '5kg' || item.id === 'gas-5.0kg' || item.id === 'gas-5kg') {
+            pMap['5kg'] = p;
+            pMap['5.0kg'] = p;
+            pMap['gas-5kg'] = p;
+            pMap['gas-5.0kg'] = p;
+          }
+          if (item.size === '2.3 kg' || item.id === 'gas-2.3kg') {
+            pMap['2.3kg'] = p;
+            pMap['gas-2.3kg'] = p;
+          }
+        }
+      });
+    }
+
+    if (priceSchedules && Array.isArray(priceSchedules)) {
+      priceSchedules.forEach((sched: any) => {
+        const ft = String(sched.fuelType || sched.fueltype || sched.fuel_type || '').toLowerCase();
+        const np = Number(sched.newPrice || sched.newprice || sched.new_price) || 0;
+        const st = String(sched.status || '').toLowerCase();
+        if (np > 0 && st !== 'cancelled') {
+          if (ft.includes('12.5')) { pMap['12.5kg'] = np; pMap['gas-12.5kg'] = np; }
+          if (ft.includes('37.5')) { pMap['37.5kg'] = np; pMap['gas-37.5kg'] = np; }
+          if (ft.includes('5.0') || ft.includes('5kg')) { pMap['5kg'] = np; pMap['5.0kg'] = np; pMap['gas-5kg'] = np; pMap['gas-5.0kg'] = np; }
+          if (ft.includes('2.3')) { pMap['2.3kg'] = np; pMap['gas-2.3kg'] = np; }
+        }
+      });
+    }
+
+    // Hydrate from localStorage
+    try {
+      const storedPrices = localStorage.getItem('fuel_flow_gas_prices');
+      if (storedPrices) {
+        const parsed = JSON.parse(storedPrices);
+        if (typeof parsed === 'object' && parsed) {
+          Object.keys(parsed).forEach(k => {
+            const v = Number(parsed[k]);
+            if (v > 0) {
+              pMap[k] = v;
+              if (k === '12.5kg') pMap['gas-12.5kg'] = v;
+              if (k === '37.5kg') pMap['gas-37.5kg'] = v;
+              if (k === '5kg' || k === '5.0kg') {
+                pMap['5kg'] = v;
+                pMap['5.0kg'] = v;
+                pMap['gas-5kg'] = v;
+                pMap['gas-5.0kg'] = v;
+              }
+              if (k === '2.3kg') pMap['gas-2.3kg'] = v;
+            }
+          });
+        }
+      }
+
+      const storedStock = localStorage.getItem('fuel_flow_gas_stock') || localStorage.getItem('fuel_flow_gas_inventory') || localStorage.getItem('fuelflow_lpgas_inventory');
+      if (storedStock) {
+        const parsed = JSON.parse(storedStock);
+        if (Array.isArray(parsed)) {
+          parsed.forEach((item: any) => {
+            const p = Number(item.selling_price || item.unit_price || item.price) || 0;
+            if (p > 0) {
+              if (item.size === '12.5 kg' || item.id === 'gas-12.5kg') {
+                pMap['12.5kg'] = p;
+                pMap['gas-12.5kg'] = p;
+              }
+              if (item.size === '37.5 kg' || item.id === 'gas-37.5kg') {
+                pMap['37.5kg'] = p;
+                pMap['gas-37.5kg'] = p;
+              }
+              if (item.size === '5.0 kg' || item.size === '5kg' || item.id === 'gas-5.0kg' || item.id === 'gas-5kg') {
+                pMap['5kg'] = p;
+                pMap['5.0kg'] = p;
+                pMap['gas-5kg'] = p;
+                pMap['gas-5.0kg'] = p;
+              }
+              if (item.size === '2.3 kg' || item.id === 'gas-2.3kg') {
+                pMap['2.3kg'] = p;
+                pMap['gas-2.3kg'] = p;
+              }
+            }
+          });
+        }
+      }
+    } catch (_) {}
+
+    return pMap;
+  });
+
+  // Fetch dynamic LP Gas prices from Supabase price_schedules and gas_inventory
+  useEffect(() => {
+    let isMounted = true;
+
+    const fetchDynamicGasPrices = async () => {
+      const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
+      if (!isConfigured) return;
+
+      try {
+        const updatedMap: Record<string, number> = {};
+
+        // 1. Fetch from gas_inventory table
+        const { data: gasInvData, error: gasErr } = await supabase
+          .from('gas_inventory')
+          .select('*');
+
+        if (!gasErr && gasInvData && gasInvData.length > 0) {
+          gasInvData.forEach((row: any) => {
+            const price = Number(row.selling_price || row.unit_price || row.price) || 0;
+            if (price > 0) {
+              const id = String(row.id || '').toLowerCase();
+              const size = String(row.size || '').toLowerCase();
+
+              if (id.includes('12.5') || size.includes('12.5')) {
+                updatedMap['12.5kg'] = price;
+                updatedMap['gas-12.5kg'] = price;
+              } else if (id.includes('37.5') || size.includes('37.5')) {
+                updatedMap['37.5kg'] = price;
+                updatedMap['gas-37.5kg'] = price;
+              } else if (id.includes('5.0') || id.includes('5kg') || size.includes('5.0') || size.includes('5kg') || size === '5') {
+                updatedMap['5kg'] = price;
+                updatedMap['5.0kg'] = price;
+                updatedMap['gas-5kg'] = price;
+                updatedMap['gas-5.0kg'] = price;
+              } else if (id.includes('2.3') || size.includes('2.3')) {
+                updatedMap['2.3kg'] = price;
+                updatedMap['gas-2.3kg'] = price;
+              }
+            }
+          });
+        }
+
+        // 2. Fetch from price_schedules table
+        const { data: schedData, error: schedErr } = await supabase
+          .from('price_schedules')
+          .select('*')
+          .order('effectivedate', { ascending: false });
+
+        if (!schedErr && schedData && schedData.length > 0) {
+          schedData.forEach((row: any) => {
+            const fuelType = String(row.fueltype || row.fuel_type || '').toLowerCase();
+            const newPrice = Number(row.newprice || row.new_price || row.price) || 0;
+            const status = String(row.status || '').toLowerCase();
+
+            if (newPrice > 0 && status !== 'cancelled') {
+              if (fuelType.includes('12.5') || fuelType.includes('gas 12.5')) {
+                if (!updatedMap['12.5kg']) updatedMap['12.5kg'] = newPrice;
+                if (!updatedMap['gas-12.5kg']) updatedMap['gas-12.5kg'] = newPrice;
+              } else if (fuelType.includes('37.5') || fuelType.includes('gas 37.5')) {
+                if (!updatedMap['37.5kg']) updatedMap['37.5kg'] = newPrice;
+                if (!updatedMap['gas-37.5kg']) updatedMap['gas-37.5kg'] = newPrice;
+              } else if (fuelType.includes('5.0') || fuelType.includes('5kg') || fuelType.includes('gas 5')) {
+                if (!updatedMap['5kg']) updatedMap['5kg'] = newPrice;
+                if (!updatedMap['5.0kg']) updatedMap['5.0kg'] = newPrice;
+                if (!updatedMap['gas-5kg']) updatedMap['gas-5kg'] = newPrice;
+                if (!updatedMap['gas-5.0kg']) updatedMap['gas-5.0kg'] = newPrice;
+              } else if (fuelType.includes('2.3') || fuelType.includes('gas 2.3')) {
+                if (!updatedMap['2.3kg']) updatedMap['2.3kg'] = newPrice;
+                if (!updatedMap['gas-2.3kg']) updatedMap['gas-2.3kg'] = newPrice;
+              }
+            }
+          });
+        }
+
+        if (isMounted && Object.keys(updatedMap).length > 0) {
+          setGasPriceMap(prev => ({ ...prev, ...updatedMap }));
+        }
+      } catch (err) {
+        console.warn('Notice: Error dynamically loading gas price schedules in DailyShiftSummary:', err);
+      }
+    };
+
+    fetchDynamicGasPrices();
+
+    // Event listeners for immediate sync across tabs
+    const handlePricesUpdated = (e: any) => {
+      const detail = e?.detail;
+      if (detail?.updatedPrices) {
+        setGasPriceMap(prev => ({ ...prev, ...detail.updatedPrices }));
+      }
+    };
+
+    const handleStorageChange = (e: StorageEvent) => {
+      if (e.key === 'fuel_flow_gas_prices' && e.newValue) {
+        try {
+          const parsed = JSON.parse(e.newValue);
+          setGasPriceMap(prev => ({ ...prev, ...parsed }));
+        } catch (_) {}
+      }
+    };
+
+    window.addEventListener('gas-prices-updated', handlePricesUpdated);
+    window.addEventListener('gas-inventory-updated', handlePricesUpdated);
+    window.addEventListener('storage', handleStorageChange);
+
+    return () => {
+      isMounted = false;
+      window.removeEventListener('gas-prices-updated', handlePricesUpdated);
+      window.removeEventListener('gas-inventory-updated', handlePricesUpdated);
+      window.removeEventListener('storage', handleStorageChange);
+    };
+  }, []);
+
+  // Helper to dynamically resolve LP Gas standard selling unit price
+  const getDynamicGasUnitPrice = (g: ShiftGasSale): number => {
+    const key = String(g.gasItemId || g.type || g.size || '').toLowerCase();
+    if (key.includes('12.5')) return gasPriceMap['12.5kg'] || gasPriceMap['gas-12.5kg'] || 3690;
+    if (key.includes('37.5')) return gasPriceMap['37.5kg'] || gasPriceMap['gas-37.5kg'] || 11200;
+    if (key.includes('5.0') || key.includes('5kg') || key === '5') return gasPriceMap['5kg'] || gasPriceMap['5.0kg'] || gasPriceMap['gas-5kg'] || 1482;
+    if (key.includes('2.3')) return gasPriceMap['2.3kg'] || gasPriceMap['gas-2.3kg'] || 694;
+    return gasPriceMap[key] || gasPriceMap[g.gasItemId] || Number(g.unitPrice) || 0;
+  };
 
   // Supervisor Name helper
   const getSupervisorName = (id?: string) => {
@@ -676,20 +919,26 @@ export default function DailyShiftSummary({
       } catch (_) {}
     }
 
-    // Standard fallback gas items if no sales were ever initialized
+    // Standard fallback gas items if no sales were ever initialized in this shift
     if (rawGas.length === 0) {
       rawGas = [
-        { gasItemId: 'gas-12.5kg', size: '12.5 kg', type: '12.5kg', quantity: 0, unitPrice: 3690, totalAmount: 0 },
-        { gasItemId: 'gas-5kg', size: '5.0 kg', type: '5kg', quantity: 0, unitPrice: 1482, totalAmount: 0 },
-        { gasItemId: 'gas-2.3kg', size: '2.3 kg', type: '2.3kg', quantity: 0, unitPrice: 694, totalAmount: 0 },
+        { gasItemId: 'gas-12.5kg', size: '12.5 kg', type: '12.5kg', quantity: 0, unitPrice: getDynamicGasUnitPrice({ gasItemId: 'gas-12.5kg', size: '12.5 kg', quantity: 0, unitPrice: 0, totalAmount: 0 }), totalAmount: 0 },
+        { gasItemId: 'gas-5kg', size: '5.0 kg', type: '5kg', quantity: 0, unitPrice: getDynamicGasUnitPrice({ gasItemId: 'gas-5kg', size: '5.0 kg', quantity: 0, unitPrice: 0, totalAmount: 0 }), totalAmount: 0 },
+        { gasItemId: 'gas-2.3kg', size: '2.3 kg', type: '2.3kg', quantity: 0, unitPrice: getDynamicGasUnitPrice({ gasItemId: 'gas-2.3kg', size: '2.3 kg', quantity: 0, unitPrice: 0, totalAmount: 0 }), totalAmount: 0 },
       ];
     }
 
     const gasItems: ItemizedGasSale[] = rawGas.map((g, idx) => {
       const qty = Number(g.quantity) || 0;
-      const price = Number(g.unitPrice) || 0;
+      const recordedPrice = Number(g.unitPrice) || 0;
+      const scheduledPrice = getDynamicGasUnitPrice(g);
+
+      // Price Sync & Fallback Logic:
+      // If a shift has specific recorded gas sales, use the actual selling price recorded for that shift log.
+      // If sales count is 0, display the current effective standard unit price set in the station's LP Gas Price Schedule.
+      const price = (qty > 0 && recordedPrice > 0) ? recordedPrice : scheduledPrice;
       const total = Number(g.totalAmount) || (qty * price);
-      const sizeLabel = g.size || (g.type === '12.5kg' ? '12.5 kg' : g.type === '5kg' ? '5.0 kg' : g.type === '2.3kg' ? '2.3 kg' : 'Standard');
+      const sizeLabel = g.size || (g.type === '12.5kg' ? '12.5 kg' : g.type === '37.5kg' ? '37.5 kg' : (g.type === '5kg' || g.type === '5.0kg') ? '5.0 kg' : g.type === '2.3kg' ? '2.3 kg' : 'Standard');
       
       let name = `Litro Gas ${sizeLabel} Cylinder`;
       if (sizeLabel.toLowerCase().includes('refill')) {
@@ -806,7 +1055,7 @@ export default function DailyShiftSummary({
       totalLubeAmount,
       totalNonFuelAmount: totalGasAmount + totalLubeAmount,
     };
-  }, [currentShift, counterSalesData]);
+  }, [currentShift, counterSalesData, gasPriceMap]);
 
   // Section 4: Non-Cash Deductions & Financial Settlement
   const financialSettlement = useMemo(() => {

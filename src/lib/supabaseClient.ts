@@ -1,5 +1,5 @@
 import { supabase, getTanksTableName } from './supabase';
-import { PumpReading, FuelTank, OilTank, Customer, CustomerLedgerEntry, Shift, ShiftBankDeposit, PumperShortageExcessRecord } from '../types';
+import { PumpReading, FuelTank, OilTank, Customer, CustomerLedgerEntry, Shift, ShiftBankDeposit, PumperShortageExcessRecord, ChamberReading } from '../types';
 
 export { supabase };
 
@@ -1690,6 +1690,323 @@ export async function updatePumperShortageExcessStatus(
     console.warn('updatePumperShortageExcessStatus error:', err);
     return { success: false, error: err };
   }
+}
+
+export interface PumperReconciliationPayload {
+  id: string; // `${shiftId}_${pumperId}`
+  shift_id: string;
+  pumper_id: string;
+  pumper_name: string;
+  handed_over_cash: number;
+  actual_cash: number;
+  expected_cash: number;
+  cash_variance: number;
+  credit_sales: number;
+  card_sales: number;
+  touch_card_sales: number;
+  voucher_sales: number;
+  assigned_pumps_count: number;
+  status: string;
+  updated_at?: string;
+}
+
+/**
+ * Persists a pumper's reconciled cash handover and non-cash sales directly to Supabase.
+ * Tries 'shift_pumper_assignments', 'shift_pumper_reconciliations', and 'pumper_assignments'.
+ */
+export async function savePumperReconciliation(
+  client: any,
+  payload: PumperReconciliationPayload
+) {
+  // Always cache locally first so page refreshes never lose state
+  try {
+    const key = `fuelflow_pumper_reconciliation_${payload.shift_id}_${payload.pumper_id}`;
+    localStorage.setItem(key, JSON.stringify(payload));
+  } catch (_) {}
+
+  const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
+  if (!isConfigured) return { success: true };
+
+  const fullPayload = {
+    ...payload,
+    updated_at: new Date().toISOString()
+  };
+
+  try {
+    // 1. Try 'shift_pumper_assignments' with full columns
+    const { error: err1 } = await client
+      .from('shift_pumper_assignments')
+      .upsert([fullPayload]);
+
+    if (!err1) return { success: true };
+
+    // If schema error (e.g. column doesn't exist), try standard columns
+    if (err1 && (err1.code === '42703' || err1.code === 'PGRST204' || err1.message?.includes('column'))) {
+      const basicPayload = {
+        id: payload.id,
+        shift_id: payload.shift_id,
+        pumper_id: payload.pumper_id,
+        pumper_name: payload.pumper_name,
+        actual_cash: payload.actual_cash,
+        expected_cash: payload.expected_cash,
+        cash_variance: payload.cash_variance,
+        status: payload.status,
+        updated_at: new Date().toISOString()
+      };
+      const { error: errBasic } = await client
+        .from('shift_pumper_assignments')
+        .upsert([basicPayload]);
+      if (!errBasic) return { success: true };
+    }
+  } catch (err) {
+    console.warn('shift_pumper_assignments save error, trying fallbacks:', err);
+  }
+
+  try {
+    // 2. Try 'shift_pumper_reconciliations'
+    const { error: err2 } = await client
+      .from('shift_pumper_reconciliations')
+      .upsert([fullPayload]);
+    if (!err2) return { success: true };
+  } catch (_) {}
+
+  try {
+    // 3. Try legacy 'pumper_assignments'
+    const { error: err3 } = await client
+      .from('pumper_assignments')
+      .upsert([{
+        id: payload.id,
+        shift_id: payload.shift_id,
+        pumper_id: payload.pumper_id,
+        actual_cash: payload.actual_cash,
+        handed_over_cash: payload.handed_over_cash,
+        credit_sales: payload.credit_sales,
+        card_sales: payload.card_sales,
+        touch_card_sales: payload.touch_card_sales,
+        voucher_sales: payload.voucher_sales,
+        status: payload.status
+      }]);
+    if (!err3) return { success: true };
+  } catch (_) {}
+
+  return { success: false };
+}
+
+/**
+ * Fetches reconciled pumper records for an active shift.
+ */
+export async function fetchPumperReconciliations(
+  client: any,
+  shiftId: string
+): Promise<any[]> {
+  const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
+  let dbResults: any[] = [];
+
+  if (isConfigured && shiftId) {
+    try {
+      const { data, error } = await client
+        .from('shift_pumper_assignments')
+        .select('*')
+        .eq('shift_id', shiftId);
+      if (!error && data && data.length > 0) {
+        dbResults = data;
+      }
+    } catch (_) {}
+
+    if (dbResults.length === 0) {
+      try {
+        const { data, error } = await client
+          .from('shift_pumper_reconciliations')
+          .select('*')
+          .eq('shift_id', shiftId);
+        if (!error && data && data.length > 0) {
+          dbResults = data;
+        }
+      } catch (_) {}
+    }
+
+    if (dbResults.length === 0) {
+      try {
+        const { data, error } = await client
+          .from('pumper_assignments')
+          .select('*')
+          .eq('shift_id', shiftId);
+        if (!error && data && data.length > 0) {
+          dbResults = data;
+        }
+      } catch (_) {}
+    }
+  }
+
+  // Also read from localStorage cache to guarantee instant rehydration even before/without DB response
+  const localResults: any[] = [];
+  try {
+    const prefix = `fuelflow_pumper_reconciliation_${shiftId}_`;
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(prefix)) {
+        const val = localStorage.getItem(key);
+        if (val) {
+          try {
+            localResults.push(JSON.parse(val));
+          } catch (_) {}
+        }
+      }
+    }
+  } catch (_) {}
+
+  // Merge local and db results (db takes priority if available, otherwise local)
+  const mergedMap = new Map<string, any>();
+  localResults.forEach(r => {
+    const pid = r.pumper_id || r.pumperId;
+    if (pid) mergedMap.set(pid, r);
+  });
+  dbResults.forEach(r => {
+    const pid = r.pumper_id || r.pumperId;
+    if (pid) {
+      const existing = mergedMap.get(pid) || {};
+      mergedMap.set(pid, {
+        ...existing,
+        ...r,
+        handed_over_cash: Number(r.handed_over_cash ?? r.handedovercash ?? r.actual_cash ?? r.actualcash) || Number(existing.handed_over_cash ?? existing.actual_cash) || 0,
+        actual_cash: Number(r.actual_cash ?? r.actualcash ?? r.handed_over_cash ?? r.handedovercash) || Number(existing.actual_cash ?? existing.handed_over_cash) || 0,
+        credit_sales: Number(r.credit_sales ?? r.creditsales) || Number(existing.credit_sales) || 0,
+        card_sales: Number(r.card_sales ?? r.cardsales) || Number(existing.card_sales) || 0,
+        touch_card_sales: Number(r.touch_card_sales ?? r.touchcardsales) || Number(existing.touch_card_sales) || 0,
+        voucher_sales: Number(r.voucher_sales ?? r.vouchersales) || Number(existing.voucher_sales) || 0,
+        status: r.status || existing.status || 'Completed'
+      });
+    }
+  });
+
+  return Array.from(mergedMap.values());
+}
+
+export interface ForecourtOilChamberRecord {
+  id: string; // `${shiftId}_${chamberId}`
+  shift_id: string;
+  chamber_id: string;
+  chamber_number: number;
+  grade: string;
+  opening_liters: number;
+  received_liters: number;
+  closing_liters: number;
+  sold_liters: number;
+  rate_per_liter: number;
+  total_amount: number;
+  updated_at?: string;
+}
+
+/**
+ * Persists 4-Chamber Forecourt Bulk Oil Dispenser readings directly to Supabase.
+ * Tries 'bulk_oil_shift_logs', then 'forecourt_oil_reconciliations'.
+ */
+export async function saveForecourtOilReconciliation(
+  client: any,
+  shiftId: string,
+  chamberReadings: ChamberReading[]
+) {
+  if (!shiftId || !chamberReadings || chamberReadings.length === 0) return { success: true };
+
+  // 1. Always cache in localStorage for instant offline/page-refresh recovery
+  try {
+    const cacheKey = `fuelflow_forecourt_oil_${shiftId}`;
+    localStorage.setItem(cacheKey, JSON.stringify(chamberReadings));
+    chamberReadings.forEach(ch => {
+      const cl = ch.closingLevel ?? ch.closingLiters ?? 0;
+      if (cl > 0) {
+        localStorage.setItem(`fuelflow_chamber_closing_${ch.chamberId}`, String(cl));
+      }
+    });
+  } catch (_) {}
+
+  const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
+  if (!isConfigured) return { success: true };
+
+  const records = chamberReadings.map((ch, idx) => ({
+    id: `${shiftId}_${ch.chamberId || `ch_${idx + 1}`}`,
+    shift_id: shiftId,
+    chamber_id: ch.chamberId || `ch_${idx + 1}`,
+    chamber_number: ch.chamberNumber || (idx + 1),
+    grade: ch.grade || '',
+    opening_liters: Number(ch.openingLevel ?? ch.openingLiters ?? 0),
+    received_liters: Number(ch.receivedLevel ?? ch.receivedLiters ?? 0),
+    closing_liters: Number(ch.closingLevel ?? ch.closingLiters ?? 0),
+    sold_liters: Number(ch.soldLiters || 0),
+    rate_per_liter: Number(ch.ratePerLiter || 0),
+    total_amount: Number(ch.totalAmount || 0),
+    updated_at: new Date().toISOString()
+  }));
+
+  try {
+    const { error: err1 } = await client
+      .from('bulk_oil_shift_logs')
+      .upsert(records);
+    if (!err1) return { success: true };
+  } catch (e) {
+    console.warn('bulk_oil_shift_logs upsert note:', e);
+  }
+
+  try {
+    const { error: err2 } = await client
+      .from('forecourt_oil_reconciliations')
+      .upsert(records);
+    if (!err2) return { success: true };
+  } catch (e) {
+    console.warn('forecourt_oil_reconciliations upsert note:', e);
+  }
+
+  return { success: false };
+}
+
+/**
+ * Fetches Forecourt Bulk Oil Dispenser reconciliation records for an active shift.
+ */
+export async function fetchForecourtOilReconciliation(
+  client: any,
+  shiftId: string
+): Promise<any[]> {
+  if (!shiftId) return [];
+  const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
+  let dbResults: any[] = [];
+
+  if (isConfigured) {
+    try {
+      const { data, error } = await client
+        .from('bulk_oil_shift_logs')
+        .select('*')
+        .eq('shift_id', shiftId);
+      if (!error && data && data.length > 0) {
+        dbResults = data;
+      }
+    } catch (_) {}
+
+    if (dbResults.length === 0) {
+      try {
+        const { data, error } = await client
+          .from('forecourt_oil_reconciliations')
+          .select('*')
+          .eq('shift_id', shiftId);
+        if (!error && data && data.length > 0) {
+          dbResults = data;
+        }
+      } catch (_) {}
+    }
+  }
+
+  // Also read from localStorage cache
+  let localResults: any[] = [];
+  try {
+    const raw = localStorage.getItem(`fuelflow_forecourt_oil_${shiftId}`);
+    if (raw) {
+      localResults = JSON.parse(raw);
+    }
+  } catch (_) {}
+
+  if (dbResults.length > 0) {
+    return dbResults;
+  }
+  return localResults;
 }
 
 
