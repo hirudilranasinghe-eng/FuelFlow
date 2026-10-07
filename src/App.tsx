@@ -29,9 +29,18 @@ import PriceManagementTab from './components/PriceManagementTab';
 import DepositsTab from './components/DepositsTab';
 import PumperShortExcessTab from './components/PumperShortExcessTab';
 import LoginPage, { LoginModal } from './components/LoginPage';
-import { AuthUser, Employee, FuelTank, OilTank, Pump, PumpMachine, Shift, StockDelivery, PriceSchedule, Customer, CreditTransaction, CreditPayment, LPGasItem, ShiftBankDeposit, resolveUserRole, PumperShortageExcessRecord } from './types';
+import { AuthUser, Employee, FuelTank, OilTank, Pump, PumpMachine, Shift, StockDelivery, PriceSchedule, Customer, CreditTransaction, CreditPayment, LPGasItem, ShiftBankDeposit, resolveUserRole, PumperShortageExcessRecord, RolePermissionsMap, UserPermissionsMap, normalizeRoleName } from './types';
 import { supabase, getTanksTableName, setTanksTableName } from './lib/supabase';
 import { upsertPumpReadings, syncCreditAndCardSales, syncAllNonCashSales, updateNozzleMeterCarryover, saveOilTank, recordShiftBankDeposit, fetchShiftBankDeposits, saveIndividualBankDeposit, deleteIndividualBankDeposit, isPumpReadingActiveOrAssigned, saveShiftLogs, savePumperShortageExcessRecords } from './lib/supabaseClient';
+import { 
+  getCachedRolePermissions, 
+  getCachedUserPermissions, 
+  checkUserPermission, 
+  fetchRolePermissionsFromSupabase, 
+  fetchUserPermissionsFromSupabase,
+  fetchAndHydrateActiveUserPermissions,
+  clearActiveUserPermissions
+} from './lib/permissions';
 
 export const defaultPumpMachines: PumpMachine[] = [];
 export const defaultPumps: Pump[] = [];
@@ -41,11 +50,48 @@ export default function App() {
   const [isCheckingAuth, setIsCheckingAuth] = useState<boolean>(true);
   const [user, setUser] = useState<AuthUser | null>(null);
 
+  // RBAC permissions state (Role & User Overrides)
+  const [rolePermissions, setRolePermissions] = useState<RolePermissionsMap>(() => getCachedRolePermissions());
+  const [userPermissions, setUserPermissions] = useState<UserPermissionsMap>(() => getCachedUserPermissions());
+
   // Navigation active tab
   const [activeTab, setActiveTab] = useState<string>('dashboard');
   const [reportSubTab, setReportSubTab] = useState<string>('daily-sales');
-  const [adminSubTab, setAdminSubTab] = useState<'tanks' | 'oils' | 'mapping' | 'employees' | 'price' | 'system'>('tanks');
+  const [adminSubTab, setAdminSubTab] = useState<'tanks' | 'oils' | 'mapping' | 'employees' | 'permissions' | 'price' | 'system'>('tanks');
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false);
+
+  // Sync role and user permissions from Supabase
+  useEffect(() => {
+    let isMounted = true;
+    Promise.all([
+      fetchRolePermissionsFromSupabase(supabase),
+      fetchUserPermissionsFromSupabase(supabase)
+    ]).then(([rMap, uMap]) => {
+      if (isMounted) {
+        if (rMap) setRolePermissions(rMap);
+        if (uMap) setUserPermissions(uMap);
+      }
+    });
+
+    const handleRoleSync = (e: any) => {
+      if (e?.detail?.permissionsMap && isMounted) {
+        setRolePermissions(e.detail.permissionsMap);
+      }
+    };
+    const handleUserSync = (e: any) => {
+      if (e?.detail?.userPermissionsMap && isMounted) {
+        setUserPermissions(e.detail.userPermissionsMap);
+      }
+    };
+
+    window.addEventListener('role-permissions-updated', handleRoleSync);
+    window.addEventListener('user-permissions-updated', handleUserSync);
+    return () => {
+      isMounted = false;
+      window.removeEventListener('role-permissions-updated', handleRoleSync);
+      window.removeEventListener('user-permissions-updated', handleUserSync);
+    };
+  }, []);
 
   const handleSetActiveTab = (tab: string, subTab?: string) => {
     setActiveTab(tab);
@@ -94,12 +140,14 @@ export default function App() {
               try {
                 localStorage.setItem('fms_user', JSON.stringify(authUser));
               } catch (_) {}
+              fetchAndHydrateActiveUserPermissions(supabase, authUser);
             }
           }
         } catch (err) {
           console.warn("Supabase auth session check notice:", err);
           if (isMounted) {
             setUser(null);
+            clearActiveUserPermissions();
             try {
               localStorage.removeItem('fms_user');
             } catch (_) {}
@@ -109,12 +157,18 @@ export default function App() {
         try {
           const stored = localStorage.getItem('fms_user');
           if (stored && isMounted) {
-            setUser(JSON.parse(stored));
+            const parsed = JSON.parse(stored);
+            setUser(parsed);
+            fetchAndHydrateActiveUserPermissions(supabase, parsed);
           } else if (isMounted) {
             setUser(null);
+            clearActiveUserPermissions();
           }
         } catch (_) {
-          if (isMounted) setUser(null);
+          if (isMounted) {
+            setUser(null);
+            clearActiveUserPermissions();
+          }
         }
       }
 
@@ -143,8 +197,10 @@ export default function App() {
         try {
           localStorage.setItem('fms_user', JSON.stringify(authUser));
         } catch (_) {}
+        fetchAndHydrateActiveUserPermissions(supabase, authUser);
       } else {
         setUser(null);
+        clearActiveUserPermissions();
         try {
           localStorage.removeItem('fms_user');
         } catch (_) {}
@@ -158,21 +214,26 @@ export default function App() {
     };
   }, []);
 
-  // Redirect non-admin users away from 'admin' tab if attempted
+  // Dynamic RBAC tab guard: Redirect users away from modules they lack view permission for
   useEffect(() => {
     if (user) {
-      const { role } = resolveUserRole(user.email, user.role);
-      if (role !== 'admin' && activeTab === 'admin') {
-        setActiveTab('dashboard');
+      const canAccess = checkUserPermission(rolePermissions, user, activeTab, 'view', userPermissions);
+      if (!canAccess) {
+        // Find first available module
+        const fallback = ['dashboard', 'shift', 'deposits', 'reports'].find(m => 
+          checkUserPermission(rolePermissions, user, m, 'view', userPermissions)
+        ) || 'dashboard';
+        setActiveTab(fallback);
       }
     }
-  }, [user, activeTab]);
+  }, [user, activeTab, rolePermissions, userPermissions]);
 
   const handleLoginSuccess = (signedInUser: AuthUser) => {
     setUser(signedInUser);
     try {
       localStorage.setItem('fms_user', JSON.stringify(signedInUser));
     } catch (_) {}
+    fetchAndHydrateActiveUserPermissions(supabase, signedInUser);
   };
 
   const handleLogout = async () => {
@@ -183,6 +244,7 @@ export default function App() {
       }
     } catch (_) {}
     setUser(null);
+    clearActiveUserPermissions();
     try {
       localStorage.removeItem('fms_user');
       localStorage.removeItem('fuelflow_user');
@@ -1735,6 +1797,8 @@ export default function App() {
         onLogout={handleLogout} 
         isCollapsed={sidebarCollapsed}
         onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
+        rolePermissions={rolePermissions}
+        userPermissions={userPermissions}
       />
 
       {/* Main Panel Content Area */}

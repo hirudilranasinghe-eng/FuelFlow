@@ -18,10 +18,11 @@ import { SUPABASE_SQL } from '../lib/sqlSchema';
 import { isAdmin } from '../lib/auth';
 import LubricantStorageTab from './admin/LubricantStorageTab';
 import UndergroundTanksTab from './admin/UndergroundTanksTab';
+import RolePermissionsTab from './admin/RolePermissionsTab';
 
 interface AdminControlTabProps {
-  activeSubTab?: 'tanks' | 'oils' | 'mapping' | 'employees' | 'price' | 'system';
-  onSubTabChange?: (tab: 'tanks' | 'oils' | 'mapping' | 'employees' | 'price' | 'system') => void;
+  activeSubTab?: 'tanks' | 'oils' | 'mapping' | 'employees' | 'permissions' | 'price' | 'system';
+  onSubTabChange?: (tab: 'tanks' | 'oils' | 'mapping' | 'employees' | 'permissions' | 'price' | 'system') => void;
   tanks: FuelTank[];
   setTanks: React.Dispatch<React.SetStateAction<FuelTank[]>>;
   oilTanks?: OilTank[];
@@ -58,11 +59,11 @@ export default function AdminControlTab({
   user,
   userRole
 }: AdminControlTabProps) {
-  // Active sub-tab inside Admin Control: 'tanks' | 'oils' | 'mapping' | 'employees' | 'price' | 'system'
-  const [internalAdminSection, setInternalAdminSection] = useState<'tanks' | 'oils' | 'mapping' | 'employees' | 'price' | 'system'>('tanks');
+  // Active sub-tab inside Admin Control: 'tanks' | 'oils' | 'mapping' | 'employees' | 'permissions' | 'price' | 'system'
+  const [internalAdminSection, setInternalAdminSection] = useState<'tanks' | 'oils' | 'mapping' | 'employees' | 'permissions' | 'price' | 'system'>('tanks');
   
   const adminSection = activeSubTab || internalAdminSection;
-  const setAdminSection = (tab: 'tanks' | 'oils' | 'mapping' | 'employees' | 'price' | 'system') => {
+  const setAdminSection = (tab: 'tanks' | 'oils' | 'mapping' | 'employees' | 'permissions' | 'price' | 'system') => {
     if (onSubTabChange) {
       onSubTabChange(tab);
     }
@@ -1047,6 +1048,12 @@ export default function AdminControlTab({
           title: 'Fuel Tariff & Price Management',
           subtitle: 'Active retail rates per liter and scheduled price revisions'
         };
+      case 'permissions':
+        return {
+          icon: ShieldCheck,
+          title: 'Role Access & Permissions (RBAC)',
+          subtitle: 'Multi-role permission matrix, dynamic sidebar visibility, and operational access control'
+        };
       case 'system':
       default:
         return {
@@ -1290,13 +1297,24 @@ export default function AdminControlTab({
               />
             </div>
 
-            <button
-              onClick={handleOpenAddEmpModal}
-              className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-colors shadow-xs whitespace-nowrap cursor-pointer"
-            >
-              <Plus className="w-4 h-4" />
-              <span>Register Staff Member</span>
-            </button>
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <button
+                type="button"
+                onClick={() => setAdminSection('permissions')}
+                className="flex items-center gap-2 px-3.5 py-2 bg-purple-50 hover:bg-purple-100 text-purple-700 border border-purple-200 rounded-xl text-xs font-bold transition-colors shadow-2xs whitespace-nowrap cursor-pointer"
+              >
+                <ShieldCheck className="w-4 h-4 text-purple-600" />
+                <span>Role Permissions (RBAC)</span>
+              </button>
+
+              <button
+                onClick={handleOpenAddEmpModal}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold transition-colors shadow-xs whitespace-nowrap cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                <span>Register Staff Member</span>
+              </button>
+            </div>
           </div>
 
           {/* Categorized Lists: Supervisors & Pumpers (Compact Table View) */}
@@ -1437,6 +1455,18 @@ export default function AdminControlTab({
             );
           })()}
         </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* SECTION: ROLE ACCESS & PERMISSIONS (RBAC) MATRIX */}
+      {/* ========================================================================= */}
+      {adminSection === 'permissions' && (
+        <RolePermissionsTab
+          employees={employees}
+          user={user}
+          userRole={userRole}
+          showToast={showToast}
+        />
       )}
 
       {/* ========================================================================= */}

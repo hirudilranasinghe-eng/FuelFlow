@@ -466,3 +466,72 @@ CREATE TABLE IF NOT EXISTS forecourt_oil_reconciliations (
 ALTER TABLE forecourt_oil_reconciliations DISABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Enable all access for forecourt_oil_reconciliations" ON forecourt_oil_reconciliations;
 CREATE POLICY "Enable all access for forecourt_oil_reconciliations" ON forecourt_oil_reconciliations FOR ALL TO public USING (true) WITH CHECK (true);
+
+-- Role Access & Permissions (RBAC) Table
+CREATE TABLE IF NOT EXISTS role_permissions (
+    id TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    module TEXT NOT NULL,
+    is_visible BOOLEAN NOT NULL DEFAULT true,
+    can_view BOOLEAN NOT NULL DEFAULT true,
+    can_create BOOLEAN NOT NULL DEFAULT false,
+    can_edit BOOLEAN NOT NULL DEFAULT false,
+    can_delete BOOLEAN NOT NULL DEFAULT false,
+    can_export BOOLEAN NOT NULL DEFAULT false,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT unique_role_module UNIQUE (role, module)
+);
+
+ALTER TABLE role_permissions ADD COLUMN IF NOT EXISTS is_visible BOOLEAN DEFAULT true;
+ALTER TABLE role_permissions ADD COLUMN IF NOT EXISTS can_view BOOLEAN DEFAULT true;
+ALTER TABLE role_permissions DISABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Enable all access for role_permissions" ON role_permissions;
+CREATE POLICY "Enable all access for role_permissions" ON role_permissions FOR ALL TO public USING (true) WITH CHECK (true);
+
+-- User-Specific Permission Overrides Table
+CREATE TABLE IF NOT EXISTS user_permissions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    user_name TEXT,
+    user_role TEXT,
+    module TEXT NOT NULL,
+    is_visible BOOLEAN NOT NULL DEFAULT true,
+    can_view BOOLEAN NOT NULL DEFAULT true,
+    can_create BOOLEAN NOT NULL DEFAULT false,
+    can_edit BOOLEAN NOT NULL DEFAULT false,
+    can_delete BOOLEAN NOT NULL DEFAULT false,
+    can_export BOOLEAN NOT NULL DEFAULT false,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT unique_user_module UNIQUE (user_id, module)
+);
+
+ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS is_visible BOOLEAN DEFAULT true;
+ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS can_view BOOLEAN DEFAULT true;
+ALTER TABLE user_permissions DISABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Enable all access for user_permissions" ON user_permissions;
+CREATE POLICY "Enable all access for user_permissions" ON user_permissions FOR ALL TO public USING (true) WITH CHECK (true);
+
+-- Safe RPC function to fetch active Supabase auth users for admin dropdown
+CREATE OR REPLACE FUNCTION get_supabase_auth_users()
+RETURNS TABLE (
+    id UUID,
+    email TEXT,
+    full_name TEXT,
+    role TEXT
+) 
+SECURITY DEFINER
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        u.id,
+        u.email::TEXT,
+        COALESCE(u.raw_user_meta_data->>'full_name', u.raw_user_meta_data->>'name', u.email)::TEXT AS full_name,
+        COALESCE(u.raw_user_meta_data->>'role', 'user')::TEXT AS role
+    FROM auth.users u
+    ORDER BY u.created_at DESC;
+END;
+$$ LANGUAGE plpgsql;
+
+GRANT EXECUTE ON FUNCTION get_supabase_auth_users() TO authenticated, anon, public;
+

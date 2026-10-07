@@ -5,6 +5,72 @@
 
 export type FuelType = 'Petrol 92' | 'Petrol 95' | 'Auto Diesel' | 'Super Diesel' | 'Lanka Ordinary Diesel' | 'Oil & Lubricants';
 
+export type SystemRole = 'System Admin' | 'Manager' | 'Supervisor' | 'Auditor' | 'Pumper' | 'Cashier';
+
+export type SystemModuleId =
+  | 'dashboard'
+  | 'shift'
+  | 'shift_management'
+  | 'pumper-short-excess'
+  | 'pumper_short_excess'
+  | 'deposits'
+  | 'stock'
+  | 'fuel_stock'
+  | 'oil-storage'
+  | 'oil_storage'
+  | 'gas-inventory'
+  | 'gas_inventory'
+  | 'purchases'
+  | 'manual-dip-record'
+  | 'manual_dip_record'
+  | 'reports'
+  | 'customers'
+  | 'admin'
+  | 'admin_control';
+
+export interface ModulePermission {
+  id?: string;
+  role: string;
+  module: SystemModuleId | string;
+  moduleName?: string;
+  canView: boolean;
+  canCreate: boolean;
+  canEdit: boolean;
+  canDelete: boolean;
+  canExport: boolean;
+  updatedAt?: string;
+}
+
+export type RolePermissionsMap = Record<string, Record<string, {
+  canView: boolean;
+  canCreate: boolean;
+  canEdit: boolean;
+  canDelete: boolean;
+  canExport: boolean;
+}>>;
+
+export type UserPermissionsMap = Record<string, Record<string, {
+  canView: boolean;
+  canCreate: boolean;
+  canEdit: boolean;
+  canDelete: boolean;
+  canExport: boolean;
+}>>;
+
+export interface UserModulePermission {
+  id?: string;
+  userId: string;
+  userName?: string;
+  userRole?: string;
+  module: SystemModuleId | string;
+  canView: boolean;
+  canCreate: boolean;
+  canEdit: boolean;
+  canDelete: boolean;
+  canExport: boolean;
+  updatedAt?: string;
+}
+
 export interface AuthUser {
   id: string;
   email: string;
@@ -13,16 +79,32 @@ export interface AuthUser {
   avatarColor?: string;
 }
 
+export function normalizeRoleName(role?: string): SystemRole {
+  if (!role) return 'Supervisor';
+  const r = role.toLowerCase().trim();
+  if (r.includes('admin') || r === 'system admin' || r === 'system_admin' || r === 'owner') return 'System Admin';
+  if (r.includes('manager')) return 'Manager';
+  if (r.includes('auditor') || r.includes('accountant')) return 'Auditor';
+  if (r.includes('pumper') || r.includes('operator')) return 'Pumper';
+  if (r.includes('cashier')) return 'Cashier';
+  if (r.includes('supervisor')) return 'Supervisor';
+  return 'Supervisor';
+}
+
 export function resolveUserRole(email?: string, metaRole?: string): { role: 'admin' | 'supervisor'; roleTitle: string } {
-  if (metaRole && typeof metaRole === 'string' && metaRole.trim().toLowerCase() === 'admin') {
-    return { role: 'admin', roleTitle: 'System Admin' };
+  if (metaRole && typeof metaRole === 'string') {
+    const norm = normalizeRoleName(metaRole);
+    if (norm === 'System Admin') {
+      return { role: 'admin', roleTitle: 'System Admin' };
+    }
+    return { role: 'supervisor', roleTitle: norm };
   }
 
   const lowerEmail = (email || '').toLowerCase().trim();
   if (lowerEmail.includes('admin')) {
     return { role: 'admin', roleTitle: 'System Admin' };
   }
-  return { role: 'supervisor', roleTitle: 'User' };
+  return { role: 'supervisor', roleTitle: 'Supervisor' };
 }
 
 export interface Employee {
