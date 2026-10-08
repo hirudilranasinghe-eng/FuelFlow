@@ -756,6 +756,31 @@ export default function App() {
         `).order('starttime', { ascending: false });
         if (shiftError) handleSupabaseError(shiftError);
 
+        // If shiftsData contains active shifts with missing or empty pumpReadings, query pump_readings / meter_readings directly
+        if (shiftsData && Array.isArray(shiftsData)) {
+          for (const s of shiftsData) {
+            if (s.isactive && (!s.pumpReadings || s.pumpReadings.length === 0)) {
+              try {
+                const { data: prData } = await supabase
+                  .from('pump_readings')
+                  .select('*')
+                  .eq('shift_id', s.id);
+                if (prData && prData.length > 0) {
+                  s.pumpReadings = prData;
+                } else {
+                  const { data: mrData } = await supabase
+                    .from('meter_readings')
+                    .select('*')
+                    .eq('shift_id', s.id);
+                  if (mrData && mrData.length > 0) {
+                    s.pumpReadings = mrData;
+                  }
+                }
+              } catch (_) {}
+            }
+          }
+        }
+
         // Fetch shift bank deposits to accurately calculate banked cash per shift
         let appDepositsByShift: Record<string, number> = {};
         try {
@@ -793,9 +818,24 @@ export default function App() {
               replacementPumperCash: Number(r.replacement_pumper_cash || r.replacementpumpercash || r.replacementPumperCash) || 0,
               handoverMeter: Number(r.handover_meter !== undefined ? r.handover_meter : r.handovermeter !== undefined ? r.handovermeter : r.handoverMeter) || 0,
               handoverNotes: r.handover_notes || r.handovernotes || r.handoverNotes || '',
-              startMeter: Number(r.start_meter !== undefined ? r.start_meter : r.startmeter !== undefined ? r.startmeter : r.startMeter) || 0,
-              endMeter: Number(r.end_meter !== undefined ? r.end_meter : r.endmeter !== undefined ? r.endmeter : r.endMeter) || 0,
-              testingQty: Number(r.testing_qty !== undefined ? r.testing_qty : r.testingqty !== undefined ? r.testingqty : r.testingQty) || 0,
+              startMeter: (() => {
+                const raw = r.start_meter !== undefined ? r.start_meter : (r.startmeter !== undefined ? r.startmeter : r.startMeter);
+                if (raw === undefined || raw === null || raw === '') return 0;
+                const p = parseFloat(String(raw));
+                return !isNaN(p) ? p : 0;
+              })(),
+              endMeter: (() => {
+                const raw = r.end_meter !== undefined ? r.end_meter : (r.endmeter !== undefined ? r.endmeter : r.endMeter);
+                if (raw === undefined || raw === null || raw === '') return 0;
+                const p = parseFloat(String(raw));
+                return !isNaN(p) ? p : 0;
+              })(),
+              testingQty: (() => {
+                const raw = r.testing_qty !== undefined ? r.testing_qty : (r.testingqty !== undefined ? r.testingqty : r.testingQty);
+                if (raw === undefined || raw === null || raw === '') return 0;
+                const p = parseFloat(String(raw));
+                return !isNaN(p) ? p : 0;
+              })(),
               status: r.status || 'Idle',
               isLocked: r.is_locked !== undefined ? r.is_locked : r.islocked !== undefined ? r.islocked : r.isLocked,
               isStartSaved: r.is_start_saved !== undefined ? r.is_start_saved : r.isstartsaved !== undefined ? r.isstartsaved : (r.is_locked || (Number(r.start_meter || r.startmeter || 0) > 0)),

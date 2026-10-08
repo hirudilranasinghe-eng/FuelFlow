@@ -80,7 +80,19 @@ function getValidReadingId(r: PumpReading, shiftId: string): string {
  * Guarantees a valid unique string/UUID 'id'.
  */
 export function formatPumpReadingSnakeCase(r: PumpReading, shiftId: string) {
-  const fuel = Math.max(0, (r.endMeter || 0) - (r.startMeter || 0) - (r.testingQty || 0));
+  const rawStart = r.startMeter;
+  const parsedStart = (rawStart !== undefined && rawStart !== null && !isNaN(Number(rawStart))) ? parseFloat(String(rawStart)) : 0;
+  const startMeter = !isNaN(parsedStart) ? parsedStart : 0;
+
+  const rawEnd = r.endMeter;
+  const parsedEnd = (rawEnd !== undefined && rawEnd !== null && !isNaN(Number(rawEnd))) ? parseFloat(String(rawEnd)) : 0;
+  const endMeter = !isNaN(parsedEnd) ? parsedEnd : 0;
+
+  const rawTest = r.testingQty;
+  const parsedTest = (rawTest !== undefined && rawTest !== null && !isNaN(Number(rawTest))) ? parseFloat(String(rawTest)) : 0;
+  const testQty = !isNaN(parsedTest) ? parsedTest : 0;
+
+  const fuel = Math.max(0, endMeter - startMeter - testQty);
   const grossFuel = fuel * (r.unitPrice || 0);
   const oilSales = r.oilSalesAmount || 0;
   const totalGross = grossFuel + oilSales;
@@ -103,9 +115,9 @@ export function formatPumpReadingSnakeCase(r: PumpReading, shiftId: string) {
     replacement_pumper_cash: r.replacementPumperCash || 0,
     handover_meter: r.handoverMeter || 0,
     handover_notes: r.handoverNotes || '',
-    start_meter: r.startMeter || 0,
-    end_meter: r.endMeter || 0,
-    testing_qty: r.testingQty || 0,
+    start_meter: startMeter,
+    end_meter: endMeter,
+    testing_qty: testQty,
     status: r.status || 'Active',
     is_locked: r.isLocked ?? false,
     unit_price: r.unitPrice || 0,
@@ -125,7 +137,19 @@ export function formatPumpReadingSnakeCase(r: PumpReading, shiftId: string) {
  * Strictly excludes deprecated 'tankid'.
  */
 export function formatPumpReadingLowerCase(r: PumpReading, shiftId: string) {
-  const fuel = Math.max(0, (r.endMeter || 0) - (r.startMeter || 0) - (r.testingQty || 0));
+  const rawStart = r.startMeter;
+  const parsedStart = (rawStart !== undefined && rawStart !== null && !isNaN(Number(rawStart))) ? parseFloat(String(rawStart)) : 0;
+  const startMeter = !isNaN(parsedStart) ? parsedStart : 0;
+
+  const rawEnd = r.endMeter;
+  const parsedEnd = (rawEnd !== undefined && rawEnd !== null && !isNaN(Number(rawEnd))) ? parseFloat(String(rawEnd)) : 0;
+  const endMeter = !isNaN(parsedEnd) ? parsedEnd : 0;
+
+  const rawTest = r.testingQty;
+  const parsedTest = (rawTest !== undefined && rawTest !== null && !isNaN(Number(rawTest))) ? parseFloat(String(rawTest)) : 0;
+  const testQty = !isNaN(parsedTest) ? parsedTest : 0;
+
+  const fuel = Math.max(0, endMeter - startMeter - testQty);
   const grossFuel = fuel * (r.unitPrice || 0);
   const oilSales = r.oilSalesAmount || 0;
   const totalGross = grossFuel + oilSales;
@@ -148,9 +172,9 @@ export function formatPumpReadingLowerCase(r: PumpReading, shiftId: string) {
     replacementpumpercash: r.replacementPumperCash || 0,
     handovermeter: r.handoverMeter || 0,
     handovernotes: r.handoverNotes || '',
-    startmeter: r.startMeter || 0,
-    endmeter: r.endMeter || 0,
-    testingqty: r.testingQty || 0,
+    startmeter: startMeter,
+    endmeter: endMeter,
+    testingqty: testQty,
     status: r.status || 'Active',
     islocked: r.isLocked ?? false,
     unitprice: r.unitPrice || 0,
@@ -170,6 +194,18 @@ export function formatPumpReadingLowerCase(r: PumpReading, shiftId: string) {
  * Used if custom columns like credit_sales_amount do not exist in legacy schema.
  */
 export function formatPumpReadingMinimal(r: PumpReading, shiftId: string) {
+  const rawStart = r.startMeter;
+  const parsedStart = (rawStart !== undefined && rawStart !== null && !isNaN(Number(rawStart))) ? parseFloat(String(rawStart)) : 0;
+  const startMeter = !isNaN(parsedStart) ? parsedStart : 0;
+
+  const rawEnd = r.endMeter;
+  const parsedEnd = (rawEnd !== undefined && rawEnd !== null && !isNaN(Number(rawEnd))) ? parseFloat(String(rawEnd)) : 0;
+  const endMeter = !isNaN(parsedEnd) ? parsedEnd : 0;
+
+  const rawTest = r.testingQty;
+  const parsedTest = (rawTest !== undefined && rawTest !== null && !isNaN(Number(rawTest))) ? parseFloat(String(rawTest)) : 0;
+  const testQty = !isNaN(parsedTest) ? parsedTest : 0;
+
   return {
     id: getValidReadingId(r, shiftId),
     shift_id: shiftId,
@@ -177,9 +213,9 @@ export function formatPumpReadingMinimal(r: PumpReading, shiftId: string) {
     pumpname: r.pumpName,
     fueltype: r.fuelType,
     assignedpumperid: r.assignedPumperId || null,
-    startmeter: r.startMeter || 0,
-    endmeter: r.endMeter || 0,
-    testingqty: r.testingQty || 0,
+    startmeter: startMeter,
+    endmeter: endMeter,
+    testingqty: testQty,
     status: r.status || 'Active',
     islocked: r.isLocked ?? false,
     unitprice: r.unitPrice || 0
@@ -270,12 +306,61 @@ export async function saveShiftLogs(client: any, shift: Shift, readings: PumpRea
 }
 
 /**
+ * Strictly UPSERTS meter readings into Supabase 'meter_readings' table with exact values.
+ */
+export async function upsertMeterReadings(client: any, readings: PumpReading[], shiftId: string) {
+  if (!readings || readings.length === 0 || !shiftId) return { data: null, error: null };
+  const records = readings.map(r => {
+    const rawStart = r.startMeter;
+    const parsedStart = (rawStart !== undefined && rawStart !== null && !isNaN(Number(rawStart))) ? parseFloat(String(rawStart)) : 0;
+    const rawEnd = r.endMeter;
+    const parsedEnd = (rawEnd !== undefined && rawEnd !== null && !isNaN(Number(rawEnd))) ? parseFloat(String(rawEnd)) : 0;
+    const rawTest = r.testingQty;
+    const parsedTest = (rawTest !== undefined && rawTest !== null && !isNaN(Number(rawTest))) ? parseFloat(String(rawTest)) : 0;
+    return {
+      id: getValidReadingId(r, shiftId),
+      shift_id: shiftId,
+      pump_id: r.pumpId,
+      pump_name: r.pumpName,
+      fuel_type: r.fuelType,
+      assigned_pumper_id: r.assignedPumperId || null,
+      start_meter: !isNaN(parsedStart) ? parsedStart : 0,
+      end_meter: !isNaN(parsedEnd) ? parsedEnd : 0,
+      startmeter: !isNaN(parsedStart) ? parsedStart : 0,
+      endmeter: !isNaN(parsedEnd) ? parsedEnd : 0,
+      testing_qty: !isNaN(parsedTest) ? parsedTest : 0,
+      status: r.status || 'Active',
+      is_locked: r.isLocked ?? false,
+      unit_price: r.unitPrice || 0,
+      actual_cash: r.actualCash || 0,
+      updated_at: new Date().toISOString()
+    };
+  });
+
+  try {
+    const res = await client.from('meter_readings').upsert(records);
+    return res;
+  } catch (_) {
+    return { data: null, error: null };
+  }
+}
+
+/**
  * Upserts pump readings array into Supabase with automatic column mapping fallback and error handling.
- * Also triggers explicit direct inserts for non-cash credit_sales and card_sales.
+ * Also strictly syncs to 'meter_readings' and caches in localStorage.
+ * Triggers explicit direct inserts for non-cash credit_sales and card_sales.
  */
 export async function upsertPumpReadings(client: any, readings: PumpReading[], shiftId: string) {
   if (!readings || readings.length === 0 || !shiftId) return { data: null, error: null };
 
+  // 1. Cache readings in localStorage immediately for instant zero-latency recovery on page refresh
+  try {
+    readings.forEach(r => {
+      localStorage.setItem(`fuelflow_pump_reading_${shiftId}_${r.pumpId}`, JSON.stringify(r));
+    });
+  } catch (_) {}
+
+  // 2. Strictly upsert into 'pump_readings'
   const snakePayload = readings.map(r => formatPumpReadingSnakeCase(r, shiftId));
   
   let { data, error } = await client.from('pump_readings').upsert(snakePayload);
@@ -294,6 +379,13 @@ export async function upsertPumpReadings(client: any, readings: PumpReading[], s
       data = minRetry.data;
       error = minRetry.error;
     }
+  }
+
+  // 3. Strictly upsert exact values to 'meter_readings' table in Supabase
+  try {
+    await upsertMeterReadings(client, readings, shiftId);
+  } catch (meterErr) {
+    console.warn('Notice syncing to meter_readings table:', meterErr);
   }
 
   // Explicitly sync non-cash credit_sales, card_sales, touch_card_sales, and voucher_sales in parallel
@@ -1706,12 +1798,16 @@ export interface PumperReconciliationPayload {
   touch_card_sales: number;
   voucher_sales: number;
   assigned_pumps_count: number;
+  start_meter?: number;
+  end_meter?: number;
+  startmeter?: number;
+  endmeter?: number;
   status: string;
   updated_at?: string;
 }
 
 /**
- * Persists a pumper's reconciled cash handover and non-cash sales directly to Supabase.
+ * Persists a pumper's reconciled cash handover, meter readings, and non-cash sales directly to Supabase.
  * Tries 'shift_pumper_assignments', 'shift_pumper_reconciliations', and 'pumper_assignments'.
  */
 export async function savePumperReconciliation(
@@ -1727,13 +1823,58 @@ export async function savePumperReconciliation(
   const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
   if (!isConfigured) return { success: true };
 
+  const rawStart = payload.start_meter !== undefined ? payload.start_meter : (payload.startmeter !== undefined ? payload.startmeter : (payload as any).startMeter);
+  const parsedStart = (rawStart !== undefined && rawStart !== null && rawStart !== '') ? parseFloat(String(rawStart)) : undefined;
+  const startVal = (parsedStart !== undefined && !isNaN(parsedStart)) ? parsedStart : 0;
+
+  const rawEnd = payload.end_meter !== undefined ? payload.end_meter : (payload.endmeter !== undefined ? payload.endmeter : (payload as any).endMeter);
+  const parsedEnd = (rawEnd !== undefined && rawEnd !== null && rawEnd !== '') ? parseFloat(String(rawEnd)) : undefined;
+  const endVal = (parsedEnd !== undefined && !isNaN(parsedEnd)) ? parsedEnd : 0;
+
   const fullPayload = {
     ...payload,
+    start_meter: startVal,
+    end_meter: endVal,
+    startmeter: startVal,
+    endmeter: endVal,
     updated_at: new Date().toISOString()
   };
 
+  // 1. Strictly UPSERT to legacy and standard 'pumper_assignments'
   try {
-    // 1. Try 'shift_pumper_assignments' with full columns
+    const { error: errPumper } = await client
+      .from('pumper_assignments')
+      .upsert([{
+        id: payload.id,
+        shift_id: payload.shift_id,
+        pumper_id: payload.pumper_id,
+        pumper_name: payload.pumper_name,
+        actual_cash: payload.actual_cash ?? 0,
+        handed_over_cash: payload.handed_over_cash ?? payload.actual_cash ?? 0,
+        expected_cash: payload.expected_cash ?? 0,
+        cash_variance: payload.cash_variance ?? 0,
+        credit_sales: payload.credit_sales ?? 0,
+        card_sales: payload.card_sales ?? 0,
+        touch_card_sales: payload.touch_card_sales ?? 0,
+        voucher_sales: payload.voucher_sales ?? 0,
+        start_meter: startVal,
+        end_meter: endVal,
+        startmeter: startVal,
+        endmeter: endVal,
+        status: payload.status,
+        updated_at: new Date().toISOString()
+      }]);
+    if (!errPumper) {
+      // Also sync to shift_pumper_assignments in background
+      client.from('shift_pumper_assignments').upsert([fullPayload]).then(() => {}).catch(() => {});
+      return { success: true };
+    }
+  } catch (errP) {
+    console.warn('pumper_assignments save note:', errP);
+  }
+
+  try {
+    // 2. Try 'shift_pumper_assignments' with full columns
     const { error: err1 } = await client
       .from('shift_pumper_assignments')
       .upsert([fullPayload]);
@@ -1750,6 +1891,8 @@ export async function savePumperReconciliation(
         actual_cash: payload.actual_cash,
         expected_cash: payload.expected_cash,
         cash_variance: payload.cash_variance,
+        start_meter: startVal,
+        end_meter: endVal,
         status: payload.status,
         updated_at: new Date().toISOString()
       };
@@ -1763,30 +1906,11 @@ export async function savePumperReconciliation(
   }
 
   try {
-    // 2. Try 'shift_pumper_reconciliations'
+    // 3. Try 'shift_pumper_reconciliations'
     const { error: err2 } = await client
       .from('shift_pumper_reconciliations')
       .upsert([fullPayload]);
     if (!err2) return { success: true };
-  } catch (_) {}
-
-  try {
-    // 3. Try legacy 'pumper_assignments'
-    const { error: err3 } = await client
-      .from('pumper_assignments')
-      .upsert([{
-        id: payload.id,
-        shift_id: payload.shift_id,
-        pumper_id: payload.pumper_id,
-        actual_cash: payload.actual_cash,
-        handed_over_cash: payload.handed_over_cash,
-        credit_sales: payload.credit_sales,
-        card_sales: payload.card_sales,
-        touch_card_sales: payload.touch_card_sales,
-        voucher_sales: payload.voucher_sales,
-        status: payload.status
-      }]);
-    if (!err3) return { success: true };
   } catch (_) {}
 
   return { success: false };
@@ -1803,9 +1927,10 @@ export async function fetchPumperReconciliations(
   let dbResults: any[] = [];
 
   if (isConfigured && shiftId) {
+    // 1. Try 'pumper_assignments'
     try {
       const { data, error } = await client
-        .from('shift_pumper_assignments')
+        .from('pumper_assignments')
         .select('*')
         .eq('shift_id', shiftId);
       if (!error && data && data.length > 0) {
@@ -1813,10 +1938,11 @@ export async function fetchPumperReconciliations(
       }
     } catch (_) {}
 
+    // 2. Try 'shift_pumper_assignments'
     if (dbResults.length === 0) {
       try {
         const { data, error } = await client
-          .from('shift_pumper_reconciliations')
+          .from('shift_pumper_assignments')
           .select('*')
           .eq('shift_id', shiftId);
         if (!error && data && data.length > 0) {
@@ -1825,10 +1951,11 @@ export async function fetchPumperReconciliations(
       } catch (_) {}
     }
 
+    // 3. Try 'shift_pumper_reconciliations'
     if (dbResults.length === 0) {
       try {
         const { data, error } = await client
-          .from('pumper_assignments')
+          .from('shift_pumper_reconciliations')
           .select('*')
           .eq('shift_id', shiftId);
         if (!error && data && data.length > 0) {
@@ -1859,15 +1986,42 @@ export async function fetchPumperReconciliations(
   const mergedMap = new Map<string, any>();
   localResults.forEach(r => {
     const pid = r.pumper_id || r.pumperId;
-    if (pid) mergedMap.set(pid, r);
+    if (pid) {
+      const rawStart = r.start_meter !== undefined ? r.start_meter : r.startmeter;
+      const parsedStart = (rawStart !== undefined && rawStart !== null && rawStart !== '') ? parseFloat(String(rawStart)) : undefined;
+      const rawEnd = r.end_meter !== undefined ? r.end_meter : r.endmeter;
+      const parsedEnd = (rawEnd !== undefined && rawEnd !== null && rawEnd !== '') ? parseFloat(String(rawEnd)) : undefined;
+
+      mergedMap.set(pid, {
+        ...r,
+        start_meter: (parsedStart !== undefined && !isNaN(parsedStart)) ? parsedStart : 0,
+        end_meter: (parsedEnd !== undefined && !isNaN(parsedEnd)) ? parsedEnd : 0,
+        startmeter: (parsedStart !== undefined && !isNaN(parsedStart)) ? parsedStart : 0,
+        endmeter: (parsedEnd !== undefined && !isNaN(parsedEnd)) ? parsedEnd : 0
+      });
+    }
   });
+
   dbResults.forEach(r => {
     const pid = r.pumper_id || r.pumperId;
     if (pid) {
       const existing = mergedMap.get(pid) || {};
+
+      const rawStart = r.start_meter !== undefined ? r.start_meter : (r.startmeter !== undefined ? r.startmeter : (existing.start_meter !== undefined ? existing.start_meter : existing.startmeter));
+      const parsedStart = (rawStart !== undefined && rawStart !== null && rawStart !== '') ? parseFloat(String(rawStart)) : undefined;
+      const startMeter = (parsedStart !== undefined && !isNaN(parsedStart)) ? parsedStart : 0;
+
+      const rawEnd = r.end_meter !== undefined ? r.end_meter : (r.endmeter !== undefined ? r.endmeter : (existing.end_meter !== undefined ? existing.end_meter : existing.endmeter));
+      const parsedEnd = (rawEnd !== undefined && rawEnd !== null && rawEnd !== '') ? parseFloat(String(rawEnd)) : undefined;
+      const endMeter = (parsedEnd !== undefined && !isNaN(parsedEnd)) ? parsedEnd : 0;
+
       mergedMap.set(pid, {
         ...existing,
         ...r,
+        start_meter: startMeter,
+        end_meter: endMeter,
+        startmeter: startMeter,
+        endmeter: endMeter,
         handed_over_cash: Number(r.handed_over_cash ?? r.handedovercash ?? r.actual_cash ?? r.actualcash) || Number(existing.handed_over_cash ?? existing.actual_cash) || 0,
         actual_cash: Number(r.actual_cash ?? r.actualcash ?? r.handed_over_cash ?? r.handedovercash) || Number(existing.actual_cash ?? existing.handed_over_cash) || 0,
         credit_sales: Number(r.credit_sales ?? r.creditsales) || Number(existing.credit_sales) || 0,
@@ -2007,6 +2161,119 @@ export async function fetchForecourtOilReconciliation(
     return dbResults;
   }
   return localResults;
+}
+
+/**
+ * Directly queries all saved pump readings for a shift from Supabase 'pump_readings' and 'meter_readings'.
+ * Returns an array of mapped readings or empty array if none found / table not configured.
+ */
+export async function fetchShiftPumpReadings(client: any, shiftId: string): Promise<any[]> {
+  const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
+  if (!shiftId) return [];
+
+  let dbResults: any[] = [];
+
+  if (isConfigured) {
+    // 1. Try 'pump_readings' with shift_id
+    try {
+      const { data, error } = await client
+        .from('pump_readings')
+        .select('*')
+        .eq('shift_id', shiftId);
+
+      if (!error && data && data.length > 0) {
+        dbResults = data;
+      }
+    } catch (err) {
+      console.warn('fetchShiftPumpReadings pump_readings error:', err);
+    }
+
+    // 2. Try 'pump_readings' with lowercase shiftid if empty
+    if (dbResults.length === 0) {
+      try {
+        const { data, error } = await client
+          .from('pump_readings')
+          .select('*')
+          .eq('shiftid', shiftId);
+
+        if (!error && data && data.length > 0) {
+          dbResults = data;
+        }
+      } catch (_) {}
+    }
+
+    // 3. Try 'meter_readings' with shift_id
+    try {
+      const { data, error } = await client
+        .from('meter_readings')
+        .select('*')
+        .eq('shift_id', shiftId);
+
+      if (!error && data && data.length > 0) {
+        if (dbResults.length === 0) {
+          dbResults = data;
+        } else {
+          // Merge meter_readings over pump_readings
+          const map = new Map(dbResults.map((r: any) => [r.pump_id || r.pumpid || r.pumpId, r]));
+          data.forEach((mr: any) => {
+            const pid = mr.pump_id || mr.pumpid || mr.pumpId;
+            if (pid) {
+              const existing = map.get(pid) || {};
+              map.set(pid, { ...existing, ...mr });
+            }
+          });
+          dbResults = Array.from(map.values());
+        }
+      }
+    } catch (_) {}
+
+    // 4. Try 'meter_readings' with shiftid if still empty
+    if (dbResults.length === 0) {
+      try {
+        const { data, error } = await client
+          .from('meter_readings')
+          .select('*')
+          .eq('shiftid', shiftId);
+
+        if (!error && data && data.length > 0) {
+          dbResults = data;
+        }
+      } catch (_) {}
+    }
+  }
+
+  // Also read from localStorage cache for instant zero-latency paint
+  const localResults: any[] = [];
+  try {
+    const prefix = `fuelflow_pump_reading_${shiftId}_`;
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(prefix)) {
+        const val = localStorage.getItem(key);
+        if (val) {
+          try {
+            localResults.push(JSON.parse(val));
+          } catch (_) {}
+        }
+      }
+    }
+  } catch (_) {}
+
+  // Merge local and db: db takes priority for meter readings, local as fallback
+  const finalMap = new Map<string, any>();
+  localResults.forEach(lr => {
+    const pid = lr.pumpId || lr.pump_id || lr.pumpid;
+    if (pid) finalMap.set(pid, lr);
+  });
+  dbResults.forEach(dr => {
+    const pid = dr.pump_id || dr.pumpid || dr.pumpId;
+    if (pid) {
+      const existing = finalMap.get(pid) || {};
+      finalMap.set(pid, { ...existing, ...dr });
+    }
+  });
+
+  return Array.from(finalMap.values());
 }
 
 

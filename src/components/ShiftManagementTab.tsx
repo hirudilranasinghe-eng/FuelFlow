@@ -29,6 +29,7 @@ import {
   isPumpReadingActiveOrAssigned,
   savePumperReconciliation,
   fetchPumperReconciliations,
+  fetchShiftPumpReadings,
   saveForecourtOilReconciliation,
   fetchForecourtOilReconciliation
 } from '../lib/supabaseClient';
@@ -767,10 +768,67 @@ export default function ShiftManagementTab({
       const ensuredReadings: PumpReading[] = sortPumpReadingsNaturally(availablePumps.map(p => {
         const isOil = p.id === 'pump-oil-bay' || p.fuelType === 'Oil & Lubricants' || p.name.toLowerCase().includes('oil') || p.name.toLowerCase().includes('dispenser');
         
+        // Check localStorage cache for saved pump reading to guarantee persistence on page refresh
+        let cachedStart: number | undefined;
+        let cachedEnd: number | undefined;
+        let cachedTesting: number | undefined;
+        let cachedIsStartSaved = false;
+        let cachedIsFinalized = false;
+        let cachedPumperId: string | null = null;
+        try {
+          const cStr = localStorage.getItem(`fuelflow_pump_reading_${activeShift.id}_${p.id}`);
+          if (cStr) {
+            const cObj = JSON.parse(cStr);
+            const rawCS = cObj.startMeter ?? cObj.start_meter ?? cObj.startmeter;
+            if (rawCS !== undefined && rawCS !== null && rawCS !== '') {
+              const pCS = parseFloat(String(rawCS));
+              if (!isNaN(pCS)) cachedStart = pCS;
+            }
+            const rawCE = cObj.endMeter ?? cObj.end_meter ?? cObj.endmeter;
+            if (rawCE !== undefined && rawCE !== null && rawCE !== '') {
+              const pCE = parseFloat(String(rawCE));
+              if (!isNaN(pCE)) cachedEnd = pCE;
+            }
+            const rawCT = cObj.testingQty ?? cObj.testing_qty ?? cObj.testingqty;
+            if (rawCT !== undefined && rawCT !== null && rawCT !== '') {
+              const pCT = parseFloat(String(rawCT));
+              if (!isNaN(pCT)) cachedTesting = pCT;
+            }
+            if (cObj.isStartSaved || (cachedStart !== undefined && cachedStart > 0)) {
+              cachedIsStartSaved = true;
+            }
+            if (cObj.isCardFinalized || cObj.status === 'Completed') {
+              cachedIsFinalized = true;
+            }
+            if (cObj.assignedPumperId) {
+              cachedPumperId = cObj.assignedPumperId;
+            }
+          }
+        } catch (_) {}
+
         if (readingMap.has(p.id)) {
           const existing = readingMap.get(p.id)!;
-          const isStartSaved = !!(existing.isStartSaved || initialLockedStarts[p.id] || (existing.isLocked && existing.startMeter !== undefined && existing.startMeter >= 0));
-          const isCardFinalized = !!(existing.isCardFinalized || (existing.assignedPumperId && initialFinalized[existing.assignedPumperId]) || (existing.isLocked && existing.status === 'Completed'));
+          const isStartSaved = !!(existing.isStartSaved || initialLockedStarts[p.id] || cachedIsStartSaved || (existing.isLocked && existing.startMeter !== undefined && existing.startMeter >= 0));
+          const isCardFinalized = !!(existing.isCardFinalized || cachedIsFinalized || (existing.assignedPumperId && initialFinalized[existing.assignedPumperId]) || (existing.isLocked && existing.status === 'Completed'));
+
+          const rawStart = existing.startMeter;
+          const parsedStart = (rawStart !== undefined && rawStart !== null && !isNaN(Number(rawStart))) ? parseFloat(String(rawStart)) : undefined;
+          const effectiveStart = (parsedStart !== undefined && !isNaN(parsedStart) && parsedStart > 0)
+            ? parsedStart
+            : ((cachedStart !== undefined && cachedStart > 0) ? cachedStart : (parsedStart ?? 0));
+
+          const rawEnd = existing.endMeter;
+          const parsedEnd = (rawEnd !== undefined && rawEnd !== null && !isNaN(Number(rawEnd))) ? parseFloat(String(rawEnd)) : undefined;
+          const effectiveEnd = (parsedEnd !== undefined && !isNaN(parsedEnd) && parsedEnd > 0)
+            ? parsedEnd
+            : ((cachedEnd !== undefined && cachedEnd > 0) ? cachedEnd : (parsedEnd ?? 0));
+
+          const rawTest = existing.testingQty;
+          const parsedTest = (rawTest !== undefined && rawTest !== null && !isNaN(Number(rawTest))) ? parseFloat(String(rawTest)) : undefined;
+          const effectiveTest = (parsedTest !== undefined && !isNaN(parsedTest) && parsedTest > 0)
+            ? parsedTest
+            : ((cachedTesting !== undefined && cachedTesting > 0) ? cachedTesting : (parsedTest ?? 0));
+
           if (isOil) {
             let chReadings = existing.chamberReadings;
             if (!chReadings || chReadings.length === 0) {
@@ -809,6 +867,9 @@ export default function ShiftManagementTab({
             const forecourtOilTotal = (chReadings || []).reduce((sum, ch) => sum + (ch.totalAmount || 0), 0);
             return {
               ...existing,
+              startMeter: effectiveStart,
+              endMeter: effectiveEnd,
+              testingQty: effectiveTest,
               isStartSaved,
               isCardFinalized,
               isLocked: isCardFinalized || !!existing.isLocked,
@@ -819,6 +880,9 @@ export default function ShiftManagementTab({
           }
           return {
             ...existing,
+            startMeter: effectiveStart,
+            endMeter: effectiveEnd,
+            testingQty: effectiveTest,
             isStartSaved,
             isCardFinalized,
             isLocked: isCardFinalized || !!existing.isLocked
@@ -828,20 +892,24 @@ export default function ShiftManagementTab({
         const carryForward = getPreviousEndMeterForPump(p.id);
         const pStartMeter = (p as Pump).startMeter;
         const initialMeter = pStartMeter !== undefined && pStartMeter > 0 ? Math.max(carryForward, pStartMeter) : carryForward;
+        const startMeterValue = (cachedStart !== undefined && cachedStart > 0) ? cachedStart : initialMeter;
+        const endMeterValue = (cachedEnd !== undefined && cachedEnd > 0) ? cachedEnd : 0;
+        const testingQtyValue = (cachedTesting !== undefined && cachedTesting > 0) ? cachedTesting : 0;
+        const isStartSaved = !!(initialLockedStarts[p.id] || cachedIsStartSaved || (cachedStart !== undefined && cachedStart > 0));
         const tank = tanks.find(t => t.id === p.tankId || t.fuelType === p.fuelType);
         return {
           pumpId: p.id,
           pumpName: isOil ? 'Forecourt Dispenser Station (4-Chamber Unit)' : p.name,
           fuelType: p.fuelType,
           tankId: p.tankId || tank?.id || '',
-          assignedPumperId: null,
-          startMeter: initialMeter,
-          endMeter: 0,
-          testingQty: 0,
-          status: 'Idle',
-          isLocked: false,
-          isStartSaved: !!initialLockedStarts[p.id],
-          isCardFinalized: false,
+          assignedPumperId: cachedPumperId || null,
+          startMeter: startMeterValue,
+          endMeter: endMeterValue,
+          testingQty: testingQtyValue,
+          status: cachedIsFinalized ? 'Completed' : (isStartSaved ? 'Active' : 'Idle'),
+          isLocked: cachedIsFinalized,
+          isStartSaved: isStartSaved,
+          isCardFinalized: cachedIsFinalized,
           unitPrice: tank ? tank.pricePerLiter : 355,
           chamberReadings: isOil ? getDefaultChambers(oilTanks) : undefined
         };
@@ -902,7 +970,7 @@ export default function ShiftManagementTab({
       setPumperCashInputs(initialCashInputs);
       setPumperNonCashInputs(initialNonCashInputs);
 
-      // Load saved Credit, Card POS, Touch Card, Voucher sales & Pumper Reconciliations from Supabase for this active shift
+      // Load saved Credit, Card POS, Touch Card, Voucher sales & Pumper Reconciliations & direct Pump Readings from Supabase for this active shift
       const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
       if (isConfigured && activeShift?.id) {
         Promise.all([
@@ -911,8 +979,9 @@ export default function ShiftManagementTab({
           fetchTouchCardSalesByShift(supabase, activeShift.id),
           fetchVoucherSalesByShift(supabase, activeShift.id),
           fetchPumperReconciliations(supabase, activeShift.id),
-          fetchForecourtOilReconciliation(supabase, activeShift.id)
-        ]).then(([cData, cardData, tcData, vData, reconciledList, forecourtOilList]) => {
+          fetchForecourtOilReconciliation(supabase, activeShift.id),
+          fetchShiftPumpReadings(supabase, activeShift.id)
+        ]).then(([cData, cardData, tcData, vData, reconciledList, forecourtOilList, remotePumpReadings]) => {
           if (reconciledList && reconciledList.length > 0) {
             const rehydratedCash: Record<string, string> = {};
             const rehydratedNonCash: Record<string, string> = {};
@@ -955,7 +1024,7 @@ export default function ShiftManagementTab({
             setSavedPumperCards(prev => ({ ...prev, ...rehydratedFinalized }));
           }
 
-          if ((cData && cData.length > 0) || (cardData && cardData.length > 0) || (tcData && tcData.length > 0) || (vData && vData.length > 0) || (reconciledList && reconciledList.length > 0) || (forecourtOilList && forecourtOilList.length > 0)) {
+          if ((cData && cData.length > 0) || (cardData && cardData.length > 0) || (tcData && tcData.length > 0) || (vData && vData.length > 0) || (reconciledList && reconciledList.length > 0) || (forecourtOilList && forecourtOilList.length > 0) || (remotePumpReadings && remotePumpReadings.length > 0)) {
             setDraftReadings(prev => {
               if (!prev || prev.length === 0) return prev;
               let hasChanges = false;
@@ -1010,6 +1079,13 @@ export default function ShiftManagementTab({
                 const vMatch = vData?.find((v: any) => (v.pump_id || v.pumpid) === r.pumpId || (r.assignedPumperId && (v.pumper_id || v.pumperid) === r.assignedPumperId));
                 const recMatch = reconciledList?.find((rec: any) => (rec.pumper_id || rec.pumperId) === r.assignedPumperId);
 
+                // Check direct remote pump_readings table match
+                const remoteReadingMatch = remotePumpReadings?.find((rp: any) => 
+                  (rp.pump_id || rp.pumpid) === r.pumpId || 
+                  (r.id && rp.id === r.id) ||
+                  (r.assignedPumperId && (rp.assigned_pumper_id || rp.assignedpumperid) === r.assignedPumperId && (rp.pump_id || rp.pumpid) === r.pumpId)
+                );
+
                 const cAmount = cMatch ? Number(cMatch.amount || cMatch.credit_amount || cMatch.total_amount) : (recMatch ? Number(recMatch.credit_sales ?? recMatch.creditsales) : r.creditSalesAmount);
                 const cardAmount = cardMatch ? Number(cardMatch.amount || cardMatch.card_amount || cardMatch.total_amount) : (recMatch ? Number(recMatch.card_sales ?? recMatch.cardsales) : r.cardSalesAmount);
                 const tcAmount = tcMatch ? Number(tcMatch.amount || tcMatch.touch_card_amount || tcMatch.total_amount) : (recMatch ? Number(recMatch.touch_card_sales ?? recMatch.touchcardsales) : r.touchCardSalesAmount);
@@ -1022,17 +1098,54 @@ export default function ShiftManagementTab({
                 const pCount = assignedPumps.length || 1;
                 const targetCash = (r.actualCash && r.actualCash > 0) ? r.actualCash : (pCount === 1 ? recCash : Math.round((recCash / pCount) * 100) / 100);
 
+                // Start Meter and End Meter rehydration from remote pump_readings & reconciliation
+                let nextStartMeter = r.startMeter;
+                let nextEndMeter = r.endMeter;
+                let nextTestingQty = r.testingQty;
+                let nextIsStartSaved = r.isStartSaved;
+
+                if (remoteReadingMatch) {
+                  const remStart = remoteReadingMatch.start_meter !== undefined ? Number(remoteReadingMatch.start_meter) : (remoteReadingMatch.startmeter !== undefined ? Number(remoteReadingMatch.startmeter) : undefined);
+                  const remEnd = remoteReadingMatch.end_meter !== undefined ? Number(remoteReadingMatch.end_meter) : (remoteReadingMatch.endmeter !== undefined ? Number(remoteReadingMatch.endmeter) : undefined);
+                  const remTest = remoteReadingMatch.testing_qty !== undefined ? Number(remoteReadingMatch.testing_qty) : (remoteReadingMatch.testingqty !== undefined ? Number(remoteReadingMatch.testingqty) : undefined);
+
+                  if (remStart !== undefined && !isNaN(remStart) && remStart > 0) {
+                    nextStartMeter = remStart;
+                    nextIsStartSaved = true;
+                  }
+                  if (remEnd !== undefined && !isNaN(remEnd) && remEnd > 0) {
+                    nextEndMeter = remEnd;
+                  }
+                  if (remTest !== undefined && !isNaN(remTest) && remTest > 0) {
+                    nextTestingQty = remTest;
+                  }
+                } else if (recMatch) {
+                  const recStart = recMatch.start_meter !== undefined ? Number(recMatch.start_meter) : (recMatch.startmeter !== undefined ? Number(recMatch.startmeter) : undefined);
+                  const recEnd = recMatch.end_meter !== undefined ? Number(recMatch.end_meter) : (recMatch.endmeter !== undefined ? Number(recMatch.endmeter) : undefined);
+                  if (recStart !== undefined && !isNaN(recStart) && recStart > 0 && (!r.startMeter || r.startMeter === 0)) {
+                    nextStartMeter = recStart;
+                    nextIsStartSaved = true;
+                  }
+                  if (recEnd !== undefined && !isNaN(recEnd) && recEnd > 0 && (!r.endMeter || r.endMeter === 0)) {
+                    nextEndMeter = recEnd;
+                  }
+                }
+
                 const nextActualCash = targetCash > 0 ? targetCash : r.actualCash;
                 const nextCredit = cAmount !== undefined && cAmount > 0 ? cAmount : r.creditSalesAmount;
                 const nextCard = cardAmount !== undefined && cardAmount > 0 ? cardAmount : r.cardSalesAmount;
                 const nextTc = tcAmount !== undefined && tcAmount > 0 ? tcAmount : r.touchCardSalesAmount;
                 const nextVoucher = vAmount !== undefined && vAmount > 0 ? vAmount : r.voucherSalesAmount;
-                const nextIsFinalized = recCompleted ? true : r.isCardFinalized;
-                const nextIsLocked = recCompleted ? true : r.isLocked;
-                const nextStatus = recCompleted ? 'Completed' as const : r.status;
+                const nextIsFinalized = recCompleted ? true : (remoteReadingMatch?.status === 'Completed' ? true : r.isCardFinalized);
+                const nextIsLocked = recCompleted ? true : (remoteReadingMatch?.is_locked !== undefined ? remoteReadingMatch.is_locked : (remoteReadingMatch?.islocked !== undefined ? remoteReadingMatch.islocked : r.isLocked));
+                const nextStatus = recCompleted ? 'Completed' as const : (remoteReadingMatch?.status ? (remoteReadingMatch.status as any) : r.status);
                 const nextOilSales = updatedChambers ? updatedChambers.reduce((sum, ch) => sum + (ch.totalAmount || 0), 0) : (r.oilSalesAmount || 0);
 
                 if (
+                  nextStartMeter !== r.startMeter ||
+                  nextEndMeter !== r.endMeter ||
+                  nextTestingQty !== r.testingQty ||
+                  nextIsStartSaved !== r.isStartSaved ||
                   nextActualCash !== r.actualCash ||
                   nextCredit !== r.creditSalesAmount ||
                   nextCard !== r.cardSalesAmount ||
@@ -1047,6 +1160,10 @@ export default function ShiftManagementTab({
                   hasChanges = true;
                   return {
                     ...r,
+                    startMeter: nextStartMeter,
+                    endMeter: nextEndMeter,
+                    testingQty: nextTestingQty,
+                    isStartSaved: nextIsStartSaved,
                     actualCash: nextActualCash,
                     creditSalesAmount: nextCredit,
                     cardSalesAmount: nextCard,
@@ -2034,7 +2151,10 @@ export default function ShiftManagementTab({
 
         const updated = {
           ...r,
-          [field]: value,
+          [field]: (field === 'startMeter' ? startM : (field === 'endMeter' ? endM : (field === 'testingQty' ? testQ : value))),
+          startMeter: startM,
+          endMeter: endM,
+          testingQty: testQ,
           creditSalesAmount: creditVal,
           cardSalesAmount: cardVal,
           touchCardSalesAmount: touchCardVal,
@@ -2434,7 +2554,60 @@ export default function ShiftManagementTab({
       return;
     }
 
-    // Lock ONLY Start Meters
+    // Build updated draft readings with confirmed parsed start meters
+    const updatedDraftReadings = draftReadings.map(dr => {
+      if (dr.assignedPumperId === pumperId) {
+        const rawStart = dr.startMeter;
+        const parsedStart = (rawStart !== undefined && rawStart !== null && rawStart !== '') ? parseFloat(String(rawStart)) : 0;
+        return {
+          ...dr,
+          startMeter: !isNaN(parsedStart) ? parsedStart : 0,
+          isStartSaved: true,
+          status: dr.status === 'Completed' ? ('Completed' as const) : ('Active' as const)
+        };
+      }
+      return dr;
+    });
+
+    const targetReadings = updatedDraftReadings.filter(r => r.assignedPumperId === pumperId);
+
+    // 1. Strictly UPSERT exact values to meter_readings and pump_readings table in Supabase
+    // Wait for write confirmation before updating UI state or reloading data
+    try {
+      const { error: upsertErr } = await upsertPumpReadings(supabase, targetReadings, activeShift.id);
+      if (upsertErr) {
+        console.warn('Start meter Supabase upsert notice:', upsertErr);
+      }
+    } catch (err) {
+      console.warn('Start meter sync note:', err);
+    }
+
+    // Also strictly persist start_meter into pumper_assignments / shift_pumper_assignments
+    try {
+      const avgStartMeter = targetReadings.reduce((sum, r) => sum + (parseFloat(String(r.startMeter)) || 0), 0) / (targetReadings.length || 1);
+      await savePumperReconciliation(supabase, {
+        id: `${activeShift.id}_${pumperId}`,
+        shift_id: activeShift.id,
+        pumper_id: pumperId,
+        pumper_name: pumperName,
+        handed_over_cash: 0,
+        actual_cash: 0,
+        expected_cash: 0,
+        cash_variance: 0,
+        credit_sales: 0,
+        card_sales: 0,
+        touch_card_sales: 0,
+        voucher_sales: 0,
+        assigned_pumps_count: targetReadings.length,
+        start_meter: Math.round(avgStartMeter * 100) / 100,
+        end_meter: 0,
+        status: 'Active'
+      });
+    } catch (err) {
+      console.warn('Save pumper assignment start meter note:', err);
+    }
+
+    // 2. Lock ONLY Start Meters and persist locally
     const newLockedStarts = { ...lockedStartMeters };
     pumperReadings.forEach(r => {
       newLockedStarts[r.pumpId] = true;
@@ -2442,25 +2615,8 @@ export default function ShiftManagementTab({
     setLockedStartMeters(newLockedStarts);
     saveLocksToStorage(activeShift.id, newLockedStarts, lockedEndMeters, finalizedPumperCards);
 
-    // Update draftReadings with isStartSaved: true & status: Active
-    const updatedDraftReadings = draftReadings.map(dr => {
-      if (dr.assignedPumperId === pumperId) {
-        return {
-          ...dr,
-          isStartSaved: true,
-          status: dr.status === 'Completed' ? ('Completed' as const) : ('Active' as const)
-        };
-      }
-      return dr;
-    });
+    // 3. Update UI states with confirmed values
     setDraftReadings(updatedDraftReadings);
-
-    // Save pump readings to Supabase
-    try {
-      await upsertPumpReadings(supabase, updatedDraftReadings.filter(r => r.assignedPumperId === pumperId), activeShift.id);
-    } catch (err) {
-      console.warn('Start meter sync note:', err);
-    }
 
     // Update React activeShift state
     let totalFuel = 0;
@@ -2521,27 +2677,20 @@ export default function ShiftManagementTab({
       }
     }
 
-    // Lock Start Meters, End Meters, and the whole Pumper Card
-    const newLockedStarts = { ...lockedStartMeters };
-    const newLockedEnds = { ...lockedEndMeters };
-    const newFinalized = { ...finalizedPumperCards, [pumperId]: true };
-    pumperReadings.forEach(r => {
-      newLockedStarts[r.pumpId] = true;
-      newLockedEnds[r.pumpId] = true;
-    });
-
-    setLockedStartMeters(newLockedStarts);
-    setLockedEndMeters(newLockedEnds);
-    setFinalizedPumperCards(newFinalized);
-    setSavedPumperCards(prev => ({ ...prev, [pumperId]: true }));
-    setSavedPumperIds(prev => ({ ...prev, [pumperId]: true }));
-    saveLocksToStorage(activeShift.id, newLockedStarts, newLockedEnds, newFinalized);
-
-    // Update draftReadings with isStartSaved: true, isCardFinalized: true, isLocked: true and status: Completed
+    // Build updated draft readings with confirmed values
     const updatedDraftReadings = draftReadings.map(dr => {
       if (dr.assignedPumperId === pumperId) {
+        const rawStart = dr.startMeter;
+        const parsedStart = (rawStart !== undefined && rawStart !== null && rawStart !== '') ? parseFloat(String(rawStart)) : 0;
+        const rawEnd = dr.endMeter;
+        const parsedEnd = (rawEnd !== undefined && rawEnd !== null && rawEnd !== '') ? parseFloat(String(rawEnd)) : 0;
+        const rawTest = dr.testingQty;
+        const parsedTest = (rawTest !== undefined && rawTest !== null && rawTest !== '') ? parseFloat(String(rawTest)) : 0;
         return {
           ...dr,
+          startMeter: !isNaN(parsedStart) ? parsedStart : 0,
+          endMeter: !isNaN(parsedEnd) ? parsedEnd : 0,
+          testingQty: !isNaN(parsedTest) ? parsedTest : 0,
           isStartSaved: true,
           isCardFinalized: true,
           isLocked: true,
@@ -2550,17 +2699,22 @@ export default function ShiftManagementTab({
       }
       return dr;
     });
-    setDraftReadings(updatedDraftReadings);
 
-    // Save pump readings and all non-cash sales (credit, card, touch card, voucher) to Supabase
+    const targetReadings = updatedDraftReadings.filter(r => r.assignedPumperId === pumperId);
+
+    // 1. Strictly UPSERT exact values to meter_readings and pump_readings table in Supabase
+    // Wait for Supabase write confirmation before updating UI state or reloading data
     try {
-      await upsertPumpReadings(supabase, updatedDraftReadings.filter(r => r.assignedPumperId === pumperId), activeShift.id);
-      await syncAllNonCashSales(supabase, updatedDraftReadings.filter(r => r.assignedPumperId === pumperId), activeShift.id);
+      const { error: upsertErr } = await upsertPumpReadings(supabase, targetReadings, activeShift.id);
+      if (upsertErr) {
+        console.warn('Finalize pump readings Supabase upsert notice:', upsertErr);
+      }
+      await syncAllNonCashSales(supabase, targetReadings, activeShift.id);
     } catch (err) {
       console.warn('Pump readings & non-cash sync note:', err);
     }
 
-    // Save pumper assignment & handed over cash summary to Supabase shift_pumper_assignments / shift_pumper_reconciliations
+    // Save pumper assignment & handed over cash summary to Supabase shift_pumper_assignments / pumper_assignments
     const pumperCard = pumperCardsData.find(p => p.pumperId === pumperId);
     const handedOverCash = pumperCashInputs[pumperId] !== undefined && pumperCashInputs[pumperId] !== ''
       ? Math.round(Number(pumperCashInputs[pumperId]) * 100) / 100
@@ -2584,6 +2738,9 @@ export default function ShiftManagementTab({
 
     const expCash = pumperCard ? (pumperCard.totalExpectedCash || 0) : 0;
     const variance = Math.round((handedOverCash - expCash) * 100) / 100;
+
+    const avgStartMeter = targetReadings.reduce((sum, r) => sum + (parseFloat(String(r.startMeter)) || 0), 0) / (targetReadings.length || 1);
+    const avgEndMeter = targetReadings.reduce((sum, r) => sum + (parseFloat(String(r.endMeter)) || 0), 0) / (targetReadings.length || 1);
 
     // Cache clean formatted values in local input states
     setPumperCashInputs(prev => ({
@@ -2612,6 +2769,8 @@ export default function ShiftManagementTab({
       touch_card_sales: touchCardSales,
       voucher_sales: voucherSales,
       assigned_pumps_count: pumperReadings.length,
+      start_meter: Math.round(avgStartMeter * 100) / 100,
+      end_meter: Math.round(avgEndMeter * 100) / 100,
       status: 'Completed',
       updated_at: new Date().toISOString()
     };
@@ -2621,6 +2780,25 @@ export default function ShiftManagementTab({
     } catch (err) {
       console.warn('savePumperReconciliation error:', err);
     }
+
+    // 2. Lock Start Meters, End Meters, and the whole Pumper Card locally
+    const newLockedStarts = { ...lockedStartMeters };
+    const newLockedEnds = { ...lockedEndMeters };
+    const newFinalized = { ...finalizedPumperCards, [pumperId]: true };
+    pumperReadings.forEach(r => {
+      newLockedStarts[r.pumpId] = true;
+      newLockedEnds[r.pumpId] = true;
+    });
+
+    setLockedStartMeters(newLockedStarts);
+    setLockedEndMeters(newLockedEnds);
+    setFinalizedPumperCards(newFinalized);
+    setSavedPumperCards(prev => ({ ...prev, [pumperId]: true }));
+    setSavedPumperIds(prev => ({ ...prev, [pumperId]: true }));
+    saveLocksToStorage(activeShift.id, newLockedStarts, newLockedEnds, newFinalized);
+
+    // 3. Update React activeShift state
+    setDraftReadings(updatedDraftReadings);
 
     // Update activeShift state in React
     let totalFuel = 0;
@@ -2733,7 +2911,7 @@ export default function ShiftManagementTab({
   };
 
   // Save and lock a single pump's starting readings (Assigned Pumper & Start Meter), marking it Active
-  const handleSavePumpData = (pumpId: string) => {
+  const handleSavePumpData = async (pumpId: string) => {
     if (!activeShift) return;
     const r = draftReadings.find(dr => dr.pumpId === pumpId);
     if (!r) return;
@@ -2742,7 +2920,9 @@ export default function ShiftManagementTab({
     if (!r.assignedPumperId) {
       errors.push("Please assign a Pumper to this pump before saving.");
     }
-    if (r.startMeter === undefined || r.startMeter === null || r.startMeter < 0 || isNaN(r.startMeter)) {
+    const rawStart = r.startMeter;
+    const parsedStart = (rawStart !== undefined && rawStart !== null && rawStart !== '') ? parseFloat(String(rawStart)) : undefined;
+    if (parsedStart === undefined || isNaN(parsedStart) || parsedStart < 0) {
       errors.push("Start Meter reading must be a non-negative number.");
     }
 
@@ -2752,10 +2932,12 @@ export default function ShiftManagementTab({
       return;
     }
 
+    const validStart = parsedStart ?? 0;
     const updatedReadings = draftReadings.map(dr => {
       if (dr.pumpId === pumpId) {
         return { 
           ...dr, 
+          startMeter: validStart,
           endMeter: dr.endMeter || 0,
           isStartSaved: true,
           status: 'Active' as const 
@@ -2763,6 +2945,40 @@ export default function ShiftManagementTab({
       }
       return dr;
     });
+
+    const targetReading = updatedReadings.find(dr => dr.pumpId === pumpId);
+
+    // Strictly persist to Supabase pump_readings and meter_readings and wait for write confirmation
+    if (targetReading) {
+      try {
+        await upsertPumpReadings(supabase, [targetReading], activeShift.id);
+      } catch (err) {
+        console.warn('handleSavePumpData sync note:', err);
+      }
+      if (targetReading.assignedPumperId) {
+        try {
+          const pObj = employees.find(e => e.id === targetReading.assignedPumperId);
+          await savePumperReconciliation(supabase, {
+            id: `${activeShift.id}_${targetReading.assignedPumperId}`,
+            shift_id: activeShift.id,
+            pumper_id: targetReading.assignedPumperId,
+            pumper_name: pObj?.name || 'Pumper',
+            handed_over_cash: 0,
+            actual_cash: 0,
+            expected_cash: 0,
+            cash_variance: 0,
+            credit_sales: 0,
+            card_sales: 0,
+            touch_card_sales: 0,
+            voucher_sales: 0,
+            assigned_pumps_count: 1,
+            start_meter: validStart,
+            end_meter: targetReading.endMeter || 0,
+            status: 'Active'
+          });
+        } catch (_) {}
+      }
+    }
 
     setDraftReadings(updatedReadings);
 
