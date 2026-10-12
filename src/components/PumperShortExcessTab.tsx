@@ -120,23 +120,36 @@ export default function PumperShortExcessTab({
       }
 
       if (data && Array.isArray(data)) {
-        const mapped: PumperShortageExcessRecord[] = data.map((d: any) => ({
-          id: d.id,
-          shift_id: d.shift_id || d.shiftId || '',
-          shift_name: d.shift_name || d.shiftName || (d.shift_id ? `Shift ${d.shift_id}` : ''),
-          pumper_id: d.pumper_id || d.pumperId || '',
-          pumper_name: d.pumper_name || d.pumperName || 'Pumper',
-          date: d.date || (d.created_at ? d.created_at.slice(0, 10) : new Date().toISOString().slice(0, 10)),
-          expected_amount: Number(d.expected_amount ?? d.expectedAmount ?? 0),
-          collected_amount: Number(d.collected_amount ?? d.collectedAmount ?? 0),
-          variance_amount: Number(d.variance_amount ?? d.varianceAmount ?? (Number(d.collected_amount ?? 0) - Number(d.expected_amount ?? 0))),
-          type: (d.type || (Number(d.variance_amount ?? 0) < -0.5 ? 'SHORTAGE' : Number(d.variance_amount ?? 0) > 0.5 ? 'EXCESS' : 'BALANCED')) as any,
-          status: (d.status || 'PENDING') as any,
-          settled_at: d.settled_at || d.settledAt || undefined,
-          settled_by: d.settled_by || d.settledBy || undefined,
-          notes: d.notes || '',
-          created_at: d.created_at || d.createdAt || undefined
-        }));
+        const mapped: PumperShortageExcessRecord[] = data.map((d: any) => {
+          const recDate = d.record_date || d.date || (d.created_at ? d.created_at.slice(0, 10) : new Date().toISOString().slice(0, 10));
+          const exp = Number(d.expected_sales ?? d.expected_amount ?? d.expectedAmount ?? 0);
+          const act = Number(d.actual_handed_over_cash ?? d.collected_amount ?? d.collectedAmount ?? 0);
+          const diff = Number(d.difference ?? d.variance ?? d.variance_amount ?? d.varianceAmount ?? (act - exp));
+          const rType = d.type || (diff < -0.5 ? 'SHORTAGE' : diff > 0.5 ? 'EXCESS' : 'BALANCED');
+
+          return {
+            id: d.id,
+            shift_id: d.shift_id || d.shiftId || '',
+            shift_name: d.shift_name || d.shiftName || (d.shift_id ? `Shift ${d.shift_id}` : ''),
+            pumper_id: d.pumper_id || d.pumperId || '',
+            pumper_name: d.pumper_name || d.pumperName || 'Pumper',
+            date: recDate,
+            record_date: recDate,
+            expected_amount: exp,
+            expected_sales: exp,
+            collected_amount: act,
+            actual_handed_over_cash: act,
+            variance_amount: diff,
+            difference: diff,
+            variance: diff,
+            type: rType as any,
+            status: (d.status || (Math.abs(diff) <= 0.5 ? 'SETTLED' : 'PENDING')) as any,
+            settled_at: d.settled_at || d.settledAt || undefined,
+            settled_by: d.settled_by || d.settledBy || undefined,
+            notes: d.notes || '',
+            created_at: d.created_at || d.createdAt || undefined
+          };
+        });
 
         setRecords(mapped);
       } else {

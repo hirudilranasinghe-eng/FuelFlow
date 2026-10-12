@@ -1421,7 +1421,7 @@ export default function App() {
   }, [tanks, priceSchedules]);
 
   // Action: Close operational shift and update stock levels automatically
-  const handleCloseShift = (closedShift: Shift) => {
+  const handleCloseShift = async (closedShift: Shift) => {
     // 1. Deduct Net Sold volume from fuel tanks (testing quantity is returned to underground tanks so 0 deduction for test fuel)
     const netSoldByTank: Record<string, number> = {};
     const netSoldByFuelType: Record<string, number> = {};
@@ -1625,7 +1625,7 @@ export default function App() {
         const shiftDate = closedShift.startTime ? closedShift.startTime.slice(0, 10) : new Date().toISOString().slice(0, 10);
         const pumperMap = new Map<string, {
           pumperName: string;
-          expectedAmount: number;
+          grossSales: number;
           actualCash: number;
           nonCashSales: number;
         }>();
@@ -1642,10 +1642,10 @@ export default function App() {
           const nonCash = (r.creditSalesAmount || 0) + (r.cardSalesAmount || 0) + (r.touchCardSalesAmount || 0) + (r.voucherSalesAmount || 0);
           const cash = r.actualCash || 0;
 
-          const cur = pumperMap.get(pId) || { pumperName: pName, expectedAmount: 0, actualCash: 0, nonCashSales: 0 };
+          const cur = pumperMap.get(pId) || { pumperName: pName, grossSales: 0, actualCash: 0, nonCashSales: 0 };
           pumperMap.set(pId, {
             pumperName: pName,
-            expectedAmount: cur.expectedAmount + grossRev,
+            grossSales: cur.grossSales + grossRev,
             actualCash: cur.actualCash + cash,
             nonCashSales: cur.nonCashSales + nonCash
           });
@@ -1653,21 +1653,27 @@ export default function App() {
 
         const pumperRecords: PumperShortageExcessRecord[] = [];
         pumperMap.forEach((val, pId) => {
-          const totalCollected = val.actualCash + val.nonCashSales;
-          const variance = totalCollected - val.expectedAmount;
+          const expectedCash = Math.round(Math.max(0, val.grossSales - val.nonCashSales) * 100) / 100;
+          const actualCash = Math.round(val.actualCash * 100) / 100;
+          const variance = Math.round((actualCash - expectedCash) * 100) / 100;
           const rType: 'SHORTAGE' | 'EXCESS' | 'BALANCED' = 
             variance < -0.5 ? 'SHORTAGE' : variance > 0.5 ? 'EXCESS' : 'BALANCED';
 
           pumperRecords.push({
             id: `p_var_${closedShift.id}_${pId}`,
             shift_id: closedShift.id,
-            shift_name: closedShift.name,
+            shift_name: closedShift.name || `Shift ${closedShift.id}`,
             pumper_id: pId,
             pumper_name: val.pumperName,
             date: shiftDate,
-            expected_amount: val.expectedAmount,
-            collected_amount: totalCollected,
+            record_date: shiftDate,
+            expected_amount: expectedCash,
+            expected_sales: expectedCash,
+            collected_amount: actualCash,
+            actual_handed_over_cash: actualCash,
             variance_amount: variance,
+            difference: variance,
+            variance: variance,
             type: rType,
             status: rType === 'BALANCED' ? 'SETTLED' : 'PENDING',
             notes: `Shift Closing auto-reconciliation (${closedShift.name || closedShift.id})`,
@@ -1676,7 +1682,7 @@ export default function App() {
         });
 
         if (pumperRecords.length > 0) {
-          savePumperShortageExcessRecords(supabase, pumperRecords);
+          await savePumperShortageExcessRecords(supabase, pumperRecords);
         }
       }
     }

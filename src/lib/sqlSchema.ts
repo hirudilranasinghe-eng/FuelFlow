@@ -271,6 +271,67 @@ CREATE TABLE IF NOT EXISTS meter_readings (
 );
 ALTER TABLE meter_readings DISABLE ROW LEVEL SECURITY;
 
+-- Pumper Shortage & Excess Ledger Table
+CREATE TABLE IF NOT EXISTS pumper_shortage_excess (
+    id TEXT PRIMARY KEY,
+    shift_id TEXT REFERENCES shifts(id) ON DELETE CASCADE,
+    shift_name TEXT,
+    pumper_id TEXT REFERENCES employees(id),
+    pumper_name TEXT NOT NULL,
+    date TEXT NOT NULL DEFAULT '',
+    record_date TEXT DEFAULT '',
+    expected_amount NUMERIC DEFAULT 0,
+    expected_sales NUMERIC DEFAULT 0,
+    collected_amount NUMERIC DEFAULT 0,
+    actual_handed_over_cash NUMERIC DEFAULT 0,
+    variance_amount NUMERIC DEFAULT 0,
+    difference NUMERIC DEFAULT 0,
+    variance NUMERIC DEFAULT 0,
+    type TEXT,
+    status TEXT DEFAULT 'PENDING',
+    settled_at TIMESTAMPTZ,
+    settled_by TEXT,
+    notes TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS record_date TEXT DEFAULT '';
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS expected_sales NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS actual_handed_over_cash NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS difference NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS variance NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS expected_amount NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS collected_amount NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS variance_amount NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS date TEXT DEFAULT '';
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS shift_name TEXT;
+ALTER TABLE pumper_shortage_excess DISABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS pumper_shortages_excess (
+    id TEXT PRIMARY KEY,
+    shift_id TEXT REFERENCES shifts(id) ON DELETE CASCADE,
+    shift_name TEXT,
+    pumper_id TEXT REFERENCES employees(id),
+    pumper_name TEXT NOT NULL,
+    date TEXT NOT NULL DEFAULT '',
+    record_date TEXT DEFAULT '',
+    expected_amount NUMERIC DEFAULT 0,
+    expected_sales NUMERIC DEFAULT 0,
+    collected_amount NUMERIC DEFAULT 0,
+    actual_handed_over_cash NUMERIC DEFAULT 0,
+    variance_amount NUMERIC DEFAULT 0,
+    difference NUMERIC DEFAULT 0,
+    variance NUMERIC DEFAULT 0,
+    type TEXT,
+    status TEXT DEFAULT 'PENDING',
+    settled_at TIMESTAMPTZ,
+    settled_by TEXT,
+    notes TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE pumper_shortages_excess DISABLE ROW LEVEL SECURITY;
+
 -- Role Access & Permissions (RBAC) Table
 CREATE TABLE IF NOT EXISTS role_permissions (
     id TEXT PRIMARY KEY,

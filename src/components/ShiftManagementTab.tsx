@@ -31,9 +31,10 @@ import {
   fetchPumperReconciliations,
   fetchShiftPumpReadings,
   saveForecourtOilReconciliation,
-  fetchForecourtOilReconciliation
+  fetchForecourtOilReconciliation,
+  savePumperShortageExcessRecords
 } from '../lib/supabaseClient';
-import { Employee, FuelTank, OilTank, Pump, PumpMachine, PumpReading, Shift, FuelType, ChamberReading, ShiftCounterSales, ShiftGasSale, ShiftLubeSale, PackagedOilItem, ShiftBankDeposit } from '../types';
+import { Employee, FuelTank, OilTank, Pump, PumpMachine, PumpReading, Shift, FuelType, ChamberReading, ShiftCounterSales, ShiftGasSale, ShiftLubeSale, PackagedOilItem, ShiftBankDeposit, PumperShortageExcessRecord } from '../types';
 import { deductPackagedStock, fetchPackagedLubricants } from '../lib/lubricantsClient';
 
 interface ShiftManagementTabProps {
@@ -2960,6 +2961,36 @@ export default function ShiftManagementTab({
       console.warn('savePumperReconciliation error:', err);
     }
 
+    // Persist pumper shortage/excess record into pumper_shortage_excess table upon reconciliation finalization
+    try {
+      const shiftDate = getLocalDateString(activeShift.startTime) || new Date().toISOString().slice(0, 10);
+      const rType: 'SHORTAGE' | 'EXCESS' | 'BALANCED' = variance < -0.5 ? 'SHORTAGE' : variance > 0.5 ? 'EXCESS' : 'BALANCED';
+      const shortageExcessRecord: PumperShortageExcessRecord = {
+        id: `p_var_${activeShift.id}_${pumperId}`,
+        shift_id: activeShift.id,
+        shift_name: activeShift.name || `Shift ${activeShift.id}`,
+        pumper_id: pumperId,
+        pumper_name: pumperName,
+        date: shiftDate,
+        record_date: shiftDate,
+        expected_amount: expCash,
+        expected_sales: expCash,
+        collected_amount: handedOverCash,
+        actual_handed_over_cash: handedOverCash,
+        variance_amount: variance,
+        difference: variance,
+        variance: variance,
+        type: rType,
+        status: rType === 'BALANCED' ? 'SETTLED' : 'PENDING',
+        notes: `Pumper record finalized (${activeShift.name || activeShift.id})`,
+        created_at: new Date().toISOString()
+      };
+
+      await savePumperShortageExcessRecords(supabase, [shortageExcessRecord]);
+    } catch (err) {
+      console.warn('savePumperShortageExcessRecords note on finalize:', err);
+    }
+
     // 2. Lock Start Meters, End Meters, and the whole Pumper Card locally
     const newLockedStarts = { ...lockedStartMeters };
     const newLockedEnds = { ...lockedEndMeters };
@@ -3943,6 +3974,51 @@ export default function ShiftManagementTab({
             } catch (_) {}
           }
         });
+      }
+
+      // Persist pumper shortage and excess records into pumper_shortage_excess table on shift close
+      const shiftDate = getLocalDateString(closedShift.startTime) || new Date().toISOString().slice(0, 10);
+      const pumperShortageRecords: PumperShortageExcessRecord[] = [];
+
+      pumperCardsData.forEach(card => {
+        if (!card.pumperId) return;
+        const pId = card.pumperId;
+        const pName = card.pumperName || 'Pumper';
+        const handedOver = pumperCashInputs[pId] !== undefined && pumperCashInputs[pId] !== ''
+          ? Math.round(Number(pumperCashInputs[pId]) * 100) / 100
+          : (card.totalActualCash || 0);
+        const expAmount = Math.round((card.totalExpectedCash || 0) * 100) / 100;
+        const diff = Math.round((handedOver - expAmount) * 100) / 100;
+        const recordType: 'SHORTAGE' | 'EXCESS' | 'BALANCED' = diff < -0.5 ? 'SHORTAGE' : diff > 0.5 ? 'EXCESS' : 'BALANCED';
+
+        pumperShortageRecords.push({
+          id: `p_var_${closedShift.id}_${pId}`,
+          shift_id: closedShift.id,
+          shift_name: closedShift.name || `Shift ${closedShift.id}`,
+          pumper_id: pId,
+          pumper_name: pName,
+          date: shiftDate,
+          record_date: shiftDate,
+          expected_amount: expAmount,
+          expected_sales: expAmount,
+          collected_amount: handedOver,
+          actual_handed_over_cash: handedOver,
+          variance_amount: diff,
+          difference: diff,
+          variance: diff,
+          type: recordType,
+          status: recordType === 'BALANCED' ? 'SETTLED' : 'PENDING',
+          notes: `Shift Closing reconciliation (${closedShift.name || closedShift.id})`,
+          created_at: new Date().toISOString()
+        });
+      });
+
+      if (pumperShortageRecords.length > 0) {
+        try {
+          await savePumperShortageExcessRecords(supabase, pumperShortageRecords);
+        } catch (shortErr) {
+          console.warn('savePumperShortageExcessRecords note on shift close:', shortErr);
+        }
       }
 
       // Delegate authoritative shift closure, database update, and single deposit record insertion to parent handler

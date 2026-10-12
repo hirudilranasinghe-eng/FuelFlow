@@ -1600,56 +1600,81 @@ export async function savePumperShortageExcessRecords(
   if (!isConfigured) return { success: true };
 
   try {
-    const payloads = records.map(r => ({
-      id: r.id,
-      shift_id: r.shift_id,
-      shift_name: r.shift_name || '',
-      pumper_id: r.pumper_id,
-      pumper_name: r.pumper_name,
-      date: r.date,
-      expected_amount: r.expected_amount,
-      collected_amount: r.collected_amount,
-      variance_amount: r.variance_amount,
-      type: r.type,
-      status: r.status,
-      settled_at: r.settled_at || null,
-      settled_by: r.settled_by || null,
-      notes: r.notes || '',
-      created_at: r.created_at || new Date().toISOString()
-    }));
+    const validRecords = records.filter(r => {
+      const hasId = !!r.id;
+      const hasShiftId = !!r.shift_id;
+      const hasPumperId = !!r.pumper_id;
+      const hasPumperName = !!r.pumper_name;
+      if (!hasId || !hasShiftId || !hasPumperId || !hasPumperName) {
+        console.warn('Skipping invalid pumper shortage/excess record missing mandatory fields:', r);
+        return false;
+      }
+      return true;
+    });
 
-    let { data, error } = await client
-      .from('pumper_shortage_excess')
-      .upsert(payloads, { onConflict: 'id' });
+    if (validRecords.length === 0) {
+      return { success: true };
+    }
 
-    if (error && (error.code === '42P01' || error.message?.includes('does not exist') || error.message?.includes('pumper_shortage_excess'))) {
-      const fb = await client
-        .from('pumper_shortages_excess')
+    const payloads = validRecords.map(r => {
+      const exp = Number(r.expected_amount ?? r.expected_sales) || 0;
+      const act = Number(r.collected_amount ?? r.actual_handed_over_cash) || 0;
+      const diff = Number(r.variance_amount ?? r.difference ?? (act - exp)) || 0;
+      const recDate = r.date || r.record_date || new Date().toISOString().slice(0, 10);
+      const pumperIdStr = r.pumper_id !== undefined && r.pumper_id !== null ? String(r.pumper_id).trim() : 'unknown_pumper';
+      const shiftIdStr = r.shift_id !== undefined && r.shift_id !== null ? String(r.shift_id).trim() : 'unknown_shift';
+      const rType = r.type || (diff < -0.5 ? 'SHORTAGE' : diff > 0.5 ? 'EXCESS' : 'BALANCED');
+      const rStatus = r.status || (Math.abs(diff) <= 0.5 ? 'SETTLED' : 'PENDING');
+
+      const existingId = r.id ? String(r.id) : '';
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(existingId);
+      const recordId = isUuid ? existingId : (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : getDeterministicUUID('shortage', shiftIdStr, pumperIdStr, existingId));
+
+      return {
+        id: recordId,
+        shift_id: shiftIdStr,
+        shift_name: String(r.shift_name || ''),
+        pumper_id: pumperIdStr,
+        pumper_name: String(r.pumper_name || pumperIdStr),
+        record_date: String(recDate),
+        expected_amount: exp,
+        collected_amount: act,
+        variance_amount: diff,
+        type: String(rType),
+        status: String(rStatus)
+      };
+    });
+
+    let data: any = null;
+    let error: any = null;
+
+    try {
+      const res = await client
+        .from('pumper_shortage_excess')
         .upsert(payloads, { onConflict: 'id' });
-      data = fb.data;
-      error = fb.error;
+      data = res.data;
+      error = res.error;
+    } catch (upsertEx: any) {
+      error = upsertEx;
     }
 
     if (error) {
-      console.warn('pumper_shortage_excess upsert warning (falling back if needed):', error.message || error);
-      const fallbackPayloads = records.map(r => ({
-        id: r.id,
-        shift_id: r.shift_id,
-        pumper_id: r.pumper_id,
-        pumper_name: r.pumper_name,
-        date: r.date,
-        expected_amount: r.expected_amount,
-        collected_amount: r.collected_amount,
-        variance_amount: r.variance_amount,
-        status: r.status
-      }));
-      await client.from('pumper_shortage_excess').upsert(fallbackPayloads, { onConflict: 'id' }).catch(() => {});
-      await client.from('pumper_shortages_excess').upsert(fallbackPayloads, { onConflict: 'id' }).catch(() => {});
+      console.error('Pumper shortage save error:', {
+        message: error?.message,
+        details: error?.details,
+        hint: error?.hint,
+        code: error?.code
+      });
+      return { success: false, data: null, error };
+    } else {
+      console.log('Pumper shortage records saved successfully to Supabase:', data || payloads);
+      return { success: true, data, error: null };
     }
-
-    return { success: !error, data, error };
-  } catch (err) {
-    console.warn('savePumperShortageExcessRecords exception:', err);
+  } catch (err: any) {
+    console.error('savePumperShortageExcessRecords exception:', {
+      message: err?.message,
+      details: err?.details
+    });
     return { success: false, error: err };
   }
 }
@@ -1699,11 +1724,16 @@ export async function fetchPumperShortagesExcess(
         shift_name: d.shift_name || d.shiftName || (d.shift_id ? `Shift ${d.shift_id}` : ''),
         pumper_id: d.pumper_id || d.pumperId || '',
         pumper_name: d.pumper_name || d.pumperName || 'Pumper',
-        date: d.date || (d.created_at ? d.created_at.slice(0, 10) : new Date().toISOString().slice(0, 10)),
-        expected_amount: Number(d.expected_amount ?? d.expectedAmount ?? 0),
-        collected_amount: Number(d.collected_amount ?? d.collectedAmount ?? 0),
-        variance_amount: Number(d.variance_amount ?? d.varianceAmount ?? (Number(d.collected_amount ?? 0) - Number(d.expected_amount ?? 0))),
-        type: (d.type || (Number(d.variance_amount ?? 0) < -0.5 ? 'SHORTAGE' : Number(d.variance_amount ?? 0) > 0.5 ? 'EXCESS' : 'BALANCED')) as any,
+        date: d.record_date || d.date || (d.created_at ? d.created_at.slice(0, 10) : new Date().toISOString().slice(0, 10)),
+        record_date: d.record_date || d.date || (d.created_at ? d.created_at.slice(0, 10) : new Date().toISOString().slice(0, 10)),
+        expected_amount: Number(d.expected_sales ?? d.expected_amount ?? d.expectedAmount ?? 0),
+        expected_sales: Number(d.expected_sales ?? d.expected_amount ?? d.expectedAmount ?? 0),
+        collected_amount: Number(d.actual_handed_over_cash ?? d.collected_amount ?? d.collectedAmount ?? 0),
+        actual_handed_over_cash: Number(d.actual_handed_over_cash ?? d.collected_amount ?? d.collectedAmount ?? 0),
+        variance_amount: Number(d.difference ?? d.variance ?? d.variance_amount ?? d.varianceAmount ?? (Number(d.actual_handed_over_cash ?? d.collected_amount ?? 0) - Number(d.expected_sales ?? d.expected_amount ?? 0))),
+        difference: Number(d.difference ?? d.variance ?? d.variance_amount ?? d.varianceAmount ?? (Number(d.actual_handed_over_cash ?? d.collected_amount ?? 0) - Number(d.expected_sales ?? d.expected_amount ?? 0))),
+        variance: Number(d.difference ?? d.variance ?? d.variance_amount ?? d.varianceAmount ?? (Number(d.actual_handed_over_cash ?? d.collected_amount ?? 0) - Number(d.expected_sales ?? d.expected_amount ?? 0))),
+        type: (d.type || (Number(d.difference ?? d.variance_amount ?? 0) < -0.5 ? 'SHORTAGE' : Number(d.difference ?? d.variance_amount ?? 0) > 0.5 ? 'EXCESS' : 'BALANCED')) as any,
         status: (d.status || 'PENDING') as any,
         settled_at: d.settled_at || d.settledAt || undefined,
         settled_by: d.settled_by || d.settledBy || undefined,

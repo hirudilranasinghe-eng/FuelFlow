@@ -344,17 +344,35 @@ CREATE TABLE IF NOT EXISTS pumper_shortage_excess (
     shift_name TEXT,
     pumper_id TEXT,
     pumper_name TEXT NOT NULL,
-    date TEXT NOT NULL,
+    date TEXT NOT NULL DEFAULT '',
+    record_date TEXT DEFAULT '',
     expected_amount NUMERIC DEFAULT 0,
+    expected_sales NUMERIC DEFAULT 0,
     collected_amount NUMERIC DEFAULT 0,
+    actual_handed_over_cash NUMERIC DEFAULT 0,
     variance_amount NUMERIC DEFAULT 0,
+    difference NUMERIC DEFAULT 0,
+    variance NUMERIC DEFAULT 0,
     type TEXT CHECK (type IN ('SHORTAGE', 'EXCESS', 'BALANCED')),
     status TEXT CHECK (status IN ('PENDING', 'SETTLED')),
     settled_at TIMESTAMPTZ,
     settled_by TEXT,
     notes TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Ensure all column variants exist on pumper_shortage_excess
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS record_date TEXT DEFAULT '';
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS expected_sales NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS actual_handed_over_cash NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS difference NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS variance NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS expected_amount NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS collected_amount NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS variance_amount NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS date TEXT DEFAULT '';
+ALTER TABLE pumper_shortage_excess ADD COLUMN IF NOT EXISTS shift_name TEXT;
 
 ALTER TABLE pumper_shortage_excess DISABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Enable all access for pumper_shortage_excess" ON pumper_shortage_excess;
@@ -367,10 +385,15 @@ CREATE TABLE IF NOT EXISTS pumper_shortages_excess (
     shift_name TEXT,
     pumper_id TEXT,
     pumper_name TEXT NOT NULL,
-    date TEXT NOT NULL,
+    date TEXT NOT NULL DEFAULT '',
+    record_date TEXT DEFAULT '',
     expected_amount NUMERIC DEFAULT 0,
+    expected_sales NUMERIC DEFAULT 0,
     collected_amount NUMERIC DEFAULT 0,
+    actual_handed_over_cash NUMERIC DEFAULT 0,
     variance_amount NUMERIC DEFAULT 0,
+    difference NUMERIC DEFAULT 0,
+    variance NUMERIC DEFAULT 0,
     type TEXT CHECK (type IN ('SHORTAGE', 'EXCESS', 'BALANCED')),
     status TEXT CHECK (status IN ('PENDING', 'SETTLED')),
     settled_at TIMESTAMPTZ,
@@ -378,6 +401,12 @@ CREATE TABLE IF NOT EXISTS pumper_shortages_excess (
     notes TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+ALTER TABLE pumper_shortages_excess ADD COLUMN IF NOT EXISTS record_date TEXT DEFAULT '';
+ALTER TABLE pumper_shortages_excess ADD COLUMN IF NOT EXISTS expected_sales NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortages_excess ADD COLUMN IF NOT EXISTS actual_handed_over_cash NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortages_excess ADD COLUMN IF NOT EXISTS difference NUMERIC DEFAULT 0;
+ALTER TABLE pumper_shortages_excess ADD COLUMN IF NOT EXISTS variance NUMERIC DEFAULT 0;
 
 ALTER TABLE pumper_shortages_excess DISABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Enable all access for pumper_shortages_excess" ON pumper_shortages_excess;

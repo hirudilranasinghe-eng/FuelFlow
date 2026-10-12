@@ -611,9 +611,14 @@ export interface PumperShortageExcessRecord {
   pumper_id: string;
   pumper_name: string;
   date: string;
+  record_date?: string;
   expected_amount: number;
+  expected_sales?: number;
   collected_amount: number;
+  actual_handed_over_cash?: number;
   variance_amount: number;
+  difference?: number;
+  variance?: number;
   type: 'SHORTAGE' | 'EXCESS' | 'BALANCED';
   status: 'PENDING' | 'SETTLED';
   settled_at?: string;
