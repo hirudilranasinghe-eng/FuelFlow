@@ -841,12 +841,12 @@ export default function App() {
               isStartSaved: r.is_start_saved !== undefined ? r.is_start_saved : r.isstartsaved !== undefined ? r.isstartsaved : (r.is_locked || (Number(r.start_meter || r.startmeter || 0) > 0)),
               isCardFinalized: r.is_card_finalized !== undefined ? r.is_card_finalized : r.iscardfinalized !== undefined ? r.iscardfinalized : (r.status === 'Completed'),
               unitPrice: Number(r.unit_price || r.unitprice || r.unitPrice) || 0,
-              actualCash: Number(r.actual_cash ?? r.actualcash ?? r.actualCash) || 0,
+              actualCash: Number(r.actual_cash ?? r.actualcash ?? r.actualCash ?? r.handed_over_cash ?? r.handedovercash) || 0,
               cashVariance: Number(r.cash_variance ?? r.cashvariance ?? r.cashVariance) || 0,
-              creditSalesAmount: Number(r.credit_sales_amount ?? r.creditsalesamount ?? r.creditSalesAmount) || 0,
-              cardSalesAmount: Number(r.card_sales_amount ?? r.cardsalesamount ?? r.cardSalesAmount) || 0,
-              touchCardSalesAmount: Number(r.touch_card_sales_amount ?? r.touchcardsalesamount ?? r.touchCardSalesAmount) || 0,
-              voucherSalesAmount: Number(r.voucher_sales_amount ?? r.vouchersalesamount ?? r.voucherSalesAmount) || 0,
+              creditSalesAmount: Number(r.credit_sales_amount ?? r.creditsalesamount ?? r.creditSalesAmount ?? r.credit_sales ?? r.creditsales) || 0,
+              cardSalesAmount: Number(r.card_sales_amount ?? r.cardsalesamount ?? r.cardSalesAmount ?? r.card_sales ?? r.card_sale ?? r.cardsales) || 0,
+              touchCardSalesAmount: Number(r.touch_card_sales_amount ?? r.touchcardsalesamount ?? r.touchCardSalesAmount ?? r.touch_card_sales ?? r.touch_card ?? r.touchcardsales) || 0,
+              voucherSalesAmount: Number(r.voucher_sales_amount ?? r.vouchersalesamount ?? r.voucherSalesAmount ?? r.voucher_sales ?? r.voucher_sale ?? r.vouchersales) || 0,
               oilSalesAmount: Number(r.oil_sales_amount ?? r.oilsalesamount ?? r.oilSalesAmount) || 0
             }));
 

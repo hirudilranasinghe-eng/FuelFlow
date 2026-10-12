@@ -388,9 +388,15 @@ export async function upsertPumpReadings(client: any, readings: PumpReading[], s
     console.warn('Notice syncing to meter_readings table:', meterErr);
   }
 
-  // Explicitly sync non-cash credit_sales, card_sales, touch_card_sales, and voucher_sales in parallel
-  syncCreditAndCardSales(client, readings, shiftId);
-  syncTouchCardAndVoucherSales(client, readings, shiftId);
+  // Explicitly await sync for non-cash credit_sales, card_sales, touch_card_sales, and voucher_sales
+  try {
+    await Promise.all([
+      syncCreditAndCardSales(client, readings, shiftId),
+      syncTouchCardAndVoucherSales(client, readings, shiftId)
+    ]);
+  } catch (syncErr) {
+    console.warn('Non-cash sales sync notice in upsertPumpReadings:', syncErr);
+  }
 
   return { data, error };
 }
@@ -1795,8 +1801,11 @@ export interface PumperReconciliationPayload {
   cash_variance: number;
   credit_sales: number;
   card_sales: number;
+  card_sale?: number;
   touch_card_sales: number;
+  touch_card?: number;
   voucher_sales: number;
+  voucher_sale?: number;
   assigned_pumps_count: number;
   start_meter?: number;
   end_meter?: number;
@@ -1808,7 +1817,7 @@ export interface PumperReconciliationPayload {
 
 /**
  * Persists a pumper's reconciled cash handover, meter readings, and non-cash sales directly to Supabase.
- * Tries 'shift_pumper_assignments', 'shift_pumper_reconciliations', and 'pumper_assignments'.
+ * Strictly awaits all database responses across 'pumper_assignments', 'shift_pumper_assignments', and 'shift_pumper_reconciliations'.
  */
 export async function savePumperReconciliation(
   client: any,
@@ -1831,142 +1840,127 @@ export async function savePumperReconciliation(
   const parsedEnd = (rawEnd !== undefined && rawEnd !== null && rawEnd !== '') ? parseFloat(String(rawEnd)) : undefined;
   const endVal = (parsedEnd !== undefined && !isNaN(parsedEnd)) ? parsedEnd : 0;
 
+  const handedCash = payload.handed_over_cash !== undefined ? payload.handed_over_cash : (payload.actual_cash ?? 0);
+  const credSales = payload.credit_sales ?? 0;
+  const cSales = payload.card_sales ?? (payload as any).card_sale ?? 0;
+  const tcSales = payload.touch_card_sales ?? (payload as any).touch_card ?? 0;
+  const vSales = payload.voucher_sales ?? (payload as any).voucher_sale ?? 0;
+
+  // Complete payload with all column variations (both singular and plural)
   const fullPayload = {
-    ...payload,
+    id: payload.id,
+    shift_id: payload.shift_id,
+    pumper_id: payload.pumper_id,
+    pumper_name: payload.pumper_name,
+    handed_over_cash: handedCash,
+    actual_cash: handedCash,
+    expected_cash: payload.expected_cash ?? 0,
+    cash_variance: payload.cash_variance ?? 0,
+    credit_sales: credSales,
+    card_sales: cSales,
+    card_sale: cSales,
+    touch_card_sales: tcSales,
+    touch_card: tcSales,
+    voucher_sales: vSales,
+    voucher_sale: vSales,
     start_meter: startVal,
     end_meter: endVal,
     startmeter: startVal,
     endmeter: endVal,
+    assigned_pumps_count: payload.assigned_pumps_count || 1,
+    status: payload.status || 'Completed',
     updated_at: new Date().toISOString()
   };
 
-  // 1. Strictly UPSERT to legacy and standard 'pumper_assignments'
+  const standardPayload = {
+    id: payload.id,
+    shift_id: payload.shift_id,
+    pumper_id: payload.pumper_id,
+    pumper_name: payload.pumper_name,
+    handed_over_cash: handedCash,
+    actual_cash: handedCash,
+    expected_cash: payload.expected_cash ?? 0,
+    cash_variance: payload.cash_variance ?? 0,
+    credit_sales: credSales,
+    card_sales: cSales,
+    touch_card_sales: tcSales,
+    voucher_sales: vSales,
+    start_meter: startVal,
+    end_meter: endVal,
+    assigned_pumps_count: payload.assigned_pumps_count || 1,
+    status: payload.status || 'Completed',
+    updated_at: new Date().toISOString()
+  };
+
+  let savedAny = false;
+
+  // 1. Strictly await database response for 'pumper_assignments'
   try {
     const { error: errPumper } = await client
       .from('pumper_assignments')
-      .upsert([{
-        id: payload.id,
-        shift_id: payload.shift_id,
-        pumper_id: payload.pumper_id,
-        pumper_name: payload.pumper_name,
-        actual_cash: payload.actual_cash ?? 0,
-        handed_over_cash: payload.handed_over_cash ?? payload.actual_cash ?? 0,
-        expected_cash: payload.expected_cash ?? 0,
-        cash_variance: payload.cash_variance ?? 0,
-        credit_sales: payload.credit_sales ?? 0,
-        card_sales: payload.card_sales ?? 0,
-        touch_card_sales: payload.touch_card_sales ?? 0,
-        voucher_sales: payload.voucher_sales ?? 0,
-        start_meter: startVal,
-        end_meter: endVal,
-        startmeter: startVal,
-        endmeter: endVal,
-        status: payload.status,
-        updated_at: new Date().toISOString()
-      }]);
+      .upsert([fullPayload]);
     if (!errPumper) {
-      // Also sync to shift_pumper_assignments in background
-      client.from('shift_pumper_assignments').upsert([fullPayload]).then(() => {}).catch(() => {});
-      return { success: true };
+      savedAny = true;
+    } else if (errPumper.code === '42703' || errPumper.code === 'PGRST204' || errPumper.message?.includes('column')) {
+      const { error: errStd } = await client
+        .from('pumper_assignments')
+        .upsert([standardPayload]);
+      if (!errStd) savedAny = true;
     }
   } catch (errP) {
-    console.warn('pumper_assignments save note:', errP);
+    console.warn('pumper_assignments upsert note:', errP);
   }
 
+  // 2. Strictly await database response for 'shift_pumper_assignments'
   try {
-    // 2. Try 'shift_pumper_assignments' with full columns
-    const { error: err1 } = await client
+    const { error: errShift } = await client
       .from('shift_pumper_assignments')
       .upsert([fullPayload]);
-
-    if (!err1) return { success: true };
-
-    // If schema error (e.g. column doesn't exist), try standard columns
-    if (err1 && (err1.code === '42703' || err1.code === 'PGRST204' || err1.message?.includes('column'))) {
-      const basicPayload = {
-        id: payload.id,
-        shift_id: payload.shift_id,
-        pumper_id: payload.pumper_id,
-        pumper_name: payload.pumper_name,
-        actual_cash: payload.actual_cash,
-        expected_cash: payload.expected_cash,
-        cash_variance: payload.cash_variance,
-        start_meter: startVal,
-        end_meter: endVal,
-        status: payload.status,
-        updated_at: new Date().toISOString()
-      };
-      const { error: errBasic } = await client
+    if (!errShift) {
+      savedAny = true;
+    } else if (errShift.code === '42703' || errShift.code === 'PGRST204' || errShift.message?.includes('column')) {
+      const { error: errShiftStd } = await client
         .from('shift_pumper_assignments')
-        .upsert([basicPayload]);
-      if (!errBasic) return { success: true };
+        .upsert([standardPayload]);
+      if (!errShiftStd) savedAny = true;
     }
-  } catch (err) {
-    console.warn('shift_pumper_assignments save error, trying fallbacks:', err);
+  } catch (errS) {
+    console.warn('shift_pumper_assignments upsert note:', errS);
   }
 
+  // 3. Strictly await database response for 'shift_pumper_reconciliations'
   try {
-    // 3. Try 'shift_pumper_reconciliations'
-    const { error: err2 } = await client
+    const { error: errRecon } = await client
       .from('shift_pumper_reconciliations')
       .upsert([fullPayload]);
-    if (!err2) return { success: true };
-  } catch (_) {}
+    if (!errRecon) {
+      savedAny = true;
+    } else if (errRecon.code === '42703' || errRecon.code === 'PGRST204' || errRecon.message?.includes('column')) {
+      const { error: errReconStd } = await client
+        .from('shift_pumper_reconciliations')
+        .upsert([standardPayload]);
+      if (!errReconStd) savedAny = true;
+    }
+  } catch (errR) {
+    console.warn('shift_pumper_reconciliations upsert note:', errR);
+  }
 
-  return { success: false };
+  return { success: savedAny };
 }
 
 /**
  * Fetches reconciled pumper records for an active shift.
+ * Gathers and merges data across 'pumper_assignments', 'shift_pumper_assignments', and 'shift_pumper_reconciliations',
+ * ensuring complete state rehydration on page refresh.
  */
 export async function fetchPumperReconciliations(
   client: any,
   shiftId: string
 ): Promise<any[]> {
   const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
-  let dbResults: any[] = [];
+  const mergedMap = new Map<string, any>();
 
-  if (isConfigured && shiftId) {
-    // 1. Try 'pumper_assignments'
-    try {
-      const { data, error } = await client
-        .from('pumper_assignments')
-        .select('*')
-        .eq('shift_id', shiftId);
-      if (!error && data && data.length > 0) {
-        dbResults = data;
-      }
-    } catch (_) {}
-
-    // 2. Try 'shift_pumper_assignments'
-    if (dbResults.length === 0) {
-      try {
-        const { data, error } = await client
-          .from('shift_pumper_assignments')
-          .select('*')
-          .eq('shift_id', shiftId);
-        if (!error && data && data.length > 0) {
-          dbResults = data;
-        }
-      } catch (_) {}
-    }
-
-    // 3. Try 'shift_pumper_reconciliations'
-    if (dbResults.length === 0) {
-      try {
-        const { data, error } = await client
-          .from('shift_pumper_reconciliations')
-          .select('*')
-          .eq('shift_id', shiftId);
-        if (!error && data && data.length > 0) {
-          dbResults = data;
-        }
-      } catch (_) {}
-    }
-  }
-
-  // Also read from localStorage cache to guarantee instant rehydration even before/without DB response
-  const localResults: any[] = [];
+  // 1. Read from localStorage cache as immediate baseline
   try {
     const prefix = `fuelflow_pumper_reconciliation_${shiftId}_`;
     for (let i = 0; i < localStorage.length; i++) {
@@ -1975,63 +1969,89 @@ export async function fetchPumperReconciliations(
         const val = localStorage.getItem(key);
         if (val) {
           try {
-            localResults.push(JSON.parse(val));
+            const parsed = JSON.parse(val);
+            const pid = parsed.pumper_id || parsed.pumperId;
+            if (pid) {
+              const rawStart = parsed.start_meter !== undefined ? parsed.start_meter : parsed.startmeter;
+              const pStart = (rawStart !== undefined && rawStart !== null && rawStart !== '') ? parseFloat(String(rawStart)) : undefined;
+              const rawEnd = parsed.end_meter !== undefined ? parsed.end_meter : parsed.endmeter;
+              const pEnd = (rawEnd !== undefined && rawEnd !== null && rawEnd !== '') ? parseFloat(String(rawEnd)) : undefined;
+              mergedMap.set(pid, {
+                ...parsed,
+                start_meter: (pStart !== undefined && !isNaN(pStart)) ? pStart : 0,
+                end_meter: (pEnd !== undefined && !isNaN(pEnd)) ? pEnd : 0,
+                startmeter: (pStart !== undefined && !isNaN(pStart)) ? pStart : 0,
+                endmeter: (pEnd !== undefined && !isNaN(pEnd)) ? pEnd : 0
+              });
+            }
           } catch (_) {}
         }
       }
     }
   } catch (_) {}
 
-  // Merge local and db results (db takes priority if available, otherwise local)
-  const mergedMap = new Map<string, any>();
-  localResults.forEach(r => {
-    const pid = r.pumper_id || r.pumperId;
-    if (pid) {
-      const rawStart = r.start_meter !== undefined ? r.start_meter : r.startmeter;
-      const parsedStart = (rawStart !== undefined && rawStart !== null && rawStart !== '') ? parseFloat(String(rawStart)) : undefined;
-      const rawEnd = r.end_meter !== undefined ? r.end_meter : r.endmeter;
-      const parsedEnd = (rawEnd !== undefined && rawEnd !== null && rawEnd !== '') ? parseFloat(String(rawEnd)) : undefined;
-
-      mergedMap.set(pid, {
-        ...r,
-        start_meter: (parsedStart !== undefined && !isNaN(parsedStart)) ? parsedStart : 0,
-        end_meter: (parsedEnd !== undefined && !isNaN(parsedEnd)) ? parsedEnd : 0,
-        startmeter: (parsedStart !== undefined && !isNaN(parsedStart)) ? parsedStart : 0,
-        endmeter: (parsedEnd !== undefined && !isNaN(parsedEnd)) ? parsedEnd : 0
-      });
-    }
-  });
-
-  dbResults.forEach(r => {
-    const pid = r.pumper_id || r.pumperId;
-    if (pid) {
+  if (isConfigured && shiftId) {
+    // Helper to merge a database row into mergedMap
+    const mergeRow = (row: any) => {
+      const pid = row.pumper_id || row.pumperId;
+      if (!pid) return;
       const existing = mergedMap.get(pid) || {};
 
-      const rawStart = r.start_meter !== undefined ? r.start_meter : (r.startmeter !== undefined ? r.startmeter : (existing.start_meter !== undefined ? existing.start_meter : existing.startmeter));
+      const rawStart = row.start_meter !== undefined ? row.start_meter : (row.startmeter !== undefined ? row.startmeter : (existing.start_meter !== undefined ? existing.start_meter : existing.startmeter));
       const parsedStart = (rawStart !== undefined && rawStart !== null && rawStart !== '') ? parseFloat(String(rawStart)) : undefined;
       const startMeter = (parsedStart !== undefined && !isNaN(parsedStart)) ? parsedStart : 0;
 
-      const rawEnd = r.end_meter !== undefined ? r.end_meter : (r.endmeter !== undefined ? r.endmeter : (existing.end_meter !== undefined ? existing.end_meter : existing.endmeter));
+      const rawEnd = row.end_meter !== undefined ? row.end_meter : (row.endmeter !== undefined ? row.endmeter : (existing.end_meter !== undefined ? existing.end_meter : existing.endmeter));
       const parsedEnd = (rawEnd !== undefined && rawEnd !== null && rawEnd !== '') ? parseFloat(String(rawEnd)) : undefined;
       const endMeter = (parsedEnd !== undefined && !isNaN(parsedEnd)) ? parsedEnd : 0;
 
+      const handedCash = Number(row.handed_over_cash ?? row.handedovercash ?? row.actual_cash ?? row.actualcash) || Number(existing.handed_over_cash ?? existing.actual_cash) || 0;
+      const credit = Number(row.credit_sales ?? row.creditsales) || Number(existing.credit_sales) || 0;
+      const card = Number(row.card_sales ?? row.card_sale ?? row.cardsales) || Number(existing.card_sales ?? existing.card_sale) || 0;
+      const touchCard = Number(row.touch_card_sales ?? row.touch_card ?? row.touchcardsales) || Number(existing.touch_card_sales ?? existing.touch_card) || 0;
+      const voucher = Number(row.voucher_sales ?? row.voucher_sale ?? row.vouchersales) || Number(existing.voucher_sales ?? existing.voucher_sale) || 0;
+
       mergedMap.set(pid, {
         ...existing,
-        ...r,
+        ...row,
         start_meter: startMeter,
         end_meter: endMeter,
         startmeter: startMeter,
         endmeter: endMeter,
-        handed_over_cash: Number(r.handed_over_cash ?? r.handedovercash ?? r.actual_cash ?? r.actualcash) || Number(existing.handed_over_cash ?? existing.actual_cash) || 0,
-        actual_cash: Number(r.actual_cash ?? r.actualcash ?? r.handed_over_cash ?? r.handedovercash) || Number(existing.actual_cash ?? existing.handed_over_cash) || 0,
-        credit_sales: Number(r.credit_sales ?? r.creditsales) || Number(existing.credit_sales) || 0,
-        card_sales: Number(r.card_sales ?? r.cardsales) || Number(existing.card_sales) || 0,
-        touch_card_sales: Number(r.touch_card_sales ?? r.touchcardsales) || Number(existing.touch_card_sales) || 0,
-        voucher_sales: Number(r.voucher_sales ?? r.vouchersales) || Number(existing.voucher_sales) || 0,
-        status: r.status || existing.status || 'Completed'
+        handed_over_cash: handedCash,
+        actual_cash: handedCash,
+        credit_sales: credit,
+        card_sales: card,
+        card_sale: card,
+        touch_card_sales: touchCard,
+        touch_card: touchCard,
+        voucher_sales: voucher,
+        voucher_sale: voucher,
+        status: row.status || existing.status || 'Active'
       });
+    };
+
+    // Query all tables in parallel to get complete persisted payload across tables
+    try {
+      const [pumperRes, shiftPumperRes, reconRes] = await Promise.all([
+        client.from('pumper_assignments').select('*').eq('shift_id', shiftId),
+        client.from('shift_pumper_assignments').select('*').eq('shift_id', shiftId),
+        client.from('shift_pumper_reconciliations').select('*').eq('shift_id', shiftId)
+      ]);
+
+      if (pumperRes?.data && Array.isArray(pumperRes.data)) {
+        pumperRes.data.forEach(mergeRow);
+      }
+      if (shiftPumperRes?.data && Array.isArray(shiftPumperRes.data)) {
+        shiftPumperRes.data.forEach(mergeRow);
+      }
+      if (reconRes?.data && Array.isArray(reconRes.data)) {
+        reconRes.data.forEach(mergeRow);
+      }
+    } catch (err) {
+      console.warn('Notice fetching pumper reconciliations from Supabase:', err);
     }
-  });
+  }
 
   return Array.from(mergedMap.values());
 }

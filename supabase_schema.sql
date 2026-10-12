@@ -395,16 +395,85 @@ CREATE TABLE IF NOT EXISTS shift_pumper_assignments (
     cash_variance NUMERIC DEFAULT 0,
     credit_sales NUMERIC DEFAULT 0,
     card_sales NUMERIC DEFAULT 0,
+    card_sale NUMERIC DEFAULT 0,
     touch_card_sales NUMERIC DEFAULT 0,
+    touch_card NUMERIC DEFAULT 0,
     voucher_sales NUMERIC DEFAULT 0,
+    voucher_sale NUMERIC DEFAULT 0,
+    start_meter NUMERIC DEFAULT 0,
+    end_meter NUMERIC DEFAULT 0,
     assigned_pumps_count INTEGER DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'Completed',
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+ALTER TABLE shift_pumper_assignments ADD COLUMN IF NOT EXISTS start_meter NUMERIC DEFAULT 0;
+ALTER TABLE shift_pumper_assignments ADD COLUMN IF NOT EXISTS end_meter NUMERIC DEFAULT 0;
+ALTER TABLE shift_pumper_assignments ADD COLUMN IF NOT EXISTS card_sale NUMERIC DEFAULT 0;
+ALTER TABLE shift_pumper_assignments ADD COLUMN IF NOT EXISTS touch_card NUMERIC DEFAULT 0;
+ALTER TABLE shift_pumper_assignments ADD COLUMN IF NOT EXISTS voucher_sale NUMERIC DEFAULT 0;
 ALTER TABLE shift_pumper_assignments DISABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Enable all access for shift_pumper_assignments" ON shift_pumper_assignments;
 CREATE POLICY "Enable all access for shift_pumper_assignments" ON shift_pumper_assignments FOR ALL TO public USING (true) WITH CHECK (true);
+
+-- Pumper Assignments standard table
+CREATE TABLE IF NOT EXISTS pumper_assignments (
+    id TEXT PRIMARY KEY,
+    shift_id TEXT REFERENCES shifts(id) ON DELETE CASCADE,
+    pumper_id TEXT REFERENCES employees(id),
+    pumper_name TEXT,
+    handed_over_cash NUMERIC DEFAULT 0,
+    actual_cash NUMERIC DEFAULT 0,
+    expected_cash NUMERIC DEFAULT 0,
+    cash_variance NUMERIC DEFAULT 0,
+    credit_sales NUMERIC DEFAULT 0,
+    card_sales NUMERIC DEFAULT 0,
+    card_sale NUMERIC DEFAULT 0,
+    touch_card_sales NUMERIC DEFAULT 0,
+    touch_card NUMERIC DEFAULT 0,
+    voucher_sales NUMERIC DEFAULT 0,
+    voucher_sale NUMERIC DEFAULT 0,
+    start_meter NUMERIC DEFAULT 0,
+    end_meter NUMERIC DEFAULT 0,
+    startmeter NUMERIC DEFAULT 0,
+    endmeter NUMERIC DEFAULT 0,
+    assigned_pumps_count INTEGER DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'Completed',
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE pumper_assignments ADD COLUMN IF NOT EXISTS start_meter NUMERIC DEFAULT 0;
+ALTER TABLE pumper_assignments ADD COLUMN IF NOT EXISTS end_meter NUMERIC DEFAULT 0;
+ALTER TABLE pumper_assignments ADD COLUMN IF NOT EXISTS card_sale NUMERIC DEFAULT 0;
+ALTER TABLE pumper_assignments ADD COLUMN IF NOT EXISTS touch_card NUMERIC DEFAULT 0;
+ALTER TABLE pumper_assignments ADD COLUMN IF NOT EXISTS voucher_sale NUMERIC DEFAULT 0;
+ALTER TABLE pumper_assignments DISABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Enable all access for pumper_assignments" ON pumper_assignments;
+CREATE POLICY "Enable all access for pumper_assignments" ON pumper_assignments FOR ALL TO public USING (true) WITH CHECK (true);
+
+-- Meter Readings table
+CREATE TABLE IF NOT EXISTS meter_readings (
+    id TEXT PRIMARY KEY,
+    shift_id TEXT REFERENCES shifts(id) ON DELETE CASCADE,
+    pump_id TEXT NOT NULL,
+    pump_name TEXT,
+    fuel_type TEXT,
+    assigned_pumper_id TEXT REFERENCES employees(id),
+    start_meter NUMERIC NOT NULL DEFAULT 0,
+    end_meter NUMERIC NOT NULL DEFAULT 0,
+    startmeter NUMERIC DEFAULT 0,
+    endmeter NUMERIC DEFAULT 0,
+    testing_qty NUMERIC DEFAULT 0,
+    status TEXT DEFAULT 'Active',
+    is_locked BOOLEAN DEFAULT false,
+    unit_price NUMERIC DEFAULT 0,
+    actual_cash NUMERIC DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE meter_readings DISABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Enable all access for meter_readings" ON meter_readings;
+CREATE POLICY "Enable all access for meter_readings" ON meter_readings FOR ALL TO public USING (true) WITH CHECK (true);
 
 CREATE TABLE IF NOT EXISTS shift_pumper_reconciliations (
     id TEXT PRIMARY KEY,
@@ -417,13 +486,23 @@ CREATE TABLE IF NOT EXISTS shift_pumper_reconciliations (
     cash_variance NUMERIC DEFAULT 0,
     credit_sales NUMERIC DEFAULT 0,
     card_sales NUMERIC DEFAULT 0,
+    card_sale NUMERIC DEFAULT 0,
     touch_card_sales NUMERIC DEFAULT 0,
+    touch_card NUMERIC DEFAULT 0,
     voucher_sales NUMERIC DEFAULT 0,
+    voucher_sale NUMERIC DEFAULT 0,
+    start_meter NUMERIC DEFAULT 0,
+    end_meter NUMERIC DEFAULT 0,
     assigned_pumps_count INTEGER DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'Completed',
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+ALTER TABLE shift_pumper_reconciliations ADD COLUMN IF NOT EXISTS start_meter NUMERIC DEFAULT 0;
+ALTER TABLE shift_pumper_reconciliations ADD COLUMN IF NOT EXISTS end_meter NUMERIC DEFAULT 0;
+ALTER TABLE shift_pumper_reconciliations ADD COLUMN IF NOT EXISTS card_sale NUMERIC DEFAULT 0;
+ALTER TABLE shift_pumper_reconciliations ADD COLUMN IF NOT EXISTS touch_card NUMERIC DEFAULT 0;
+ALTER TABLE shift_pumper_reconciliations ADD COLUMN IF NOT EXISTS voucher_sale NUMERIC DEFAULT 0;
 ALTER TABLE shift_pumper_reconciliations DISABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Enable all access for shift_pumper_reconciliations" ON shift_pumper_reconciliations;
 CREATE POLICY "Enable all access for shift_pumper_reconciliations" ON shift_pumper_reconciliations FOR ALL TO public USING (true) WITH CHECK (true);

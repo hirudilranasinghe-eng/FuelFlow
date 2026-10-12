@@ -986,6 +986,8 @@ export default function ShiftManagementTab({
             const rehydratedCash: Record<string, string> = {};
             const rehydratedNonCash: Record<string, string> = {};
             const rehydratedFinalized: Record<string, boolean> = {};
+            const rehydratedLockedStarts: Record<string, boolean> = {};
+            const rehydratedLockedEnds: Record<string, boolean> = {};
 
             reconciledList.forEach((rec: any) => {
               const pid = rec.pumper_id || rec.pumperId;
@@ -993,35 +995,49 @@ export default function ShiftManagementTab({
 
               const handedCash = Number(rec.handed_over_cash ?? rec.handedovercash ?? rec.actual_cash ?? rec.actualcash) || 0;
               const credit = Number(rec.credit_sales ?? rec.creditsales) || 0;
-              const card = Number(rec.card_sales ?? rec.cardsales) || 0;
-              const touchCard = Number(rec.touch_card_sales ?? rec.touchcardsales) || 0;
-              const voucher = Number(rec.voucher_sales ?? rec.vouchersales) || 0;
+              const card = Number(rec.card_sales ?? rec.card_sale ?? rec.cardsales) || 0;
+              const touchCard = Number(rec.touch_card_sales ?? rec.touch_card ?? rec.touchcardsales) || 0;
+              const voucher = Number(rec.voucher_sales ?? rec.voucher_sale ?? rec.vouchersales) || 0;
               const isCompleted = rec.status === 'Completed';
+              const isActive = rec.status === 'Active';
 
-              if (isCompleted || handedCash > 0) {
+              if (rec.handed_over_cash !== undefined || rec.actual_cash !== undefined || isCompleted || handedCash > 0) {
                 rehydratedCash[pid] = (Math.round(handedCash * 100) / 100).toString();
               }
-              if (isCompleted || credit > 0) {
+              if (rec.credit_sales !== undefined || isCompleted || credit > 0) {
                 rehydratedNonCash[`${pid}_credit`] = (Math.round(credit * 100) / 100).toString();
               }
-              if (isCompleted || card > 0) {
+              if (rec.card_sales !== undefined || rec.card_sale !== undefined || isCompleted || card > 0) {
                 rehydratedNonCash[`${pid}_card`] = (Math.round(card * 100) / 100).toString();
               }
-              if (isCompleted || touchCard > 0) {
+              if (rec.touch_card_sales !== undefined || rec.touch_card !== undefined || isCompleted || touchCard > 0) {
                 rehydratedNonCash[`${pid}_touchCard`] = (Math.round(touchCard * 100) / 100).toString();
               }
-              if (isCompleted || voucher > 0) {
+              if (rec.voucher_sales !== undefined || rec.voucher_sale !== undefined || isCompleted || voucher > 0) {
                 rehydratedNonCash[`${pid}_voucher`] = (Math.round(voucher * 100) / 100).toString();
               }
               if (isCompleted) {
                 rehydratedFinalized[pid] = true;
               }
+
+              ensuredReadings.forEach(er => {
+                if (er.assignedPumperId === pid) {
+                  if (isCompleted) {
+                    rehydratedLockedStarts[er.pumpId] = true;
+                    rehydratedLockedEnds[er.pumpId] = true;
+                  } else if (isActive || (rec.start_meter !== undefined && rec.start_meter > 0) || er.isStartSaved) {
+                    rehydratedLockedStarts[er.pumpId] = true;
+                  }
+                }
+              });
             });
 
-            setPumperCashInputs(prev => ({ ...rehydratedCash, ...prev }));
-            setPumperNonCashInputs(prev => ({ ...rehydratedNonCash, ...prev }));
+            setPumperCashInputs(prev => ({ ...prev, ...rehydratedCash }));
+            setPumperNonCashInputs(prev => ({ ...prev, ...rehydratedNonCash }));
             setFinalizedPumperCards(prev => ({ ...prev, ...rehydratedFinalized }));
             setSavedPumperCards(prev => ({ ...prev, ...rehydratedFinalized }));
+            setLockedStartMeters(prev => ({ ...prev, ...rehydratedLockedStarts }));
+            setLockedEndMeters(prev => ({ ...prev, ...rehydratedLockedEnds }));
           }
 
           if ((cData && cData.length > 0) || (cardData && cardData.length > 0) || (tcData && tcData.length > 0) || (vData && vData.length > 0) || (reconciledList && reconciledList.length > 0) || (forecourtOilList && forecourtOilList.length > 0) || (remotePumpReadings && remotePumpReadings.length > 0)) {
@@ -1086,12 +1102,18 @@ export default function ShiftManagementTab({
                   (r.assignedPumperId && (rp.assigned_pumper_id || rp.assignedpumperid) === r.assignedPumperId && (rp.pump_id || rp.pumpid) === r.pumpId)
                 );
 
-                const cAmount = cMatch ? Number(cMatch.amount || cMatch.credit_amount || cMatch.total_amount) : (recMatch ? Number(recMatch.credit_sales ?? recMatch.creditsales) : r.creditSalesAmount);
-                const cardAmount = cardMatch ? Number(cardMatch.amount || cardMatch.card_amount || cardMatch.total_amount) : (recMatch ? Number(recMatch.card_sales ?? recMatch.cardsales) : r.cardSalesAmount);
-                const tcAmount = tcMatch ? Number(tcMatch.amount || tcMatch.touch_card_amount || tcMatch.total_amount) : (recMatch ? Number(recMatch.touch_card_sales ?? recMatch.touchcardsales) : r.touchCardSalesAmount);
-                const vAmount = vMatch ? Number(vMatch.amount || vMatch.voucher_amount || vMatch.total_amount) : (recMatch ? Number(recMatch.voucher_sales ?? recMatch.vouchersales) : r.voucherSalesAmount);
+                const remCredit = Number(remoteReadingMatch?.credit_sales_amount ?? remoteReadingMatch?.creditsalesamount ?? remoteReadingMatch?.credit_sales ?? remoteReadingMatch?.creditsales) || 0;
+                const remCard = Number(remoteReadingMatch?.card_sales_amount ?? remoteReadingMatch?.cardsalesamount ?? remoteReadingMatch?.card_sales ?? remoteReadingMatch?.card_sale ?? remoteReadingMatch?.cardsales) || 0;
+                const remTc = Number(remoteReadingMatch?.touch_card_sales_amount ?? remoteReadingMatch?.touchcardsalesamount ?? remoteReadingMatch?.touch_card_sales ?? remoteReadingMatch?.touch_card ?? remoteReadingMatch?.touchcardsales) || 0;
+                const remV = Number(remoteReadingMatch?.voucher_sales_amount ?? remoteReadingMatch?.vouchersalesamount ?? remoteReadingMatch?.voucher_sales ?? remoteReadingMatch?.voucher_sale ?? remoteReadingMatch?.vouchersales) || 0;
+                const remCash = Number(remoteReadingMatch?.actual_cash ?? remoteReadingMatch?.actualcash ?? remoteReadingMatch?.handed_over_cash ?? remoteReadingMatch?.handedovercash) || 0;
 
-                const recCash = recMatch ? (Number(recMatch.handed_over_cash ?? recMatch.handedovercash ?? recMatch.actual_cash ?? recMatch.actualcash) || 0) : 0;
+                const cAmount = cMatch ? Number(cMatch.amount || cMatch.credit_amount || cMatch.total_amount) : (recMatch && (recMatch.credit_sales ?? recMatch.creditsales) !== undefined ? Number(recMatch.credit_sales ?? recMatch.creditsales) : (remCredit > 0 ? remCredit : r.creditSalesAmount));
+                const cardAmount = cardMatch ? Number(cardMatch.amount || cardMatch.card_amount || cardMatch.total_amount) : (recMatch && (recMatch.card_sales ?? recMatch.card_sale ?? recMatch.cardsales) !== undefined ? Number(recMatch.card_sales ?? recMatch.card_sale ?? recMatch.cardsales) : (remCard > 0 ? remCard : r.cardSalesAmount));
+                const tcAmount = tcMatch ? Number(tcMatch.amount || tcMatch.touch_card_amount || tcMatch.total_amount) : (recMatch && (recMatch.touch_card_sales ?? recMatch.touch_card ?? recMatch.touchcardsales) !== undefined ? Number(recMatch.touch_card_sales ?? recMatch.touch_card ?? recMatch.touchcardsales) : (remTc > 0 ? remTc : r.touchCardSalesAmount));
+                const vAmount = vMatch ? Number(vMatch.amount || vMatch.voucher_amount || vMatch.total_amount) : (recMatch && (recMatch.voucher_sales ?? recMatch.voucher_sale ?? recMatch.vouchersales) !== undefined ? Number(recMatch.voucher_sales ?? recMatch.voucher_sale ?? recMatch.vouchersales) : (remV > 0 ? remV : r.voucherSalesAmount));
+
+                const recCash = recMatch ? (Number(recMatch.handed_over_cash ?? recMatch.handedovercash ?? recMatch.actual_cash ?? recMatch.actualcash) || 0) : (remCash > 0 ? remCash : 0);
                 const recCompleted = recMatch?.status === 'Completed';
 
                 const assignedPumps = prev.filter(p => p.assignedPumperId === r.assignedPumperId);
@@ -1109,7 +1131,7 @@ export default function ShiftManagementTab({
                   const remEnd = remoteReadingMatch.end_meter !== undefined ? Number(remoteReadingMatch.end_meter) : (remoteReadingMatch.endmeter !== undefined ? Number(remoteReadingMatch.endmeter) : undefined);
                   const remTest = remoteReadingMatch.testing_qty !== undefined ? Number(remoteReadingMatch.testing_qty) : (remoteReadingMatch.testingqty !== undefined ? Number(remoteReadingMatch.testingqty) : undefined);
 
-                  if (remStart !== undefined && !isNaN(remStart) && remStart > 0) {
+                  if (remStart !== undefined && !isNaN(remStart) && (remStart > 0 || remoteReadingMatch.is_start_saved || remoteReadingMatch.is_locked)) {
                     nextStartMeter = remStart;
                     nextIsStartSaved = true;
                   }
@@ -1122,11 +1144,11 @@ export default function ShiftManagementTab({
                 } else if (recMatch) {
                   const recStart = recMatch.start_meter !== undefined ? Number(recMatch.start_meter) : (recMatch.startmeter !== undefined ? Number(recMatch.startmeter) : undefined);
                   const recEnd = recMatch.end_meter !== undefined ? Number(recMatch.end_meter) : (recMatch.endmeter !== undefined ? Number(recMatch.endmeter) : undefined);
-                  if (recStart !== undefined && !isNaN(recStart) && recStart > 0 && (!r.startMeter || r.startMeter === 0)) {
+                  if (recStart !== undefined && !isNaN(recStart) && recStart > 0 && (!nextStartMeter || nextStartMeter === 0)) {
                     nextStartMeter = recStart;
                     nextIsStartSaved = true;
                   }
-                  if (recEnd !== undefined && !isNaN(recEnd) && recEnd > 0 && (!r.endMeter || r.endMeter === 0)) {
+                  if (recEnd !== undefined && !isNaN(recEnd) && recEnd > 0 && (!nextEndMeter || nextEndMeter === 0)) {
                     nextEndMeter = recEnd;
                   }
                 }
@@ -1178,7 +1200,36 @@ export default function ShiftManagementTab({
                 }
                 return r;
               });
-              return hasChanges ? updated : prev;
+
+              if (hasChanges) {
+                let totalFuel = 0;
+                let totalNet = 0;
+                let totalSales = 0;
+
+                updated.forEach(dr => {
+                  const isOil = dr.pumpId === 'pump-oil-bay' || dr.fuelType === 'Oil & Lubricants' || dr.pumpName?.toLowerCase().includes('dispenser') || dr.pumpName?.toLowerCase().includes('oil');
+                  const fuel = isOil ? 0 : Math.max(0, dr.endMeter - dr.startMeter);
+                  const net = isOil ? 0 : Math.max(0, fuel - dr.testingQty);
+                  const fuelRev = isOil ? 0 : (net * getPriceForFuelType(dr.fuelType));
+                  const oilRev = dr.oilSalesAmount || 0;
+                  totalFuel += fuel;
+                  totalNet += net;
+                  totalSales += (fuelRev + oilRev);
+                });
+
+                setActiveShift(prevShift => {
+                  if (!prevShift) return prevShift;
+                  return {
+                    ...prevShift,
+                    pumpReadings: updated,
+                    totalFuelSold: totalFuel,
+                    totalNetSold: totalNet,
+                    totalNetSales: totalSales
+                  };
+                });
+                return updated;
+              }
+              return prev;
             });
           }
         }).catch(err => {
@@ -2582,22 +2633,41 @@ export default function ShiftManagementTab({
       console.warn('Start meter sync note:', err);
     }
 
-    // Also strictly persist start_meter into pumper_assignments / shift_pumper_assignments
+    // Also strictly persist start_meter, non-cash and cash into pumper_assignments / shift_pumper_assignments
     try {
       const avgStartMeter = targetReadings.reduce((sum, r) => sum + (parseFloat(String(r.startMeter)) || 0), 0) / (targetReadings.length || 1);
+      const handedOver = pumperCashInputs[pumperId] !== undefined && pumperCashInputs[pumperId] !== ''
+        ? Math.round(Number(pumperCashInputs[pumperId]) * 100) / 100
+        : targetReadings.reduce((sum, r) => sum + (r.actualCash || 0), 0);
+      const creditSales = pumperNonCashInputs[`${pumperId}_credit`] !== undefined && pumperNonCashInputs[`${pumperId}_credit`] !== ''
+        ? Math.round(Number(pumperNonCashInputs[`${pumperId}_credit`]) * 100) / 100
+        : targetReadings.reduce((sum, r) => sum + (r.creditSalesAmount || 0), 0);
+      const cardSales = pumperNonCashInputs[`${pumperId}_card`] !== undefined && pumperNonCashInputs[`${pumperId}_card`] !== ''
+        ? Math.round(Number(pumperNonCashInputs[`${pumperId}_card`]) * 100) / 100
+        : targetReadings.reduce((sum, r) => sum + (r.cardSalesAmount || 0), 0);
+      const touchCardSales = pumperNonCashInputs[`${pumperId}_touchCard`] !== undefined && pumperNonCashInputs[`${pumperId}_touchCard`] !== ''
+        ? Math.round(Number(pumperNonCashInputs[`${pumperId}_touchCard`]) * 100) / 100
+        : targetReadings.reduce((sum, r) => sum + (r.touchCardSalesAmount || 0), 0);
+      const voucherSales = pumperNonCashInputs[`${pumperId}_voucher`] !== undefined && pumperNonCashInputs[`${pumperId}_voucher`] !== ''
+        ? Math.round(Number(pumperNonCashInputs[`${pumperId}_voucher`]) * 100) / 100
+        : targetReadings.reduce((sum, r) => sum + (r.voucherSalesAmount || 0), 0);
+
       await savePumperReconciliation(supabase, {
         id: `${activeShift.id}_${pumperId}`,
         shift_id: activeShift.id,
         pumper_id: pumperId,
         pumper_name: pumperName,
-        handed_over_cash: 0,
-        actual_cash: 0,
+        handed_over_cash: handedOver,
+        actual_cash: handedOver,
         expected_cash: 0,
         cash_variance: 0,
-        credit_sales: 0,
-        card_sales: 0,
-        touch_card_sales: 0,
-        voucher_sales: 0,
+        credit_sales: creditSales,
+        card_sales: cardSales,
+        card_sale: cardSales,
+        touch_card_sales: touchCardSales,
+        touch_card: touchCardSales,
+        voucher_sales: voucherSales,
+        voucher_sale: voucherSales,
         assigned_pumps_count: targetReadings.length,
         start_meter: Math.round(avgStartMeter * 100) / 100,
         end_meter: 0,
@@ -2700,21 +2770,6 @@ export default function ShiftManagementTab({
       return dr;
     });
 
-    const targetReadings = updatedDraftReadings.filter(r => r.assignedPumperId === pumperId);
-
-    // 1. Strictly UPSERT exact values to meter_readings and pump_readings table in Supabase
-    // Wait for Supabase write confirmation before updating UI state or reloading data
-    try {
-      const { error: upsertErr } = await upsertPumpReadings(supabase, targetReadings, activeShift.id);
-      if (upsertErr) {
-        console.warn('Finalize pump readings Supabase upsert notice:', upsertErr);
-      }
-      await syncAllNonCashSales(supabase, targetReadings, activeShift.id);
-    } catch (err) {
-      console.warn('Pump readings & non-cash sync note:', err);
-    }
-
-    // Save pumper assignment & handed over cash summary to Supabase shift_pumper_assignments / pumper_assignments
     const pumperCard = pumperCardsData.find(p => p.pumperId === pumperId);
     const handedOverCash = pumperCashInputs[pumperId] !== undefined && pumperCashInputs[pumperId] !== ''
       ? Math.round(Number(pumperCashInputs[pumperId]) * 100) / 100
@@ -2738,6 +2793,30 @@ export default function ShiftManagementTab({
 
     const expCash = pumperCard ? (pumperCard.totalExpectedCash || 0) : 0;
     const variance = Math.round((handedOverCash - expCash) * 100) / 100;
+
+    const targetReadings = updatedDraftReadings.filter(r => r.assignedPumperId === pumperId);
+    const pumpCount = targetReadings.length || 1;
+
+    // Distribute/assign non-cash and cash onto targetReadings so pump_readings table receives exact values
+    targetReadings.forEach((r, idx) => {
+      r.actualCash = pumpCount === 1 ? handedOverCash : (idx === pumpCount - 1 ? Math.round((handedOverCash - Math.round((handedOverCash / pumpCount) * 100) / 100 * (pumpCount - 1)) * 100) / 100 : Math.round((handedOverCash / pumpCount) * 100) / 100);
+      r.creditSalesAmount = pumpCount === 1 ? creditSales : Math.round((creditSales / pumpCount) * 100) / 100;
+      r.cardSalesAmount = pumpCount === 1 ? cardSales : Math.round((cardSales / pumpCount) * 100) / 100;
+      r.touchCardSalesAmount = pumpCount === 1 ? touchCardSales : Math.round((touchCardSales / pumpCount) * 100) / 100;
+      r.voucherSalesAmount = pumpCount === 1 ? voucherSales : Math.round((voucherSales / pumpCount) * 100) / 100;
+    });
+
+    // 1. Strictly UPSERT exact values to meter_readings and pump_readings table in Supabase
+    // Wait for Supabase write confirmation before updating UI state or reloading data
+    try {
+      const { error: upsertErr } = await upsertPumpReadings(supabase, targetReadings, activeShift.id);
+      if (upsertErr) {
+        console.warn('Finalize pump readings Supabase upsert notice:', upsertErr);
+      }
+      await syncAllNonCashSales(supabase, targetReadings, activeShift.id);
+    } catch (err) {
+      console.warn('Pump readings & non-cash sync note:', err);
+    }
 
     const avgStartMeter = targetReadings.reduce((sum, r) => sum + (parseFloat(String(r.startMeter)) || 0), 0) / (targetReadings.length || 1);
     const avgEndMeter = targetReadings.reduce((sum, r) => sum + (parseFloat(String(r.endMeter)) || 0), 0) / (targetReadings.length || 1);
@@ -2766,11 +2845,16 @@ export default function ShiftManagementTab({
       cash_variance: variance,
       credit_sales: creditSales,
       card_sales: cardSales,
+      card_sale: cardSales,
       touch_card_sales: touchCardSales,
+      touch_card: touchCardSales,
       voucher_sales: voucherSales,
+      voucher_sale: voucherSales,
       assigned_pumps_count: pumperReadings.length,
       start_meter: Math.round(avgStartMeter * 100) / 100,
       end_meter: Math.round(avgEndMeter * 100) / 100,
+      startmeter: Math.round(avgStartMeter * 100) / 100,
+      endmeter: Math.round(avgEndMeter * 100) / 100,
       status: 'Completed',
       updated_at: new Date().toISOString()
     };
@@ -2957,20 +3041,40 @@ export default function ShiftManagementTab({
       }
       if (targetReading.assignedPumperId) {
         try {
-          const pObj = employees.find(e => e.id === targetReading.assignedPumperId);
+          const pid = targetReading.assignedPumperId;
+          const pObj = employees.find(e => e.id === pid);
+          const handedOver = pumperCashInputs[pid] !== undefined && pumperCashInputs[pid] !== ''
+            ? Math.round(Number(pumperCashInputs[pid]) * 100) / 100
+            : (targetReading.actualCash || 0);
+          const creditSales = pumperNonCashInputs[`${pid}_credit`] !== undefined && pumperNonCashInputs[`${pid}_credit`] !== ''
+            ? Math.round(Number(pumperNonCashInputs[`${pid}_credit`]) * 100) / 100
+            : (targetReading.creditSalesAmount || 0);
+          const cardSales = pumperNonCashInputs[`${pid}_card`] !== undefined && pumperNonCashInputs[`${pid}_card`] !== ''
+            ? Math.round(Number(pumperNonCashInputs[`${pid}_card`]) * 100) / 100
+            : (targetReading.cardSalesAmount || 0);
+          const touchCardSales = pumperNonCashInputs[`${pid}_touchCard`] !== undefined && pumperNonCashInputs[`${pid}_touchCard`] !== ''
+            ? Math.round(Number(pumperNonCashInputs[`${pid}_touchCard`]) * 100) / 100
+            : (targetReading.touchCardSalesAmount || 0);
+          const voucherSales = pumperNonCashInputs[`${pid}_voucher`] !== undefined && pumperNonCashInputs[`${pid}_voucher`] !== ''
+            ? Math.round(Number(pumperNonCashInputs[`${pid}_voucher`]) * 100) / 100
+            : (targetReading.voucherSalesAmount || 0);
+
           await savePumperReconciliation(supabase, {
-            id: `${activeShift.id}_${targetReading.assignedPumperId}`,
+            id: `${activeShift.id}_${pid}`,
             shift_id: activeShift.id,
-            pumper_id: targetReading.assignedPumperId,
+            pumper_id: pid,
             pumper_name: pObj?.name || 'Pumper',
-            handed_over_cash: 0,
-            actual_cash: 0,
+            handed_over_cash: handedOver,
+            actual_cash: handedOver,
             expected_cash: 0,
             cash_variance: 0,
-            credit_sales: 0,
-            card_sales: 0,
-            touch_card_sales: 0,
-            voucher_sales: 0,
+            credit_sales: creditSales,
+            card_sales: cardSales,
+            card_sale: cardSales,
+            touch_card_sales: touchCardSales,
+            touch_card: touchCardSales,
+            voucher_sales: voucherSales,
+            voucher_sale: voucherSales,
             assigned_pumps_count: 1,
             start_meter: validStart,
             end_meter: targetReading.endMeter || 0,
