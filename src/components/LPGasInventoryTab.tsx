@@ -77,12 +77,20 @@ export default function LPGasInventoryTab({ gasStock, onUpdateGasStock }: LPGasI
 
     window.addEventListener('gas-inventory-updated', handleUpdate);
     window.addEventListener('storage', handleUpdate);
-    window.addEventListener('focus', fetchGasItems);
-    
+    // Subscribe to realtime database changes on gas_inventory
+    const channel = supabase
+      .channel('lpgas-inventory-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'gas_inventory' }, () => {
+        fetchGasItems();
+      })
+      .subscribe();
+
     return () => {
       window.removeEventListener('gas-inventory-updated', handleUpdate);
+      window.removeEventListener('gas-prices-updated', handleUpdate);
       window.removeEventListener('storage', handleUpdate);
       window.removeEventListener('focus', fetchGasItems);
+      supabase.removeChannel(channel);
     };
   }, [onUpdateGasStock]);
 
@@ -95,9 +103,13 @@ export default function LPGasInventoryTab({ gasStock, onUpdateGasStock }: LPGasI
       }
       
       if (data && data.length > 0) {
+        // Map existing default items with exact Supabase selling_price
         const merged = DEFAULT_GAS_ITEMS.map(def => {
           const found = data.find((d: any) => d.id === def.id || d.size === def.size);
-          const price = found?.selling_price || found?.unit_price || getStoredGasPrice(def.size, def.selling_price || 0);
+          const rawPrice = found ? (found.selling_price ?? found.unit_price ?? found.price) : undefined;
+          const parsedPrice = (rawPrice !== undefined && rawPrice !== null && !isNaN(Number(rawPrice))) ? Number(rawPrice) : 0;
+          const price = parsedPrice > 0 ? parsedPrice : getStoredGasPrice(def.size, def.selling_price || 0);
+
           return found ? {
             ...def,
             ...found,
@@ -112,9 +124,38 @@ export default function LPGasInventoryTab({ gasStock, onUpdateGasStock }: LPGasI
           };
         });
 
+        // Also incorporate any custom sizes from database not in default template
+        data.forEach((row: any) => {
+          const alreadyIncluded = merged.some(m => m.id === row.id || m.size === row.size);
+          if (!alreadyIncluded && row.id && row.size) {
+            const rawPrice = row.selling_price ?? row.unit_price ?? row.price;
+            const parsedPrice = Number(rawPrice) || 0;
+            merged.push({
+              id: row.id,
+              size: row.size,
+              full_count: Number(row.full_count) || 0,
+              empty_count: Number(row.empty_count) || 0,
+              selling_price: parsedPrice,
+              unit_price: parsedPrice,
+              last_updated: row.last_updated || new Date().toISOString()
+            });
+          }
+        });
+
         setGasItems(merged);
         localStorage.setItem('fuel_flow_gas_stock', JSON.stringify(merged));
         localStorage.setItem('fuel_flow_gas_inventory', JSON.stringify(merged));
+        
+        // Sync latest prices map to fuel_flow_gas_prices so all components share latest rates
+        const priceMap: Record<string, number> = {};
+        merged.forEach(item => {
+          if (item.size.includes('12.5')) priceMap['12.5kg'] = item.selling_price;
+          if (item.size.includes('5.0') || item.size === '5kg') priceMap['5kg'] = item.selling_price;
+          if (item.size.includes('2.3')) priceMap['2.3kg'] = item.selling_price;
+          if (item.size.includes('37.5')) priceMap['37.5kg'] = item.selling_price;
+        });
+        localStorage.setItem('fuel_flow_gas_prices', JSON.stringify(priceMap));
+
         if (onUpdateGasStock) {
           onUpdateGasStock(merged);
         }

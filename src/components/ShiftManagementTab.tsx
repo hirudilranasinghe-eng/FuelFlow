@@ -196,11 +196,13 @@ export default function ShiftManagementTab({
             if (item.size === '12.5 kg' || item.id === 'gas-12.5kg') pMap['12.5kg'] = item.selling_price || item.unit_price || 3690;
             if (item.size === '5.0 kg' || item.id === 'gas-5.0kg' || item.id === 'gas-5kg') pMap['5kg'] = item.selling_price || item.unit_price || 1482;
             if (item.size === '2.3 kg' || item.id === 'gas-2.3kg') pMap['2.3kg'] = item.selling_price || item.unit_price || 694;
+            if (item.size === '37.5 kg' || item.id === 'gas-37.5kg') pMap['37.5kg'] = item.selling_price || item.unit_price || 11200;
           });
           return {
             '12.5kg': pMap['12.5kg'] || 3690,
             '5kg': pMap['5kg'] || 1482,
-            '2.3kg': pMap['2.3kg'] || 694
+            '2.3kg': pMap['2.3kg'] || 694,
+            '37.5kg': pMap['37.5kg'] || 11200
           };
         }
       }
@@ -208,15 +210,94 @@ export default function ShiftManagementTab({
     return {
       '12.5kg': 3690,
       '5kg': 1482,
-      '2.3kg': 694
+      '2.3kg': 694,
+      '37.5kg': 11200
     };
   };
 
-  // Listen for live LP Gas price updates from Admin Tariff tab
+  // Dynamic LP Gas prices directly hydrated from Supabase gas_inventory database table
+  const [dynamicGasPrices, setDynamicGasPrices] = useState<{ [key: string]: number }>(() => getActiveGasPrices());
+
+  const getDynamicGasUnitPrice = (typeOrSizeOrId: string, fallbackPrice = 0): number => {
+    const key = (typeOrSizeOrId || '').toLowerCase();
+    if (key.includes('12.5')) return dynamicGasPrices['12.5kg'] || fallbackPrice || 3690;
+    if (key.includes('5.0') || key.includes('5kg') || key === '5') return dynamicGasPrices['5kg'] || fallbackPrice || 1482;
+    if (key.includes('2.3')) return dynamicGasPrices['2.3kg'] || fallbackPrice || 694;
+    if (key.includes('37.5')) return dynamicGasPrices['37.5kg'] || fallbackPrice || 11200;
+    return dynamicGasPrices[typeOrSizeOrId] || fallbackPrice || 0;
+  };
+
+  // Dynamically fetch LP gas prices directly from Supabase gas_inventory table
+  const fetchDynamicGasPricesFromDb = async () => {
+    try {
+      const { data, error } = await supabase.from('gas_inventory').select('*');
+      if (!error && data && data.length > 0) {
+        const pMap: { [key: string]: number } = {};
+        data.forEach((row: any) => {
+          const rawPrice = row.selling_price ?? row.unit_price ?? row.price;
+          const price = Number(rawPrice) || 0;
+          if (price > 0) {
+            const id = String(row.id || '').toLowerCase();
+            const size = String(row.size || '').toLowerCase();
+            if (id.includes('12.5') || size.includes('12.5')) {
+              pMap['12.5kg'] = price;
+              pMap['gas-12.5kg'] = price;
+            } else if (id.includes('37.5') || size.includes('37.5')) {
+              pMap['37.5kg'] = price;
+              pMap['gas-37.5kg'] = price;
+            } else if (id.includes('5.0') || id.includes('5kg') || size.includes('5.0') || size.includes('5kg')) {
+              pMap['5kg'] = price;
+              pMap['gas-5kg'] = price;
+            } else if (id.includes('2.3') || size.includes('2.3')) {
+              pMap['2.3kg'] = price;
+              pMap['gas-2.3kg'] = price;
+            }
+          }
+        });
+
+        setDynamicGasPrices(prev => ({ ...prev, ...pMap }));
+        localStorage.setItem('fuel_flow_gas_prices', JSON.stringify(pMap));
+
+        // Hydrate unit prices in draftCounterSales in real-time so counter sales reflect updated prices instantly
+        setDraftCounterSales(prev => {
+          if (!prev?.gasSales || prev.gasSales.length === 0) return prev;
+          let changed = false;
+          const updatedGas = prev.gasSales.map(item => {
+            const livePrice = pMap[item.type] || pMap[item.gasItemId] || (item.size?.includes('12.5') ? pMap['12.5kg'] : item.size?.includes('5') ? pMap['5kg'] : item.size?.includes('2.3') ? pMap['2.3kg'] : undefined);
+            if (livePrice && livePrice !== item.unitPrice) {
+              changed = true;
+              return {
+                ...item,
+                unitPrice: livePrice,
+                totalAmount: (item.quantity || 0) * livePrice
+              };
+            }
+            return item;
+          });
+          if (!changed) return prev;
+          const totalGas = updatedGas.reduce((s, g) => s + (g.totalAmount || 0), 0);
+          const totalLube = prev.totalLubeSales || 0;
+          return {
+            ...prev,
+            gasSales: updatedGas,
+            totalGasSales: totalGas,
+            totalCounterRevenue: totalGas + totalLube
+          };
+        });
+      }
+    } catch (err) {
+      console.warn('Notice: Error fetching dynamic gas prices in ShiftManagementTab:', err);
+    }
+  };
+
+  // Listen for live LP Gas price updates from Supabase gas_inventory table & Admin Tariff tab
   useEffect(() => {
+    fetchDynamicGasPricesFromDb();
+
     const handleGasPriceChange = (e: Event) => {
       const customEvent = e as CustomEvent;
       const prices = customEvent.detail?.updatedPrices || getActiveGasPrices();
+      setDynamicGasPrices(prev => ({ ...prev, ...prices }));
       
       setDraftCounterSales(prev => {
         const updatedGas = (prev.gasSales || []).map(item => {
@@ -224,6 +305,7 @@ export default function ShiftManagementTab({
           if (item.type === '12.5kg' || item.size?.includes('12.5')) newPrice = prices['12.5kg'] || newPrice;
           if (item.type === '5kg' || item.size?.includes('5.0') || item.size?.includes('5kg')) newPrice = prices['5kg'] || newPrice;
           if (item.type === '2.3kg' || item.size?.includes('2.3')) newPrice = prices['2.3kg'] || newPrice;
+          if (item.type === '37.5kg' || item.size?.includes('37.5')) newPrice = prices['37.5kg'] || newPrice;
           return {
             ...item,
             unitPrice: newPrice,
@@ -242,19 +324,32 @@ export default function ShiftManagementTab({
     };
 
     window.addEventListener('gas-prices-updated', handleGasPriceChange);
+    window.addEventListener('gas-inventory-updated', fetchDynamicGasPricesFromDb);
     window.addEventListener('storage', handleGasPriceChange);
+    window.addEventListener('focus', fetchDynamicGasPricesFromDb);
+
+    // Realtime postgres changes channel for gas_inventory
+    const channel = supabase
+      .channel('shift-mgmt-gas-prices-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'gas_inventory' }, () => {
+        fetchDynamicGasPricesFromDb();
+      })
+      .subscribe();
 
     return () => {
       window.removeEventListener('gas-prices-updated', handleGasPriceChange);
+      window.removeEventListener('gas-inventory-updated', fetchDynamicGasPricesFromDb);
       window.removeEventListener('storage', handleGasPriceChange);
+      window.removeEventListener('focus', fetchDynamicGasPricesFromDb);
+      supabase.removeChannel(channel);
     };
   }, []);
+
   const getDefaultGasSales = (): ShiftGasSale[] => {
-    const prices = getActiveGasPrices();
     return [
-      { gasItemId: 'gas-12.5kg', size: '12.5 kg', type: '12.5kg', quantity: 0, unitPrice: prices['12.5kg'] || 3690, totalAmount: 0 },
-      { gasItemId: 'gas-5kg', size: '5.0 kg', type: '5kg', quantity: 0, unitPrice: prices['5kg'] || 1482, totalAmount: 0 },
-      { gasItemId: 'gas-2.3kg', size: '2.3 kg', type: '2.3kg', quantity: 0, unitPrice: prices['2.3kg'] || 694, totalAmount: 0 }
+      { gasItemId: 'gas-12.5kg', size: '12.5 kg', type: '12.5kg', quantity: 0, unitPrice: getDynamicGasUnitPrice('12.5kg', 3690), totalAmount: 0 },
+      { gasItemId: 'gas-5kg', size: '5.0 kg', type: '5kg', quantity: 0, unitPrice: getDynamicGasUnitPrice('5kg', 1482), totalAmount: 0 },
+      { gasItemId: 'gas-2.3kg', size: '2.3 kg', type: '2.3kg', quantity: 0, unitPrice: getDynamicGasUnitPrice('2.3kg', 694), totalAmount: 0 }
     ];
   };
 
@@ -4293,12 +4388,15 @@ export default function ShiftManagementTab({
                   </div>
 
                   <div className="grid grid-cols-3 gap-1.5">
-                    {(draftCounterSales.gasSales || defaultGasSales).map((item, idx) => (
+                    {(draftCounterSales.gasSales || defaultGasSales).map((item, idx) => {
+                      const dynamicUnitPrice = getDynamicGasUnitPrice(item.type || item.size || item.gasItemId, item.unitPrice);
+                      const itemTotal = (item.quantity || 0) * dynamicUnitPrice;
+                      return (
                       <div key={`gas-sale-${item.type}`} className="p-2 bg-amber-50/50 rounded-lg border border-amber-100 flex flex-col justify-between">
                         <div>
                           <div className="flex items-baseline justify-between gap-1">
                             <span className="text-[11px] font-bold text-gray-900 truncate">{item.type}</span>
-                            <span className="text-[9px] text-gray-500 font-semibold tabular-nums">Rs {item.unitPrice.toLocaleString()}</span>
+                            <span className="text-[9px] text-gray-500 font-semibold tabular-nums">Rs {dynamicUnitPrice.toLocaleString()}</span>
                           </div>
                           <div className="mt-1.5 flex items-center gap-1">
                             <label className="text-[10px] text-gray-500 font-medium shrink-0">Qty:</label>
@@ -4311,14 +4409,20 @@ export default function ShiftManagementTab({
                                 const newQty = Math.max(0, parseInt(e.target.value) || 0);
                                 const currentGas = draftCounterSales.gasSales || defaultGasSales;
                                 const updatedGas = currentGas.map((g, gIdx) => {
+                                  const uPrice = getDynamicGasUnitPrice(g.type || g.size || g.gasItemId, g.unitPrice);
                                   if (gIdx === idx) {
                                     return {
                                       ...g,
                                       quantity: newQty,
-                                      totalAmount: newQty * g.unitPrice
+                                      unitPrice: uPrice,
+                                      totalAmount: newQty * uPrice
                                     };
                                   }
-                                  return g;
+                                  return {
+                                    ...g,
+                                    unitPrice: uPrice,
+                                    totalAmount: (g.quantity || 0) * uPrice
+                                  };
                                 });
                                 const gasTotal = updatedGas.reduce((s, g) => s + g.totalAmount, 0);
                                 const lubeTotal = (draftCounterSales.lubeSales || []).reduce((s, l) => s + l.totalAmount, 0);
@@ -4341,11 +4445,12 @@ export default function ShiftManagementTab({
                         <div className="mt-1.5 pt-1 border-t border-amber-100/80 flex justify-between items-center text-[10px]">
                           <span className="text-gray-400">Total:</span>
                           <span className="font-extrabold text-amber-900 tabular-nums">
-                            {formatCurrency(item.totalAmount)}
+                            {formatCurrency(itemTotal)}
                           </span>
                         </div>
                       </div>
-                    ))}
+                    );
+                  })}
                   </div>
                 </div>
 
@@ -4409,7 +4514,7 @@ export default function ShiftManagementTab({
                           ];
                         }
 
-                        const gasTotal = (draftCounterSales.gasSales || defaultGasSales).reduce((s, g) => s + g.totalAmount, 0);
+                        const gasTotal = (draftCounterSales.gasSales || defaultGasSales).reduce((s, g) => s + ((g.quantity || 0) * getDynamicGasUnitPrice(g.type || g.size || g.gasItemId, g.unitPrice)), 0);
                         const lubeTotal = updatedLubes.reduce((s, l) => s + l.totalAmount, 0);
                         const newCounterState: ShiftCounterSales = {
                           ...draftCounterSales,
@@ -4455,7 +4560,7 @@ export default function ShiftManagementTab({
                                     }
                                     return l;
                                   });
-                                  const gasTotal = (draftCounterSales.gasSales || defaultGasSales).reduce((s, g) => s + g.totalAmount, 0);
+                                  const gasTotal = (draftCounterSales.gasSales || defaultGasSales).reduce((s, g) => s + ((g.quantity || 0) * getDynamicGasUnitPrice(g.type || g.size || g.gasItemId, g.unitPrice)), 0);
                                   const lubeTotal = updated.reduce((s, l) => s + l.totalAmount, 0);
                                   const newCounterState: ShiftCounterSales = {
                                     ...draftCounterSales,
@@ -4481,7 +4586,7 @@ export default function ShiftManagementTab({
                               type="button"
                               onClick={() => {
                                 const updated = (draftCounterSales.lubeSales || []).filter((_, idx) => idx !== lIdx);
-                                const gasTotal = (draftCounterSales.gasSales || defaultGasSales).reduce((s, g) => s + g.totalAmount, 0);
+                                const gasTotal = (draftCounterSales.gasSales || defaultGasSales).reduce((s, g) => s + ((g.quantity || 0) * getDynamicGasUnitPrice(g.type || g.size || g.gasItemId, g.unitPrice)), 0);
                                 const lubeTotal = updated.reduce((s, l) => s + l.totalAmount, 0);
                                 const newCounterState: ShiftCounterSales = {
                                   ...draftCounterSales,

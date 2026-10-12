@@ -730,12 +730,23 @@ export default function AdminControlTab({
     };
 
     window.addEventListener('gas-prices-updated', handleGasPricesUpdated);
+    window.addEventListener('gas-inventory-updated', fetchLatestGasPrices);
     window.addEventListener('focus', fetchLatestGasPrices);
+
+    const channel = supabase
+      .channel('admin-gas-prices-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'gas_inventory' }, () => {
+        fetchLatestGasPrices();
+      })
+      .subscribe();
+
     return () => {
       window.removeEventListener('gas-prices-updated', handleGasPricesUpdated);
+      window.removeEventListener('gas-inventory-updated', fetchLatestGasPrices);
       window.removeEventListener('focus', fetchLatestGasPrices);
+      supabase.removeChannel(channel);
     };
-  }, []);
+  }, [activeSubTab]);
 
   const [isUpdatingGasPrices, setIsUpdatingGasPrices] = useState(false);
 
