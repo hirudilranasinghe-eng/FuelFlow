@@ -562,6 +562,38 @@ export async function fetchSupabaseAuthUsers(
 }
 
 /**
+ * Robust visibility extractor:
+ * If an explicit permission record has can_view: false (or is_visible: false), STRICTLY respect false.
+ * Never fall back to default true when can_view is false.
+ */
+export function extractVisibility(record: any): boolean {
+  if (!record || typeof record !== 'object') return true;
+
+  // Strict check: if can_view or is_visible is explicitly false (or 0 / 'false'), immediately return false
+  if (record.can_view === false || record.can_view === 'false' || record.can_view === 0) return false;
+  if (record.canView === false || record.canView === 'false' || record.canView === 0) return false;
+  if (record.is_visible === false || record.is_visible === 'false' || record.is_visible === 0) return false;
+  if (record.isVisible === false || record.isVisible === 'false' || record.isVisible === 0) return false;
+
+  // If explicitly true
+  if (record.can_view === true || record.can_view === 'true' || record.can_view === 1) return true;
+  if (record.canView === true || record.canView === 'true' || record.canView === 1) return true;
+  if (record.is_visible === true || record.is_visible === 'true' || record.is_visible === 1) return true;
+  if (record.isVisible === true || record.isVisible === 'true' || record.isVisible === 1) return true;
+
+  return true;
+}
+
+/**
+ * Universal module key extractor mapping seamlessly across module_id, module_key, and module fields
+ */
+export function extractModuleKey(row: any): string {
+  if (!row || typeof row !== 'object') return '';
+  const raw = row.module_id || row.module_key || row.module || row.moduleId || row.moduleKey || row.permission_key || row.permissionKey || row.mod || '';
+  return String(raw).trim();
+}
+
+/**
  * Fetch all user-specific permission overrides from Supabase `user_permissions` table
  * Merges authoritative Supabase overrides with cached permissions to guarantee persistent state on page reload
  */
@@ -586,37 +618,40 @@ export async function fetchUserPermissionsFromSupabase(client: any): Promise<Use
 
       data.forEach((row: any) => {
         const uId = String(row.user_id || row.userId || '').trim();
-        const mod = row.module || row.module_key;
-        if (!uId || !mod) return;
+        const rawMod = extractModuleKey(row);
+        if (!uId || !rawMod) return;
 
-        const canon = canonicalModuleId(mod);
+        const canon = canonicalModuleId(rawMod);
+        const isVis = extractVisibility(row);
+
         const rule = {
-          canView: row.is_visible ?? row.can_view ?? row.isVisible ?? row.canView ?? true,
+          canView: isVis,
+          can_view: isVis,
+          is_visible: isVis,
           canCreate: row.can_create ?? row.canCreate ?? false,
           canEdit: row.can_edit ?? row.canEdit ?? false,
           canDelete: row.can_delete ?? row.canDelete ?? false,
           canExport: row.can_export ?? row.canExport ?? false,
         };
 
-        // Index under original uId
-        if (!updatedMap[uId]) updatedMap[uId] = {};
-        updatedMap[uId][mod] = rule;
-        updatedMap[uId][canon] = rule;
+        const mapUserAliases = (key: string) => {
+          if (!key) return;
+          if (!updatedMap[key]) updatedMap[key] = {};
+          updatedMap[key][rawMod] = rule;
+          updatedMap[key][canon] = rule;
+          updatedMap[key][rawMod.replace(/-/g, '_')] = rule;
+          updatedMap[key][rawMod.replace(/_/g, '-')] = rule;
+          updatedMap[key][`module_${canon}`] = rule;
+        };
 
-        // Index under lowercase uId
-        const lowerUid = uId.toLowerCase();
-        if (lowerUid !== uId) {
-          if (!updatedMap[lowerUid]) updatedMap[lowerUid] = {};
-          updatedMap[lowerUid][mod] = rule;
-          updatedMap[lowerUid][canon] = rule;
-        }
+        // Index under original uId and lowercase uId
+        mapUserAliases(uId);
+        mapUserAliases(uId.toLowerCase());
 
         // If row has user_name or email, index those as aliases
         const rowEmail = String(row.email || row.user_email || '').trim().toLowerCase();
         if (rowEmail) {
-          if (!updatedMap[rowEmail]) updatedMap[rowEmail] = {};
-          updatedMap[rowEmail][mod] = rule;
-          updatedMap[rowEmail][canon] = rule;
+          mapUserAliases(rowEmail);
         }
       });
 
@@ -719,21 +754,24 @@ export async function fetchAndHydrateActiveUserPermissions(
             (userName && (rowName === userName || rowUid === userName || rowName.includes(userName)));
 
           if (isMatch) {
-            const mod = row.module || row.module_key;
-            if (mod) {
-              const canon = canonicalModuleId(mod);
-              const isVis = row.is_visible ?? row.can_view ?? row.isVisible ?? row.canView ?? true;
+            const rawMod = extractModuleKey(row);
+            if (rawMod) {
+              const canon = canonicalModuleId(rawMod);
+              const isVis = extractVisibility(row);
               const rule = {
                 canView: isVis,
+                can_view: isVis,
+                is_visible: isVis,
                 canCreate: row.can_create ?? row.canCreate ?? false,
                 canEdit: row.can_edit ?? row.canEdit ?? false,
                 canDelete: row.can_delete ?? row.canDelete ?? false,
                 canExport: row.can_export ?? row.canExport ?? false,
               };
-              activeRules[mod] = rule;
+              activeRules[rawMod] = rule;
               activeRules[canon] = rule;
-              activeRules[mod.replace(/-/g, '_')] = rule;
-              activeRules[mod.replace(/_/g, '-')] = rule;
+              activeRules[rawMod.replace(/-/g, '_')] = rule;
+              activeRules[rawMod.replace(/_/g, '-')] = rule;
+              activeRules[`module_${canon}`] = rule;
             }
           }
         });
@@ -829,13 +867,15 @@ export async function saveUserPermissionsToSupabase(
     if (userMods) {
       Object.keys(userMods).forEach(moduleId => {
         const p = userMods[moduleId];
-        const isVis = !!p.canView;
+        const isVis = extractVisibility(p);
         records.push({
           id: `${uId.toLowerCase().replace(/[^a-z0-9_-]/g, '_')}_${moduleId}`,
           user_id: uId,
           user_name: targetUserInfo?.name || null,
           user_role: targetUserInfo?.role || null,
           module: moduleId,
+          module_key: moduleId,
+          module_id: moduleId,
           is_visible: isVis,
           can_view: isVis,
           can_create: !!p.canCreate,
@@ -853,6 +893,7 @@ export async function saveUserPermissionsToSupabase(
   // 3. Adaptive database upsert supporting both 'module_key', 'module', and 'module_id' schemas
   // Determine if column name can be detected from existing rows
   let candidateCols: Array<'module_key' | 'module' | 'module_id'> = ['module_key', 'module', 'module_id'];
+  let detectedKeys: string[] = [];
   try {
     const { data: probeData } = await client
       .from('user_permissions')
@@ -860,12 +901,12 @@ export async function saveUserPermissionsToSupabase(
       .limit(1);
 
     if (probeData && probeData.length > 0) {
-      const keys = Object.keys(probeData[0]);
-      if (keys.includes('module_key')) {
+      detectedKeys = Object.keys(probeData[0]);
+      if (detectedKeys.includes('module_key')) {
         candidateCols = ['module_key', 'module', 'module_id'];
-      } else if (keys.includes('module')) {
+      } else if (detectedKeys.includes('module')) {
         candidateCols = ['module', 'module_key', 'module_id'];
-      } else if (keys.includes('module_id')) {
+      } else if (detectedKeys.includes('module_id')) {
         candidateCols = ['module_id', 'module_key', 'module'];
       }
     }
@@ -874,40 +915,52 @@ export async function saveUserPermissionsToSupabase(
   let lastSaveError: any = null;
 
   for (const colName of candidateCols) {
-    // Build full payload for candidate column
-    const fullPayload = records.map(r => ({
-      id: r.id,
-      user_id: r.user_id,
-      [colName]: r.module,
-      is_visible: r.is_visible,
-      can_view: r.can_view,
-      can_create: r.can_create,
-      can_edit: r.can_edit,
-      can_delete: r.can_delete,
-      can_export: r.can_export,
-      user_name: r.user_name,
-      user_role: r.user_role,
-      updated_at: r.updated_at
-    }));
+    // Build full payload for candidate column, including all matching columns if detected
+    const fullPayload = records.map(r => {
+      const obj: any = {
+        id: r.id,
+        user_id: r.user_id,
+        [colName]: r.module,
+        is_visible: r.is_visible,
+        can_view: r.can_view,
+        can_create: r.can_create,
+        can_edit: r.can_edit,
+        can_delete: r.can_delete,
+        can_export: r.can_export,
+        user_name: r.user_name,
+        user_role: r.user_role,
+        updated_at: r.updated_at
+      };
+      if (detectedKeys.includes('module_key')) obj.module_key = r.module;
+      if (detectedKeys.includes('module')) obj.module = r.module;
+      if (detectedKeys.includes('module_id')) obj.module_id = r.module;
+      return obj;
+    });
 
     // Build core payload (stripped non-essential metadata)
-    const corePayload = records.map(r => ({
-      id: r.id,
-      user_id: r.user_id,
-      [colName]: r.module,
-      is_visible: r.is_visible,
-      can_create: r.can_create,
-      can_edit: r.can_edit,
-      can_delete: r.can_delete,
-      can_export: r.can_export
-    }));
+    const corePayload = records.map(r => {
+      const obj: any = {
+        id: r.id,
+        user_id: r.user_id,
+        [colName]: r.module,
+        is_visible: r.is_visible,
+        can_create: r.can_create,
+        can_edit: r.can_edit,
+        can_delete: r.can_delete,
+        can_export: r.can_export
+      };
+      if (detectedKeys.includes('module_key')) obj.module_key = r.module;
+      if (detectedKeys.includes('module')) obj.module = r.module;
+      if (detectedKeys.includes('module_id')) obj.module_id = r.module;
+      return obj;
+    });
 
     // Build legacy payload (can_view instead of is_visible)
     const legacyPayload = records.map(r => ({
       id: r.id,
       user_id: r.user_id,
       [colName]: r.module,
-      can_view: r.can_view ?? r.is_visible ?? true,
+      can_view: r.can_view,
       can_create: r.can_create,
       can_edit: r.can_edit,
       can_delete: r.can_delete,
@@ -1119,6 +1172,7 @@ export async function clearUserPermissionOverrides(
  * Prioritized Permission Evaluator:
  * 1. Checks if specific user has an override in `user_permissions` (matched by id, email, or name).
  *    If an individual user override exists, it is 100% authoritative (takes priority over role & admin bypass).
+ *    Strictly respects can_view: false - never falls back to default true if an explicit permission record exists.
  * 2. If no user override exists, System Admin has full access.
  * 3. Falls back to `role_permissions` matrix according to the user's role.
  */
@@ -1158,26 +1212,19 @@ export function checkUserPermission(
     (userEmail && uMap[userEmail.toLowerCase()]) ||
     (userName && uMap[userName.toLowerCase()]);
 
-  // System Admin default: System Admin always has full access unless an explicit user-specific override is configured for this specific admin account
-  if (normRole === 'System Admin') {
-    if (!matchedUserRules) {
-      return true;
-    }
-  }
-
+  // If user has an explicit individual override for this module, it is 100% authoritative over both role and admin defaults
   if (matchedUserRules) {
     const userModRule = matchedUserRules[canon] ||
       matchedUserRules[moduleId] ||
       matchedUserRules[moduleId.replace(/-/g, '_')] ||
-      matchedUserRules[moduleId.replace(/_/g, '-')];
+      matchedUserRules[moduleId.replace(/_/g, '-')] ||
+      matchedUserRules[`module_${canon}`];
 
     if (userModRule) {
       switch (action) {
         case 'view':
-          if ((userModRule as any).is_visible !== undefined) return !!(userModRule as any).is_visible;
-          if (userModRule.canView !== undefined) return !!userModRule.canView;
-          if ((userModRule as any).can_view !== undefined) return !!(userModRule as any).can_view;
-          return true;
+          // Strictly respect can_view: false - never fall back to true when can_view is false!
+          return extractVisibility(userModRule);
         case 'create':
           return userModRule.canCreate !== undefined ? !!userModRule.canCreate : !!(userModRule as any).can_create;
         case 'edit':
@@ -1192,7 +1239,7 @@ export function checkUserPermission(
     }
   }
 
-  // 2. System Admin default bypass when no explicit rule for this module exists
+  // 2. System Admin default bypass ONLY when no explicit override for this module was configured
   if (normRole === 'System Admin') {
     return true;
   }
@@ -1202,7 +1249,7 @@ export function checkUserPermission(
   const roleRules = map[normRole] || map['Supervisor'];
 
   if (!roleRules) {
-    return action === 'view' ? canon !== 'admin' : false;
+    return action === 'view' ? canon !== 'admin_control' : false;
   }
 
   const modRule = roleRules[canon] ||
@@ -1211,15 +1258,12 @@ export function checkUserPermission(
     roleRules[moduleId.replace(/_/g, '-') as SystemModuleId];
 
   if (!modRule) {
-    return action === 'view' ? canon !== 'admin' : false;
+    return action === 'view' ? canon !== 'admin_control' : false;
   }
 
   switch (action) {
     case 'view':
-      if ((modRule as any).is_visible !== undefined) return !!(modRule as any).is_visible;
-      if (modRule.canView !== undefined) return !!modRule.canView;
-      if ((modRule as any).can_view !== undefined) return !!(modRule as any).can_view;
-      return true;
+      return extractVisibility(modRule);
     case 'create':
       return modRule.canCreate !== undefined ? !!modRule.canCreate : !!(modRule as any).can_create;
     case 'edit':

@@ -36,6 +36,7 @@ import {
   getCachedRolePermissions, 
   getCachedUserPermissions, 
   checkUserPermission, 
+  isModuleVisible,
   fetchRolePermissionsFromSupabase, 
   fetchUserPermissionsFromSupabase,
   fetchAndHydrateActiveUserPermissions,
@@ -93,7 +94,43 @@ export default function App() {
     };
   }, []);
 
+  const ALL_MODULE_TABS = [
+    { id: 'dashboard', moduleKey: 'dashboard' },
+    { id: 'shift', moduleKey: 'shift_management' },
+    { id: 'pumper-short-excess', moduleKey: 'pumper_short_excess' },
+    { id: 'deposits', moduleKey: 'deposits' },
+    { id: 'stock', moduleKey: 'fuel_stock' },
+    { id: 'oil-storage', moduleKey: 'oil_storage' },
+    { id: 'gas-inventory', moduleKey: 'gas_inventory' },
+    { id: 'purchases', moduleKey: 'purchases' },
+    { id: 'manual-dip-record', moduleKey: 'manual_dip_record' },
+    { id: 'reports', moduleKey: 'reports' },
+    { id: 'customers', moduleKey: 'customers' },
+    { id: 'admin', moduleKey: 'admin_control' }
+  ];
+
+  // Route Guard: If activeTab has can_view: false, automatically redirect to first permitted module
+  useEffect(() => {
+    if (user && !isCheckingAuth) {
+      const allowed = isModuleVisible(user, activeTab, rolePermissions, userPermissions);
+      if (!allowed) {
+        const firstPermitted = ALL_MODULE_TABS.find(t => 
+          isModuleVisible(user, t.id, rolePermissions, userPermissions) || 
+          isModuleVisible(user, t.moduleKey, rolePermissions, userPermissions)
+        );
+        if (firstPermitted && firstPermitted.id !== activeTab) {
+          setActiveTab(firstPermitted.id);
+        }
+      }
+    }
+  }, [user, activeTab, rolePermissions, userPermissions, isCheckingAuth]);
+
   const handleSetActiveTab = (tab: string, subTab?: string) => {
+    // Strictly prevent navigation if user has can_view: false
+    if (!isModuleVisible(user, tab, rolePermissions, userPermissions)) {
+      console.warn(`Route Guard: Navigation blocked to "${tab}" because can_view is false.`);
+      return;
+    }
     setActiveTab(tab);
     if (tab === 'reports') {
       setReportSubTab(subTab || 'daily-sales');
@@ -1933,16 +1970,34 @@ export default function App() {
           </div>
         )}
         <AnimatePresence mode="wait">
-          <motion.div
-            key={activeTab}
-            id={`tab-content-wrapper-${activeTab}`}
-            initial={{ opacity: 0, y: 15 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -15 }}
-            transition={{ duration: 0.25, ease: 'easeInOut' }}
-            className="w-full h-full"
-          >
-            {activeTab === 'dashboard' && (
+          {!isModuleVisible(user, activeTab, rolePermissions, userPermissions) ? (
+            <motion.div
+              key="access-restricted-screen"
+              id="access-restricted-screen"
+              initial={{ opacity: 0, scale: 0.98 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0 }}
+              className="min-h-[50vh] flex flex-col items-center justify-center p-8 bg-white rounded-3xl border border-gray-100 shadow-sm text-center animate-fade-in"
+            >
+              <div className="w-14 h-14 rounded-2xl bg-rose-50 text-rose-600 flex items-center justify-center mb-4 shadow-2xs">
+                <ShieldCheck className="w-7 h-7 text-rose-600" />
+              </div>
+              <h2 className="text-base font-extrabold text-[#1C1C1C]">Access Restricted</h2>
+              <p className="text-xs text-gray-500 max-w-md mt-1 mb-5">
+                You do not have view permissions (<code className="bg-rose-50 text-rose-700 px-1.5 py-0.5 rounded font-mono font-bold text-[11px]">can_view: false</code>) for this module.
+              </p>
+            </motion.div>
+          ) : (
+            <motion.div
+              key={activeTab}
+              id={`tab-content-wrapper-${activeTab}`}
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+              transition={{ duration: 0.25, ease: 'easeInOut' }}
+              className="w-full h-full"
+            >
+              {activeTab === 'dashboard' && (
               <DashboardTab
                 employees={employees}
                 tanks={tanks}
@@ -2164,6 +2219,7 @@ export default function App() {
               />
             )}
           </motion.div>
+        )}
         </AnimatePresence>
       </div>
     </div>
