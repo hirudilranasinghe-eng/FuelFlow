@@ -271,63 +271,6 @@ export default function RolePermissionsTab({
     setHasUnsavedChanges(true);
   };
 
-  // Copy standard role default into this user's custom override
-  const handleCopyRoleDefaultToUser = (userId: string) => {
-    if (!selectedUser) return;
-    const norm = normalizeRoleName(selectedUser.role);
-    const roleBase = rolePermissions[norm] || rolePermissions['Supervisor'];
-
-    setUserPermissions(prev => ({
-      ...prev,
-      [userId]: JSON.parse(JSON.stringify(roleBase))
-    }));
-    setHasUnsavedChanges(true);
-    showToast(`Copied ${norm} baseline permissions into ${selectedUser.name}'s override profile.`);
-  };
-
-  // Grant full access specifically to this user
-  const handleGrantAllToUser = (userId: string) => {
-    if (!selectedUser) return;
-    const fullAccess: any = {};
-    SYSTEM_MODULES.forEach(m => {
-      fullAccess[m.id] = {
-        canView: true,
-        canCreate: true,
-        canEdit: true,
-        canDelete: true,
-        canExport: true
-      };
-    });
-
-    setUserPermissions(prev => ({
-      ...prev,
-      [userId]: fullAccess
-    }));
-    setHasUnsavedChanges(true);
-    showToast(`Granted full access override to ${selectedUser.name}.`);
-  };
-
-  // Set read-only specifically to this user
-  const handleSetUserReadOnly = (userId: string) => {
-    if (!selectedUser) return;
-    const readOnly: any = {};
-    SYSTEM_MODULES.forEach(m => {
-      readOnly[m.id] = {
-        canView: m.id !== 'admin',
-        canCreate: false,
-        canEdit: false,
-        canDelete: false,
-        canExport: true
-      };
-    });
-
-    setUserPermissions(prev => ({
-      ...prev,
-      [userId]: readOnly
-    }));
-    setHasUnsavedChanges(true);
-    showToast(`Set ${selectedUser.name} to Read-Only override profile.`);
-  };
 
   // Toggle user column
   const handleToggleUserColumn = (userId: string, actionKey: PermissionActionKey) => {
@@ -516,41 +459,7 @@ export default function RolePermissionsTab({
           </div>
 
           {/* Action Buttons & Save */}
-          <div className="flex items-center gap-2 flex-wrap">
-            <button
-              type="button"
-              onClick={() => handleCopyRoleDefaultToUser(selectedUserId)}
-              className="px-3 py-2 bg-gray-50 hover:bg-gray-100 text-gray-700 border border-gray-200 text-xs font-bold rounded-xl transition-all cursor-pointer shadow-2xs"
-              title="Initialize with standard role permissions"
-            >
-              Copy Role Defaults
-            </button>
-            <button
-              type="button"
-              onClick={() => handleGrantAllToUser(selectedUserId)}
-              className="px-3 py-2 bg-blue-50 hover:bg-blue-100 text-blue-700 text-xs font-bold rounded-xl transition-all cursor-pointer"
-            >
-              Grant All
-            </button>
-            <button
-              type="button"
-              onClick={() => handleSetUserReadOnly(selectedUserId)}
-              className="px-3 py-2 bg-amber-50 hover:bg-amber-100 text-amber-800 text-xs font-bold rounded-xl transition-all cursor-pointer"
-            >
-              Read-Only
-            </button>
-            {selectedUserHasOverride && (
-              <button
-                onClick={() => handleClearUserOverrides(selectedUserId)}
-                type="button"
-                className="px-3 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer shadow-2xs"
-                title="Revert user to role defaults"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                <span>Revert to Role Default</span>
-              </button>
-            )}
-
+          <div className="flex items-center gap-2">
             <button
               onClick={handleSaveAllChanges}
               disabled={isSaving}
@@ -594,9 +503,19 @@ export default function RolePermissionsTab({
                     Role: {selectedUser.role}
                   </span>
                   {selectedUserHasOverride ? (
-                    <span className="text-[10px] font-extrabold px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300 flex items-center gap-1">
-                      <CheckCircle2 className="w-3 h-3" /> Individual Override Active
-                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] font-extrabold px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300 flex items-center gap-1">
+                        <CheckCircle2 className="w-3 h-3" /> Individual Override Active
+                      </span>
+                      <button
+                        onClick={() => handleClearUserOverrides(selectedUserId)}
+                        type="button"
+                        className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 flex items-center gap-1 cursor-pointer transition-colors shadow-2xs"
+                        title="Revert user to role defaults"
+                      >
+                        <RotateCcw className="w-2.5 h-2.5" /> Revert to Default
+                      </button>
+                    </div>
                   ) : (
                     <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-gray-200 text-gray-700">
                       Inheriting {selectedUserNormRole} Role Defaults

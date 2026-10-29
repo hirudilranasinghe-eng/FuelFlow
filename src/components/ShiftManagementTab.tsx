@@ -759,6 +759,7 @@ export default function ShiftManagementTab({
   const lastSyncedShiftIdRef = React.useRef<string | null>(null);
 
   React.useEffect(() => {
+    let isMounted = true;
     if (activeShift) {
       if (lastSyncedShiftIdRef.current === activeShift.id) {
         return;
@@ -1078,6 +1079,7 @@ export default function ShiftManagementTab({
           fetchForecourtOilReconciliation(supabase, activeShift.id),
           fetchShiftPumpReadings(supabase, activeShift.id)
         ]).then(([cData, cardData, tcData, vData, reconciledList, forecourtOilList, remotePumpReadings]) => {
+          if (!isMounted) return;
           if (reconciledList && reconciledList.length > 0) {
             const rehydratedCash: Record<string, string> = {};
             const rehydratedNonCash: Record<string, string> = {};
@@ -1137,196 +1139,193 @@ export default function ShiftManagementTab({
           }
 
           if ((cData && cData.length > 0) || (cardData && cardData.length > 0) || (tcData && tcData.length > 0) || (vData && vData.length > 0) || (reconciledList && reconciledList.length > 0) || (forecourtOilList && forecourtOilList.length > 0) || (remotePumpReadings && remotePumpReadings.length > 0)) {
-            setDraftReadings(prev => {
-              if (!prev || prev.length === 0) return prev;
-              let hasChanges = false;
-              const updated = prev.map(r => {
-                const isOil = r.pumpId === 'pump-oil-bay' || r.fuelType === 'Oil & Lubricants' || r.pumpName?.toLowerCase().includes('dispenser') || r.pumpName?.toLowerCase().includes('oil');
-                let updatedChambers = r.chamberReadings;
+            let hasChanges = false;
+            const updated = ensuredReadings.map(r => {
+              const isOil = r.pumpId === 'pump-oil-bay' || r.fuelType === 'Oil & Lubricants' || r.pumpName?.toLowerCase().includes('dispenser') || r.pumpName?.toLowerCase().includes('oil');
+              let updatedChambers = r.chamberReadings;
 
-                if (isOil && forecourtOilList && forecourtOilList.length > 0) {
-                  const baseChambers = (r.chamberReadings && r.chamberReadings.length > 0)
-                    ? r.chamberReadings
-                    : getDefaultChambers(oilTanks);
+              if (isOil && forecourtOilList && forecourtOilList.length > 0) {
+                const baseChambers = (r.chamberReadings && r.chamberReadings.length > 0)
+                  ? r.chamberReadings
+                  : getDefaultChambers(oilTanks);
 
-                  updatedChambers = baseChambers.map((baseCh, idx) => {
-                    const chId = baseCh.chamberId || `ch_${idx + 1}`;
-                    const chNum = baseCh.chamberNumber || (idx + 1);
-                    const matched = forecourtOilList.find((f: any) =>
-                      (f.chamber_id && f.chamber_id === chId) ||
-                      (f.chamberId && f.chamberId === chId) ||
-                      (f.chamber_number && Number(f.chamber_number) === chNum) ||
-                      (f.chamberNumber && Number(f.chamberNumber) === chNum)
-                    );
-                    if (!matched) return baseCh;
+                updatedChambers = baseChambers.map((baseCh, idx) => {
+                  const chId = baseCh.chamberId || `ch_${idx + 1}`;
+                  const chNum = baseCh.chamberNumber || (idx + 1);
+                  const matched = forecourtOilList.find((f: any) =>
+                    (f.chamber_id && f.chamber_id === chId) ||
+                    (f.chamberId && f.chamberId === chId) ||
+                    (f.chamber_number && Number(f.chamber_number) === chNum) ||
+                    (f.chamberNumber && Number(f.chamberNumber) === chNum)
+                  );
+                  if (!matched) return baseCh;
 
-                    const op = Number(matched.opening_liters ?? matched.openingLiters ?? matched.opening_level ?? matched.openingLevel ?? baseCh.openingLevel ?? baseCh.openingLiters ?? 0);
-                    const rec = Number(matched.received_liters ?? matched.receivedLiters ?? matched.received_level ?? matched.receivedLevel ?? baseCh.receivedLevel ?? baseCh.receivedLiters ?? 0);
-                    const cl = Number(matched.closing_liters ?? matched.closingLiters ?? matched.closing_level ?? matched.closingLevel ?? baseCh.closingLevel ?? baseCh.closingLiters ?? 0);
-                    const sold = calculateChamberSoldLiters(op, cl, rec);
-                    const rate = Number(matched.rate_per_liter ?? matched.ratePerLiter ?? baseCh.ratePerLiter ?? 0);
-                    const total = Math.round(sold * rate * 100) / 100;
+                  const op = Number(matched.opening_liters ?? matched.openingLiters ?? matched.opening_level ?? matched.openingLevel ?? baseCh.openingLevel ?? baseCh.openingLiters ?? 0);
+                  const rec = Number(matched.received_liters ?? matched.receivedLiters ?? matched.received_level ?? matched.receivedLevel ?? baseCh.receivedLevel ?? baseCh.receivedLiters ?? 0);
+                  const cl = Number(matched.closing_liters ?? matched.closingLiters ?? matched.closing_level ?? matched.closingLevel ?? baseCh.closingLevel ?? baseCh.closingLiters ?? 0);
+                  const sold = calculateChamberSoldLiters(op, cl, rec);
+                  const rate = Number(matched.rate_per_liter ?? matched.ratePerLiter ?? baseCh.ratePerLiter ?? 0);
+                  const total = Math.round(sold * rate * 100) / 100;
 
-                    return {
-                      ...baseCh,
-                      chamberId: chId,
-                      chamberNumber: chNum,
-                      grade: matched.grade || baseCh.grade,
-                      openingLiters: op,
-                      openingLevel: op,
-                      receivedLiters: rec,
-                      receivedLevel: rec,
-                      closingLiters: cl,
-                      closingLevel: cl,
-                      soldLiters: sold,
-                      ratePerLiter: rate,
-                      totalAmount: total
-                    };
-                  });
-                }
-
-                const cMatch = cData?.find((c: any) => (c.pump_id || c.pumpid) === r.pumpId || (r.assignedPumperId && (c.pumper_id || c.pumperid) === r.assignedPumperId));
-                const cardMatch = cardData?.find((cd: any) => (cd.pump_id || cd.pumpid) === r.pumpId || (r.assignedPumperId && (cd.pumper_id || cd.pumperid) === r.assignedPumperId));
-                const tcMatch = tcData?.find((t: any) => (t.pump_id || t.pumpid) === r.pumpId || (r.assignedPumperId && (t.pumper_id || t.pumperid) === r.assignedPumperId));
-                const vMatch = vData?.find((v: any) => (v.pump_id || v.pumpid) === r.pumpId || (r.assignedPumperId && (v.pumper_id || v.pumperid) === r.assignedPumperId));
-                const recMatch = reconciledList?.find((rec: any) => (rec.pumper_id || rec.pumperId) === r.assignedPumperId);
-
-                // Check direct remote pump_readings table match
-                const remoteReadingMatch = remotePumpReadings?.find((rp: any) => 
-                  (rp.pump_id || rp.pumpid) === r.pumpId || 
-                  (r.id && rp.id === r.id) ||
-                  (r.assignedPumperId && (rp.assigned_pumper_id || rp.assignedpumperid) === r.assignedPumperId && (rp.pump_id || rp.pumpid) === r.pumpId)
-                );
-
-                const remCredit = Number(remoteReadingMatch?.credit_sales_amount ?? remoteReadingMatch?.creditsalesamount ?? remoteReadingMatch?.credit_sales ?? remoteReadingMatch?.creditsales) || 0;
-                const remCard = Number(remoteReadingMatch?.card_sales_amount ?? remoteReadingMatch?.cardsalesamount ?? remoteReadingMatch?.card_sales ?? remoteReadingMatch?.card_sale ?? remoteReadingMatch?.cardsales) || 0;
-                const remTc = Number(remoteReadingMatch?.touch_card_sales_amount ?? remoteReadingMatch?.touchcardsalesamount ?? remoteReadingMatch?.touch_card_sales ?? remoteReadingMatch?.touch_card ?? remoteReadingMatch?.touchcardsales) || 0;
-                const remV = Number(remoteReadingMatch?.voucher_sales_amount ?? remoteReadingMatch?.vouchersalesamount ?? remoteReadingMatch?.voucher_sales ?? remoteReadingMatch?.voucher_sale ?? remoteReadingMatch?.vouchersales) || 0;
-                const remCash = Number(remoteReadingMatch?.actual_cash ?? remoteReadingMatch?.actualcash ?? remoteReadingMatch?.handed_over_cash ?? remoteReadingMatch?.handedovercash) || 0;
-
-                const cAmount = cMatch ? Number(cMatch.amount || cMatch.credit_amount || cMatch.total_amount) : (recMatch && (recMatch.credit_sales ?? recMatch.creditsales) !== undefined ? Number(recMatch.credit_sales ?? recMatch.creditsales) : (remCredit > 0 ? remCredit : r.creditSalesAmount));
-                const cardAmount = cardMatch ? Number(cardMatch.amount || cardMatch.card_amount || cardMatch.total_amount) : (recMatch && (recMatch.card_sales ?? recMatch.card_sale ?? recMatch.cardsales) !== undefined ? Number(recMatch.card_sales ?? recMatch.card_sale ?? recMatch.cardsales) : (remCard > 0 ? remCard : r.cardSalesAmount));
-                const tcAmount = tcMatch ? Number(tcMatch.amount || tcMatch.touch_card_amount || tcMatch.total_amount) : (recMatch && (recMatch.touch_card_sales ?? recMatch.touch_card ?? recMatch.touchcardsales) !== undefined ? Number(recMatch.touch_card_sales ?? recMatch.touch_card ?? recMatch.touchcardsales) : (remTc > 0 ? remTc : r.touchCardSalesAmount));
-                const vAmount = vMatch ? Number(vMatch.amount || vMatch.voucher_amount || vMatch.total_amount) : (recMatch && (recMatch.voucher_sales ?? recMatch.voucher_sale ?? recMatch.vouchersales) !== undefined ? Number(recMatch.voucher_sales ?? recMatch.voucher_sale ?? recMatch.vouchersales) : (remV > 0 ? remV : r.voucherSalesAmount));
-
-                const recCash = recMatch ? (Number(recMatch.handed_over_cash ?? recMatch.handedovercash ?? recMatch.actual_cash ?? recMatch.actualcash) || 0) : (remCash > 0 ? remCash : 0);
-                const recCompleted = recMatch?.status === 'Completed';
-
-                const assignedPumps = prev.filter(p => p.assignedPumperId === r.assignedPumperId);
-                const pCount = assignedPumps.length || 1;
-                const targetCash = (r.actualCash && r.actualCash > 0) ? r.actualCash : (pCount === 1 ? recCash : Math.round((recCash / pCount) * 100) / 100);
-
-                // Start Meter and End Meter rehydration from remote pump_readings & reconciliation
-                let nextStartMeter = r.startMeter;
-                let nextEndMeter = r.endMeter;
-                let nextTestingQty = r.testingQty;
-                let nextIsStartSaved = r.isStartSaved;
-
-                if (remoteReadingMatch) {
-                  const remStart = remoteReadingMatch.start_meter !== undefined ? Number(remoteReadingMatch.start_meter) : (remoteReadingMatch.startmeter !== undefined ? Number(remoteReadingMatch.startmeter) : undefined);
-                  const remEnd = remoteReadingMatch.end_meter !== undefined ? Number(remoteReadingMatch.end_meter) : (remoteReadingMatch.endmeter !== undefined ? Number(remoteReadingMatch.endmeter) : undefined);
-                  const remTest = remoteReadingMatch.testing_qty !== undefined ? Number(remoteReadingMatch.testing_qty) : (remoteReadingMatch.testingqty !== undefined ? Number(remoteReadingMatch.testingqty) : undefined);
-
-                  if (remStart !== undefined && !isNaN(remStart) && (remStart > 0 || remoteReadingMatch.is_start_saved || remoteReadingMatch.is_locked)) {
-                    nextStartMeter = remStart;
-                    nextIsStartSaved = true;
-                  }
-                  if (remEnd !== undefined && !isNaN(remEnd) && remEnd > 0) {
-                    nextEndMeter = remEnd;
-                  }
-                  if (remTest !== undefined && !isNaN(remTest) && remTest > 0) {
-                    nextTestingQty = remTest;
-                  }
-                } else if (recMatch) {
-                  const recStart = recMatch.start_meter !== undefined ? Number(recMatch.start_meter) : (recMatch.startmeter !== undefined ? Number(recMatch.startmeter) : undefined);
-                  const recEnd = recMatch.end_meter !== undefined ? Number(recMatch.end_meter) : (recMatch.endmeter !== undefined ? Number(recMatch.endmeter) : undefined);
-                  if (recStart !== undefined && !isNaN(recStart) && recStart > 0 && (!nextStartMeter || nextStartMeter === 0)) {
-                    nextStartMeter = recStart;
-                    nextIsStartSaved = true;
-                  }
-                  if (recEnd !== undefined && !isNaN(recEnd) && recEnd > 0 && (!nextEndMeter || nextEndMeter === 0)) {
-                    nextEndMeter = recEnd;
-                  }
-                }
-
-                const nextActualCash = targetCash > 0 ? targetCash : r.actualCash;
-                const nextCredit = cAmount !== undefined && cAmount > 0 ? cAmount : r.creditSalesAmount;
-                const nextCard = cardAmount !== undefined && cardAmount > 0 ? cardAmount : r.cardSalesAmount;
-                const nextTc = tcAmount !== undefined && tcAmount > 0 ? tcAmount : r.touchCardSalesAmount;
-                const nextVoucher = vAmount !== undefined && vAmount > 0 ? vAmount : r.voucherSalesAmount;
-                const nextIsFinalized = recCompleted ? true : (remoteReadingMatch?.status === 'Completed' ? true : r.isCardFinalized);
-                const nextIsLocked = recCompleted ? true : (remoteReadingMatch?.is_locked !== undefined ? remoteReadingMatch.is_locked : (remoteReadingMatch?.islocked !== undefined ? remoteReadingMatch.islocked : r.isLocked));
-                const nextStatus = recCompleted ? 'Completed' as const : (remoteReadingMatch?.status ? (remoteReadingMatch.status as any) : r.status);
-                const nextOilSales = updatedChambers ? updatedChambers.reduce((sum, ch) => sum + (ch.totalAmount || 0), 0) : (r.oilSalesAmount || 0);
-
-                if (
-                  nextStartMeter !== r.startMeter ||
-                  nextEndMeter !== r.endMeter ||
-                  nextTestingQty !== r.testingQty ||
-                  nextIsStartSaved !== r.isStartSaved ||
-                  nextActualCash !== r.actualCash ||
-                  nextCredit !== r.creditSalesAmount ||
-                  nextCard !== r.cardSalesAmount ||
-                  nextTc !== r.touchCardSalesAmount ||
-                  nextVoucher !== r.voucherSalesAmount ||
-                  nextIsFinalized !== r.isCardFinalized ||
-                  nextIsLocked !== r.isLocked ||
-                  nextStatus !== r.status ||
-                  nextOilSales !== r.oilSalesAmount ||
-                  updatedChambers !== r.chamberReadings
-                ) {
-                  hasChanges = true;
                   return {
-                    ...r,
-                    startMeter: nextStartMeter,
-                    endMeter: nextEndMeter,
-                    testingQty: nextTestingQty,
-                    isStartSaved: nextIsStartSaved,
-                    actualCash: nextActualCash,
-                    creditSalesAmount: nextCredit,
-                    cardSalesAmount: nextCard,
-                    touchCardSalesAmount: nextTc,
-                    voucherSalesAmount: nextVoucher,
-                    isCardFinalized: nextIsFinalized,
-                    isLocked: nextIsLocked,
-                    status: nextStatus,
-                    chamberReadings: updatedChambers,
-                    oilSalesAmount: nextOilSales
+                    ...baseCh,
+                    chamberId: chId,
+                    chamberNumber: chNum,
+                    grade: matched.grade || baseCh.grade,
+                    openingLiters: op,
+                    openingLevel: op,
+                    receivedLiters: rec,
+                    receivedLevel: rec,
+                    closingLiters: cl,
+                    closingLevel: cl,
+                    soldLiters: sold,
+                    ratePerLiter: rate,
+                    totalAmount: total
                   };
+                });
+              }
+
+              const cMatch = cData?.find((c: any) => (c.pump_id || c.pumpid) === r.pumpId || (r.assignedPumperId && (c.pumper_id || c.pumperid) === r.assignedPumperId));
+              const cardMatch = cardData?.find((cd: any) => (cd.pump_id || cd.pumpid) === r.pumpId || (r.assignedPumperId && (cd.pumper_id || cd.pumperid) === r.assignedPumperId));
+              const tcMatch = tcData?.find((t: any) => (t.pump_id || t.pumpid) === r.pumpId || (r.assignedPumperId && (t.pumper_id || t.pumperid) === r.assignedPumperId));
+              const vMatch = vData?.find((v: any) => (v.pump_id || v.pumpid) === r.pumpId || (r.assignedPumperId && (v.pumper_id || v.pumperid) === r.assignedPumperId));
+              const recMatch = reconciledList?.find((rec: any) => (rec.pumper_id || rec.pumperId) === r.assignedPumperId);
+
+              // Check direct remote pump_readings table match
+              const remoteReadingMatch = remotePumpReadings?.find((rp: any) => 
+                (rp.pump_id || rp.pumpid) === r.pumpId || 
+                (r.id && rp.id === r.id) ||
+                (r.assignedPumperId && (rp.assigned_pumper_id || rp.assignedpumperid) === r.assignedPumperId && (rp.pump_id || rp.pumpid) === r.pumpId)
+              );
+
+              const remCredit = Number(remoteReadingMatch?.credit_sales_amount ?? remoteReadingMatch?.creditsalesamount ?? remoteReadingMatch?.credit_sales ?? remoteReadingMatch?.creditsales) || 0;
+              const remCard = Number(remoteReadingMatch?.card_sales_amount ?? remoteReadingMatch?.cardsalesamount ?? remoteReadingMatch?.card_sales ?? remoteReadingMatch?.card_sale ?? remoteReadingMatch?.cardsales) || 0;
+              const remTc = Number(remoteReadingMatch?.touch_card_sales_amount ?? remoteReadingMatch?.touchcardsalesamount ?? remoteReadingMatch?.touch_card_sales ?? remoteReadingMatch?.touch_card ?? remoteReadingMatch?.touchcardsales) || 0;
+              const remV = Number(remoteReadingMatch?.voucher_sales_amount ?? remoteReadingMatch?.vouchersalesamount ?? remoteReadingMatch?.voucher_sales ?? remoteReadingMatch?.voucher_sale ?? remoteReadingMatch?.vouchersales) || 0;
+              const remCash = Number(remoteReadingMatch?.actual_cash ?? remoteReadingMatch?.actualcash ?? remoteReadingMatch?.handed_over_cash ?? remoteReadingMatch?.handedovercash) || 0;
+
+              const cAmount = cMatch ? Number(cMatch.amount || cMatch.credit_amount || cMatch.total_amount) : (recMatch && (recMatch.credit_sales ?? recMatch.creditsales) !== undefined ? Number(recMatch.credit_sales ?? recMatch.creditsales) : (remCredit > 0 ? remCredit : r.creditSalesAmount));
+              const cardAmount = cardMatch ? Number(cardMatch.amount || cardMatch.card_amount || cardMatch.total_amount) : (recMatch && (recMatch.card_sales ?? recMatch.card_sale ?? recMatch.cardsales) !== undefined ? Number(recMatch.card_sales ?? recMatch.card_sale ?? recMatch.cardsales) : (remCard > 0 ? remCard : r.cardSalesAmount));
+              const tcAmount = tcMatch ? Number(tcMatch.amount || tcMatch.touch_card_amount || tcMatch.total_amount) : (recMatch && (recMatch.touch_card_sales ?? recMatch.touch_card ?? recMatch.touchcardsales) !== undefined ? Number(recMatch.touch_card_sales ?? recMatch.touch_card ?? recMatch.touchcardsales) : (remTc > 0 ? remTc : r.touchCardSalesAmount));
+              const vAmount = vMatch ? Number(vMatch.amount || vMatch.voucher_amount || vMatch.total_amount) : (recMatch && (recMatch.voucher_sales ?? recMatch.voucher_sale ?? recMatch.vouchersales) !== undefined ? Number(recMatch.voucher_sales ?? recMatch.voucher_sale ?? recMatch.vouchersales) : (remV > 0 ? remV : r.voucherSalesAmount));
+
+              const recCash = recMatch ? (Number(recMatch.handed_over_cash ?? recMatch.handedovercash ?? recMatch.actual_cash ?? recMatch.actualcash) || 0) : (remCash > 0 ? remCash : 0);
+              const recCompleted = recMatch?.status === 'Completed';
+
+              const assignedPumps = ensuredReadings.filter(p => p.assignedPumperId === r.assignedPumperId);
+              const pCount = assignedPumps.length || 1;
+              const targetCash = (r.actualCash && r.actualCash > 0) ? r.actualCash : (pCount === 1 ? recCash : Math.round((recCash / pCount) * 100) / 100);
+
+              // Start Meter and End Meter rehydration from remote pump_readings & reconciliation
+              let nextStartMeter = r.startMeter;
+              let nextEndMeter = r.endMeter;
+              let nextTestingQty = r.testingQty;
+              let nextIsStartSaved = r.isStartSaved;
+
+              if (remoteReadingMatch) {
+                const remStart = remoteReadingMatch.start_meter !== undefined ? Number(remoteReadingMatch.start_meter) : (remoteReadingMatch.startmeter !== undefined ? Number(remoteReadingMatch.startmeter) : undefined);
+                const remEnd = remoteReadingMatch.end_meter !== undefined ? Number(remoteReadingMatch.end_meter) : (remoteReadingMatch.endmeter !== undefined ? Number(remoteReadingMatch.endmeter) : undefined);
+                const remTest = remoteReadingMatch.testing_qty !== undefined ? Number(remoteReadingMatch.testing_qty) : (remoteReadingMatch.testingqty !== undefined ? Number(remoteReadingMatch.testingqty) : undefined);
+
+                if (remStart !== undefined && !isNaN(remStart) && (remStart > 0 || remoteReadingMatch.is_start_saved || remoteReadingMatch.is_locked)) {
+                  nextStartMeter = remStart;
+                  nextIsStartSaved = true;
                 }
-                return r;
+                if (remEnd !== undefined && !isNaN(remEnd) && remEnd > 0) {
+                  nextEndMeter = remEnd;
+                }
+                if (remTest !== undefined && !isNaN(remTest) && remTest > 0) {
+                  nextTestingQty = remTest;
+                }
+              } else if (recMatch) {
+                const recStart = recMatch.start_meter !== undefined ? Number(recMatch.start_meter) : (recMatch.startmeter !== undefined ? Number(recMatch.startmeter) : undefined);
+                const recEnd = recMatch.end_meter !== undefined ? Number(recMatch.end_meter) : (recMatch.endmeter !== undefined ? Number(recMatch.endmeter) : undefined);
+                if (recStart !== undefined && !isNaN(recStart) && recStart > 0 && (!nextStartMeter || nextStartMeter === 0)) {
+                  nextStartMeter = recStart;
+                  nextIsStartSaved = true;
+                }
+                if (recEnd !== undefined && !isNaN(recEnd) && recEnd > 0 && (!nextEndMeter || nextEndMeter === 0)) {
+                  nextEndMeter = recEnd;
+                }
+              }
+
+              const nextActualCash = targetCash > 0 ? targetCash : r.actualCash;
+              const nextCredit = cAmount !== undefined && cAmount > 0 ? cAmount : r.creditSalesAmount;
+              const nextCard = cardAmount !== undefined && cardAmount > 0 ? cardAmount : r.cardSalesAmount;
+              const nextTc = tcAmount !== undefined && tcAmount > 0 ? tcAmount : r.touchCardSalesAmount;
+              const nextVoucher = vAmount !== undefined && vAmount > 0 ? vAmount : r.voucherSalesAmount;
+              const nextIsFinalized = recCompleted ? true : (remoteReadingMatch?.status === 'Completed' ? true : r.isCardFinalized);
+              const nextIsLocked = recCompleted ? true : (remoteReadingMatch?.is_locked !== undefined ? remoteReadingMatch.is_locked : (remoteReadingMatch?.islocked !== undefined ? remoteReadingMatch.islocked : r.isLocked));
+              const nextStatus = recCompleted ? 'Completed' as const : (remoteReadingMatch?.status ? (remoteReadingMatch.status as any) : r.status);
+              const nextOilSales = updatedChambers ? updatedChambers.reduce((sum, ch) => sum + (ch.totalAmount || 0), 0) : (r.oilSalesAmount || 0);
+
+              if (
+                nextStartMeter !== r.startMeter ||
+                nextEndMeter !== r.endMeter ||
+                nextTestingQty !== r.testingQty ||
+                nextIsStartSaved !== r.isStartSaved ||
+                nextActualCash !== r.actualCash ||
+                nextCredit !== r.creditSalesAmount ||
+                nextCard !== r.cardSalesAmount ||
+                nextTc !== r.touchCardSalesAmount ||
+                nextVoucher !== r.voucherSalesAmount ||
+                nextIsFinalized !== r.isCardFinalized ||
+                nextIsLocked !== r.isLocked ||
+                nextStatus !== r.status ||
+                nextOilSales !== r.oilSalesAmount ||
+                updatedChambers !== r.chamberReadings
+              ) {
+                hasChanges = true;
+                return {
+                  ...r,
+                  startMeter: nextStartMeter,
+                  endMeter: nextEndMeter,
+                  testingQty: nextTestingQty,
+                  isStartSaved: nextIsStartSaved,
+                  actualCash: nextActualCash,
+                  creditSalesAmount: nextCredit,
+                  cardSalesAmount: nextCard,
+                  touchCardSalesAmount: nextTc,
+                  voucherSalesAmount: nextVoucher,
+                  isCardFinalized: nextIsFinalized,
+                  isLocked: nextIsLocked,
+                  status: nextStatus,
+                  chamberReadings: updatedChambers,
+                  oilSalesAmount: nextOilSales
+                };
+              }
+              return r;
+            });
+
+            if (hasChanges && isMounted) {
+              setDraftReadings(updated);
+
+              let totalFuel = 0;
+              let totalNet = 0;
+              let totalSales = 0;
+
+              updated.forEach(dr => {
+                const isOil = dr.pumpId === 'pump-oil-bay' || dr.fuelType === 'Oil & Lubricants' || dr.pumpName?.toLowerCase().includes('dispenser') || dr.pumpName?.toLowerCase().includes('oil');
+                const fuel = isOil ? 0 : Math.max(0, dr.endMeter - dr.startMeter);
+                const net = isOil ? 0 : Math.max(0, fuel - dr.testingQty);
+                const fuelRev = isOil ? 0 : (net * getPriceForFuelType(dr.fuelType));
+                const oilRev = dr.oilSalesAmount || 0;
+                totalFuel += fuel;
+                totalNet += net;
+                totalSales += (fuelRev + oilRev);
               });
 
-              if (hasChanges) {
-                let totalFuel = 0;
-                let totalNet = 0;
-                let totalSales = 0;
-
-                updated.forEach(dr => {
-                  const isOil = dr.pumpId === 'pump-oil-bay' || dr.fuelType === 'Oil & Lubricants' || dr.pumpName?.toLowerCase().includes('dispenser') || dr.pumpName?.toLowerCase().includes('oil');
-                  const fuel = isOil ? 0 : Math.max(0, dr.endMeter - dr.startMeter);
-                  const net = isOil ? 0 : Math.max(0, fuel - dr.testingQty);
-                  const fuelRev = isOil ? 0 : (net * getPriceForFuelType(dr.fuelType));
-                  const oilRev = dr.oilSalesAmount || 0;
-                  totalFuel += fuel;
-                  totalNet += net;
-                  totalSales += (fuelRev + oilRev);
-                });
-
-                setActiveShift(prevShift => {
-                  if (!prevShift) return prevShift;
-                  return {
-                    ...prevShift,
-                    pumpReadings: updated,
-                    totalFuelSold: totalFuel,
-                    totalNetSold: totalNet,
-                    totalNetSales: totalSales
-                  };
-                });
-                return updated;
-              }
-              return prev;
-            });
+              setActiveShift(prevShift => {
+                if (!prevShift) return prevShift;
+                return {
+                  ...prevShift,
+                  pumpReadings: updated,
+                  totalFuelSold: totalFuel,
+                  totalNetSold: totalNet,
+                  totalNetSales: totalSales
+                };
+              });
+            }
           }
         }).catch(err => {
           console.warn("Notice: Error loading non-cash sales & pumper reconciliations for active shift:", err);
@@ -1355,6 +1354,9 @@ export default function ShiftManagementTab({
       });
       setCommittedCounterSales(null);
     }
+    return () => {
+      isMounted = false;
+    };
   }, [activeShift?.id, pumps, tanks, oilTanks]);
 
   // Fetch latest recorded end meters for pumps from Supabase for automatic start meter carryover
