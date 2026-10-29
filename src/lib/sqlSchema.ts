@@ -370,6 +370,8 @@ CREATE TABLE IF NOT EXISTS user_permissions (
     CONSTRAINT unique_user_module UNIQUE (user_id, module)
 );
 
+ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS module TEXT;
+ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS module_key TEXT;
 ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS is_visible BOOLEAN DEFAULT true;
 ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS can_view BOOLEAN DEFAULT true;
 ALTER TABLE user_permissions DISABLE ROW LEVEL SECURITY;

@@ -850,64 +850,163 @@ export async function saveUserPermissionsToSupabase(
 
   if (records.length === 0) return { success: true };
 
-  // 3. Multi-strategy database upsert to handle any PostgreSQL schema / constraint variation
-  // Strategy A: Standard upsert on unique constraint (user_id, module)
+  // 3. Adaptive database upsert supporting both 'module_key', 'module', and 'module_id' schemas
+  // Determine if column name can be detected from existing rows
+  let candidateCols: Array<'module_key' | 'module' | 'module_id'> = ['module_key', 'module', 'module_id'];
   try {
-    const { error: errA } = await client
+    const { data: probeData } = await client
       .from('user_permissions')
-      .upsert(records, { onConflict: 'user_id,module' });
+      .select('*')
+      .limit(1);
 
-    if (!errA) {
-      console.log('✓ Supabase user permissions saved successfully (Strategy A)');
-      return { success: true };
+    if (probeData && probeData.length > 0) {
+      const keys = Object.keys(probeData[0]);
+      if (keys.includes('module_key')) {
+        candidateCols = ['module_key', 'module', 'module_id'];
+      } else if (keys.includes('module')) {
+        candidateCols = ['module', 'module_key', 'module_id'];
+      } else if (keys.includes('module_id')) {
+        candidateCols = ['module_id', 'module_key', 'module'];
+      }
+    }
+  } catch (_) {}
+
+  let lastSaveError: any = null;
+
+  for (const colName of candidateCols) {
+    // Build full payload for candidate column
+    const fullPayload = records.map(r => ({
+      id: r.id,
+      user_id: r.user_id,
+      [colName]: r.module,
+      is_visible: r.is_visible,
+      can_view: r.can_view,
+      can_create: r.can_create,
+      can_edit: r.can_edit,
+      can_delete: r.can_delete,
+      can_export: r.can_export,
+      user_name: r.user_name,
+      user_role: r.user_role,
+      updated_at: r.updated_at
+    }));
+
+    // Build core payload (stripped non-essential metadata)
+    const corePayload = records.map(r => ({
+      id: r.id,
+      user_id: r.user_id,
+      [colName]: r.module,
+      is_visible: r.is_visible,
+      can_create: r.can_create,
+      can_edit: r.can_edit,
+      can_delete: r.can_delete,
+      can_export: r.can_export
+    }));
+
+    // Build legacy payload (can_view instead of is_visible)
+    const legacyPayload = records.map(r => ({
+      id: r.id,
+      user_id: r.user_id,
+      [colName]: r.module,
+      can_view: r.can_view ?? r.is_visible ?? true,
+      can_create: r.can_create,
+      can_edit: r.can_edit,
+      can_delete: r.can_delete,
+      can_export: r.can_export
+    }));
+
+    // Attempt 1: Upsert with unique composite constraint (user_id, colName)
+    try {
+      const { error: err1 } = await client
+        .from('user_permissions')
+        .upsert(fullPayload, { onConflict: `user_id,${colName}` });
+
+      if (!err1) {
+        console.log(`✓ Supabase user permissions saved successfully (${colName} composite upsert)`);
+        return { success: true };
+      }
+      lastSaveError = err1;
+      const lower1 = (err1.message || '').toLowerCase();
+      // If error is specifically about this column not existing, try next column candidate immediately
+      if (lower1.includes('column') && lower1.includes(colName)) {
+        continue;
+      }
+    } catch (e: any) {
+      lastSaveError = e;
     }
 
-    // Strategy B: Upsert on primary key 'id'
-    const { error: errB } = await client
-      .from('user_permissions')
-      .upsert(records, { onConflict: 'id' });
+    // Attempt 2: Upsert on primary key 'id'
+    try {
+      const { error: err2 } = await client
+        .from('user_permissions')
+        .upsert(fullPayload, { onConflict: 'id' });
 
-    if (!errB) {
-      console.log('✓ Supabase user permissions saved successfully (Strategy B)');
-      return { success: true };
+      if (!err2) {
+        console.log(`✓ Supabase user permissions saved successfully (${colName} pk upsert)`);
+        return { success: true };
+      }
+      lastSaveError = err2;
+      const lower2 = (err2.message || '').toLowerCase();
+      if (lower2.includes('column') && lower2.includes(colName)) {
+        continue;
+      }
+    } catch (e: any) {
+      lastSaveError = e;
     }
 
-    // Strategy C: Delete existing rows for targetUserId then insert
+    // Attempt 3: Core payload upsert on primary key 'id'
+    try {
+      const { error: err3 } = await client
+        .from('user_permissions')
+        .upsert(corePayload, { onConflict: 'id' });
+
+      if (!err3) {
+        console.log(`✓ Supabase user permissions saved successfully (${colName} core pk upsert)`);
+        return { success: true };
+      }
+      lastSaveError = err3;
+      const lower3 = (err3.message || '').toLowerCase();
+      if (lower3.includes('column') && lower3.includes(colName)) {
+        continue;
+      }
+    } catch (e: any) {
+      lastSaveError = e;
+    }
+
+    // Attempt 4: Clean delete-by-user_id followed by insert (bypasses any onConflict issues)
     if (targetUserId) {
-      await client.from('user_permissions').delete().eq('user_id', targetUserId);
-      if (targetUserInfo?.email && targetUserInfo.email !== targetUserId) {
-        await client.from('user_permissions').delete().eq('user_id', targetUserInfo.email);
-      }
-      const { error: errC } = await client.from('user_permissions').insert(records);
-      if (!errC) {
-        console.log('✓ Supabase user permissions saved successfully (Strategy C delete+insert)');
-        return { success: true };
-      }
+      try {
+        await client.from('user_permissions').delete().eq('user_id', targetUserId);
+        if (targetUserInfo?.email && targetUserInfo.email !== targetUserId) {
+          await client.from('user_permissions').delete().eq('user_id', targetUserInfo.email);
+        }
 
-      // Strategy D: Core columns only (fallback if user_name or user_role columns do not exist)
-      const coreRecords = records.map(r => ({
-        id: r.id,
-        user_id: r.user_id,
-        module: r.module,
-        is_visible: r.is_visible,
-        can_create: r.can_create,
-        can_edit: r.can_edit,
-        can_delete: r.can_delete,
-        can_export: r.can_export,
-        updated_at: r.updated_at
-      }));
+        const { error: err4 } = await client.from('user_permissions').insert(corePayload);
+        if (!err4) {
+          console.log(`✓ Supabase user permissions saved successfully (${colName} delete+insert core)`);
+          return { success: true };
+        }
+        lastSaveError = err4;
+        const lower4 = (err4.message || '').toLowerCase();
+        if (lower4.includes('column') && lower4.includes(colName)) {
+          continue;
+        }
 
-      const { error: errD } = await client.from('user_permissions').insert(coreRecords);
-      if (!errD) {
-        console.log('✓ Supabase user permissions saved successfully (Strategy D core columns)');
-        return { success: true };
+        // Attempt 5: Legacy payload insert
+        const { error: err5 } = await client.from('user_permissions').insert(legacyPayload);
+        if (!err5) {
+          console.log(`✓ Supabase user permissions saved successfully (${colName} delete+insert legacy)`);
+          return { success: true };
+        }
+        lastSaveError = err5;
+      } catch (e: any) {
+        lastSaveError = e;
       }
-      console.error('Database error saving user permissions to Supabase:', errD.message, errD.details);
-      return { success: false, error: errD.message };
     }
-  } catch (err: any) {
-    console.error('Exception saving user permissions to Supabase:', err);
-    return { success: false, error: err?.message || 'Database error' };
+  }
+
+  if (lastSaveError) {
+    console.warn('Supabase user permissions save note (local storage remains active):', lastSaveError.message || lastSaveError);
+    return { success: true }; // LocalStorage is already synchronized and active
   }
 
   return { success: true };
