@@ -668,13 +668,31 @@ export async function saveUserPermissionsToSupabase(
   targetUserId?: string,
   targetUserInfo?: { name?: string; role?: string; email?: string }
 ): Promise<{ success: boolean; error?: string }> {
-  // 1. Update localStorage
+  // 1. Update localStorage user permissions map
   try {
     localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(userPermissionsMap));
-    if (targetUserId && userPermissionsMap[targetUserId]) {
+
+    // Determine currently logged-in user to ensure we NEVER overwrite admin active session with another user's permissions
+    let currentLoggedInUser: any = null;
+    try {
+      const stored = localStorage.getItem('fms_user') || localStorage.getItem('fuelflow_user');
+      if (stored) currentLoggedInUser = JSON.parse(stored);
+    } catch (_) {}
+
+    const isCurrentLoggedInUser = !!(currentLoggedInUser && (
+      (currentLoggedInUser.id && (currentLoggedInUser.id === targetUserId || currentLoggedInUser.id === targetUserInfo?.email)) ||
+      (currentLoggedInUser.email && (
+        currentLoggedInUser.email.toLowerCase() === (targetUserId || '').toLowerCase() || 
+        currentLoggedInUser.email.toLowerCase() === (targetUserInfo?.email || '').toLowerCase()
+      ))
+    ));
+
+    // ONLY update ACTIVE_USER_PERMS_KEY if the target user being saved IS the active session user!
+    if (isCurrentLoggedInUser && targetUserId && userPermissionsMap[targetUserId]) {
       const activeRules = { ...userPermissionsMap[targetUserId] };
       localStorage.setItem(ACTIVE_USER_PERMS_KEY, JSON.stringify(activeRules));
     }
+
     window.dispatchEvent(new CustomEvent('permissions-updated', { detail: { userPermissionsMap } }));
     window.dispatchEvent(new CustomEvent('user-permissions-updated', { detail: { userPermissionsMap } }));
     window.dispatchEvent(new Event('permissions-updated'));
@@ -685,14 +703,34 @@ export async function saveUserPermissionsToSupabase(
     return { success: true };
   }
 
-  // 2. Prepare payload
+  // 2. Prepare payload strictly isolated to target user
   const records: any[] = [];
   const now = new Date().toISOString();
 
-  const userIdsToSave = targetUserId ? [targetUserId] : Object.keys(userPermissionsMap);
+  let currentAdminEmail = '';
+  try {
+    const stored = localStorage.getItem('fms_user') || localStorage.getItem('fuelflow_user');
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      if (parsed?.email) currentAdminEmail = parsed.email.toLowerCase().trim();
+    }
+  } catch (_) {}
 
-  userIdsToSave.forEach(uId => {
-    const userMods = userPermissionsMap[uId];
+  const targetIds = new Set<string>();
+  if (targetUserId) {
+    targetIds.add(targetUserId);
+    // If target has email alias and it does not collide with admin email, save alias
+    if (targetUserInfo?.email && targetUserInfo.email !== targetUserId) {
+      if (!currentAdminEmail || targetUserInfo.email.toLowerCase().trim() !== currentAdminEmail) {
+        targetIds.add(targetUserInfo.email);
+      }
+    }
+  } else {
+    Object.keys(userPermissionsMap).forEach(k => targetIds.add(k));
+  }
+
+  targetIds.forEach(uId => {
+    const userMods = userPermissionsMap[uId] || (targetUserId ? userPermissionsMap[targetUserId] : null);
     if (userMods) {
       Object.keys(userMods).forEach(moduleId => {
         const p = userMods[moduleId];
@@ -856,34 +894,7 @@ export function checkUserPermission(
 
   const normRole = normalizeRoleName(userRole);
 
-  // 1. Strict Check for currently logged-in user's active permissions (active_user_permissions)
-  const activeUserRules = getActiveUserPermissions();
-  const activeModRule = activeUserRules[canon] ||
-    activeUserRules[moduleId] ||
-    activeUserRules[moduleId.replace(/-/g, '_')] ||
-    activeUserRules[moduleId.replace(/_/g, '-')];
-
-  if (activeModRule) {
-    switch (action) {
-      case 'view':
-        if ((activeModRule as any).is_visible !== undefined) return !!(activeModRule as any).is_visible;
-        if (activeModRule.canView !== undefined) return !!activeModRule.canView;
-        if ((activeModRule as any).can_view !== undefined) return !!(activeModRule as any).can_view;
-        return true;
-      case 'create':
-        return activeModRule.canCreate !== undefined ? !!activeModRule.canCreate : !!(activeModRule as any).can_create;
-      case 'edit':
-        return activeModRule.canEdit !== undefined ? !!activeModRule.canEdit : !!(activeModRule as any).can_edit;
-      case 'delete':
-        return activeModRule.canDelete !== undefined ? !!activeModRule.canDelete : !!(activeModRule as any).can_delete;
-      case 'export':
-        return activeModRule.canExport !== undefined ? !!activeModRule.canExport : !!(activeModRule as any).can_export;
-      default:
-        return false;
-    }
-  }
-
-  // 2. Strict Check for specific User Permissions Override in general User Permissions Map
+  // 1. Check for specific User Permissions Override in general User Permissions Map
   const uMap = userPermissionsMap || getCachedUserPermissions();
   const matchedUserRules = (userId && uMap[userId]) ||
     (userEmail && uMap[userEmail]) ||
@@ -891,6 +902,13 @@ export function checkUserPermission(
     (userId && uMap[userId.toLowerCase()]) ||
     (userEmail && uMap[userEmail.toLowerCase()]) ||
     (userName && uMap[userName.toLowerCase()]);
+
+  // System Admin default: System Admin always has full access unless an explicit user-specific override is configured for this specific admin account
+  if (normRole === 'System Admin') {
+    if (!matchedUserRules) {
+      return true;
+    }
+  }
 
   if (matchedUserRules) {
     const userModRule = matchedUserRules[canon] ||
@@ -919,7 +937,7 @@ export function checkUserPermission(
     }
   }
 
-  // 2. System Admin default bypass ONLY when NO user-specific override is configured
+  // 2. System Admin default bypass when no explicit rule for this module exists
   if (normRole === 'System Admin') {
     return true;
   }

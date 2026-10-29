@@ -64,7 +64,7 @@ export default function RolePermissionsTab({
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [lastSavedTime, setLastSavedTime] = useState<string | null>(null);
 
-  // Exclusive Supabase Authenticator User Directory (auth.users only)
+  // Combined User Directory: Supabase Auth users + station employees (supervisors, pumpers) + admin
   const authUsersList = useMemo(() => {
     const list: Array<{ 
       id: string; 
@@ -75,19 +75,7 @@ export default function RolePermissionsTab({
       isAuthUser: boolean; 
     }> = [];
 
-    // 1. Add current authenticated Supabase user session
-    if (user && user.email) {
-      list.push({
-        id: user.id || 'user_admin',
-        name: user.name || (user.email.split('@')[0]) || 'Admin User',
-        role: user.role || 'System Admin',
-        email: user.email,
-        avatarColor: user.avatarColor || 'bg-blue-600',
-        isAuthUser: true
-      });
-    }
-
-    // 2. Add active Supabase Auth accounts returned from get_supabase_auth_users() RPC
+    // 1. Add active Supabase Auth accounts returned from get_supabase_auth_users() RPC
     supabaseAuthUsers.forEach(sbUser => {
       const email = (sbUser.email || '').toLowerCase().trim();
       if (!email) return;
@@ -110,7 +98,46 @@ export default function RolePermissionsTab({
       }
     });
 
-    // 3. Fallback default account if database RPC returned no records yet
+    // 2. Add station employees (Supervisors, Pumpers, etc.) so admin can configure their access
+    employees.forEach(emp => {
+      const empEmail = `${emp.name.toLowerCase().replace(/[^a-z0-9]/g, '.')}@fuelflow.lk`;
+      const alreadyInList = list.some(u => 
+        (u.id && emp.id && u.id === emp.id) || 
+        (u.name && emp.name && u.name.toLowerCase().trim() === emp.name.toLowerCase().trim())
+      );
+      if (!alreadyInList) {
+        const normRole = normalizeRoleName(emp.role);
+        list.push({
+          id: emp.id,
+          name: emp.name,
+          role: normRole,
+          email: empEmail,
+          avatarColor: emp.avatarColor || (normRole === 'Supervisor' ? 'bg-amber-600' : 'bg-emerald-600'),
+          isAuthUser: false
+        });
+      }
+    });
+
+    // 3. Add current authenticated Supabase user session (Admin)
+    if (user && user.email) {
+      const adminEmail = user.email.toLowerCase().trim();
+      const alreadyInList = list.some(u => 
+        (u.id && user.id && u.id === user.id) || 
+        (u.email && u.email.toLowerCase().trim() === adminEmail)
+      );
+      if (!alreadyInList) {
+        list.push({
+          id: user.id || 'user_admin',
+          name: user.name || (user.email.split('@')[0]) || 'Admin User',
+          role: user.role || 'System Admin',
+          email: user.email,
+          avatarColor: user.avatarColor || 'bg-blue-600',
+          isAuthUser: true
+        });
+      }
+    }
+
+    // 4. Fallback default account if database RPC returned no records yet
     if (list.length === 0) {
       list.push({
         id: 'auth_admin_01',
@@ -123,12 +150,13 @@ export default function RolePermissionsTab({
     }
 
     return list;
-  }, [user, supabaseAuthUsers]);
+  }, [user, supabaseAuthUsers, employees]);
 
-  // Set default selected user on mount or list update
+  // Set default selected user: Prefer selecting a non-admin team member first
   useEffect(() => {
     if (!selectedUserId && authUsersList.length > 0) {
-      setSelectedUserId(authUsersList[0].id);
+      const nonAdmin = authUsersList.find(u => normalizeRoleName(u.role) !== 'System Admin');
+      setSelectedUserId(nonAdmin ? nonAdmin.id : authUsersList[0].id);
     }
   }, [authUsersList, selectedUserId]);
 
@@ -143,9 +171,57 @@ export default function RolePermissionsTab({
 
   // Check if selected user has custom specific overrides
   const selectedUserHasOverride = useMemo(() => {
-    if (!selectedUserId) return false;
-    return !!(userPermissions[selectedUserId] && Object.keys(userPermissions[selectedUserId]).length > 0);
-  }, [userPermissions, selectedUserId]);
+    if (!selectedUser) return false;
+    const uId = selectedUser.id;
+    const uEmail = selectedUser.email?.toLowerCase().trim();
+    return !!(
+      (uId && userPermissions[uId] && Object.keys(userPermissions[uId]).length > 0) ||
+      (uEmail && userPermissions[uEmail] && Object.keys(userPermissions[uEmail]).length > 0)
+    );
+  }, [userPermissions, selectedUser]);
+
+  // =========================================================================
+  // DECOUPLED TARGET USER PERMISSIONS STATE
+  // =========================================================================
+  // This state is strictly isolated to the selected target user and never leaks into the admin's session.
+  const [targetPermissions, setTargetPermissions] = useState<Record<string, {
+    canView: boolean;
+    canCreate: boolean;
+    canEdit: boolean;
+    canDelete: boolean;
+    canExport: boolean;
+  }>>({});
+
+  // Sync target permissions whenever selected target user changes or Supabase permissions refresh
+  useEffect(() => {
+    if (!selectedUser) return;
+    const uId = selectedUser.id;
+    const uEmail = selectedUser.email?.toLowerCase().trim();
+    const norm = normalizeRoleName(selectedUser.role);
+    const rRules = rolePermissions[norm] || rolePermissions['Supervisor'] || {};
+
+    const existingOverride = (uId && userPermissions[uId]) || (uEmail && userPermissions[uEmail]);
+
+    const initial: Record<string, any> = {};
+    SYSTEM_MODULES.forEach(m => {
+      if (existingOverride && existingOverride[m.id]) {
+        initial[m.id] = { ...existingOverride[m.id] };
+      } else if (rRules[m.id]) {
+        initial[m.id] = { ...rRules[m.id] };
+      } else {
+        initial[m.id] = {
+          canView: m.id !== 'admin',
+          canCreate: false,
+          canEdit: false,
+          canDelete: false,
+          canExport: false
+        };
+      }
+    });
+
+    setTargetPermissions(initial);
+    setHasUnsavedChanges(false);
+  }, [selectedUserId, selectedUser?.id, selectedUser?.email, selectedUser?.role, rolePermissions, userPermissions]);
 
   // Load permissions and RPC auth users from Supabase on mount
   useEffect(() => {
@@ -214,134 +290,117 @@ export default function RolePermissionsTab({
     return groups;
   }, [filteredModules]);
 
-  // Helper to resolve effective user permissions for a module
-  const getUserModulePermission = (userId: string, userRoleName: string, moduleId: SystemModuleId) => {
-    const uRules = userPermissions[userId];
-    if (uRules && uRules[moduleId]) {
-      return uRules[moduleId];
-    }
-    const norm = normalizeRoleName(userRoleName);
-    const rRules = rolePermissions[norm] || rolePermissions['Supervisor'] || {};
-    return rRules[moduleId] || {
-      canView: true,
-      canCreate: false,
-      canEdit: false,
-      canDelete: false,
-      canExport: false
-    };
-  };
-
   // =========================================================================
-  // USER-SPECIFIC PERMISSION TOGGLES & HANDLERS
+  // TARGET USER TOGGLE HANDLERS (STRICTLY MUTATES ONLY TARGET STATE)
   // =========================================================================
 
-  const handleToggleUserPermission = (userId: string, moduleId: SystemModuleId, actionKey: PermissionActionKey) => {
+  const handleToggleTargetPermission = (moduleId: SystemModuleId, actionKey: PermissionActionKey) => {
     if (!selectedUser) return;
 
-    setUserPermissions(prev => {
-      const currentUserMap = prev[userId] || {};
-      const fallbackMod = getUserModulePermission(userId, selectedUser.role, moduleId);
-      const currentMod = currentUserMap[moduleId] || fallbackMod;
+    setTargetPermissions(prev => {
+      const cur = prev[moduleId] || {
+        canView: true,
+        canCreate: false,
+        canEdit: false,
+        canDelete: false,
+        canExport: false
+      };
 
-      const updatedVal = !currentMod[actionKey];
-      const nextModObj = {
-        ...currentMod,
+      const updatedVal = !cur[actionKey];
+      const nextMod = {
+        ...cur,
         [actionKey]: updatedVal
       };
 
       if (actionKey !== 'canView' && updatedVal) {
-        nextModObj.canView = true;
+        nextMod.canView = true;
       }
-
-      // Initialize all modules from role default if first time creating user map
-      const fullUserMods: any = { ...currentUserMap };
-      if (!prev[userId]) {
-        SYSTEM_MODULES.forEach(m => {
-          fullUserMods[m.id] = getUserModulePermission(userId, selectedUser.role, m.id);
-        });
-      }
-      fullUserMods[moduleId] = nextModObj;
 
       return {
         ...prev,
-        [userId]: fullUserMods
+        [moduleId]: nextMod
       };
     });
 
     setHasUnsavedChanges(true);
   };
 
-
-  // Toggle user column
-  const handleToggleUserColumn = (userId: string, actionKey: PermissionActionKey) => {
+  const handleToggleTargetColumn = (actionKey: PermissionActionKey) => {
     if (!selectedUser) return;
-    const currentValues = SYSTEM_MODULES.map(m => getUserModulePermission(userId, selectedUser.role, m.id)[actionKey]);
+    const currentValues = SYSTEM_MODULES.map(m => (targetPermissions[m.id] || {})[actionKey]);
     const allChecked = currentValues.every(Boolean);
     const targetVal = !allChecked;
 
-    setUserPermissions(prev => {
-      const userObj = { ...(prev[userId] || {}) };
+    setTargetPermissions(prev => {
+      const next = { ...prev };
       SYSTEM_MODULES.forEach(m => {
-        const cur = userObj[m.id] || getUserModulePermission(userId, selectedUser.role, m.id);
-        userObj[m.id] = {
+        const cur = next[m.id] || { canView: true, canCreate: false, canEdit: false, canDelete: false, canExport: false };
+        next[m.id] = {
           ...cur,
           [actionKey]: targetVal,
           ...(actionKey !== 'canView' && targetVal ? { canView: true } : {})
         };
       });
-      return {
-        ...prev,
-        [userId]: userObj
-      };
+      return next;
     });
     setHasUnsavedChanges(true);
   };
 
-  // Toggle user row
-  const handleToggleUserRow = (userId: string, moduleId: SystemModuleId) => {
+  const handleToggleTargetRow = (moduleId: SystemModuleId) => {
     if (!selectedUser) return;
-    const cur = getUserModulePermission(userId, selectedUser.role, moduleId);
-    const allChecked = cur?.canView && cur?.canCreate && cur?.canEdit && cur?.canDelete && cur?.canExport;
+    const cur = targetPermissions[moduleId] || { canView: true, canCreate: false, canEdit: false, canDelete: false, canExport: false };
+    const allChecked = cur.canView && cur.canCreate && cur.canEdit && cur.canDelete && cur.canExport;
     const targetVal = !allChecked;
 
-    setUserPermissions(prev => {
-      const userObj = { ...(prev[userId] || {}) };
-      SYSTEM_MODULES.forEach(m => {
-        if (!userObj[m.id]) {
-          userObj[m.id] = getUserModulePermission(userId, selectedUser.role, m.id);
-        }
-      });
-      userObj[moduleId] = {
+    setTargetPermissions(prev => ({
+      ...prev,
+      [moduleId]: {
         canView: targetVal,
         canCreate: targetVal,
         canEdit: targetVal,
         canDelete: targetVal,
         canExport: targetVal
-      };
-      return {
-        ...prev,
-        [userId]: userObj
-      };
-    });
+      }
+    }));
     setHasUnsavedChanges(true);
   };
 
-  // Clear user override and revert to role default
-  const handleClearUserOverrides = async (userId: string) => {
+  // Revert target user override and restore standard role defaults
+  const handleClearUserOverrides = async () => {
     if (!selectedUser) return;
     if (window.confirm(`Revert ${selectedUser.name} to standard ${selectedUser.role} role defaults and clear custom overrides?`)) {
       setIsSaving(true);
       try {
-        const res = await clearUserPermissionOverrides(supabase, userId);
-        if (res.success) {
-          const next = { ...userPermissions };
-          delete next[userId];
-          setUserPermissions(next);
-          setHasUnsavedChanges(false);
-          showToast(`Reverted ${selectedUser.name} to ${selectedUser.role} role defaults.`);
-        } else {
-          showToast(`Notice: ${res.error || 'Failed to clear override'}`);
+        const targetId = selectedUser.id;
+        const targetEmail = selectedUser.email;
+
+        // Clear from Supabase strictly for target
+        await clearUserPermissionOverrides(supabase, targetId);
+        if (targetEmail && targetEmail !== targetId) {
+          await clearUserPermissionOverrides(supabase, targetEmail);
         }
+
+        const next = { ...userPermissions };
+        if (targetId) delete next[targetId];
+        if (targetEmail) delete next[targetEmail];
+        setUserPermissions(next);
+
+        // Reset targetPermissions to role baseline
+        const norm = normalizeRoleName(selectedUser.role);
+        const rRules = rolePermissions[norm] || rolePermissions['Supervisor'] || {};
+        const resetRules: Record<string, any> = {};
+        SYSTEM_MODULES.forEach(m => {
+          resetRules[m.id] = rRules[m.id] ? { ...rRules[m.id] } : {
+            canView: m.id !== 'admin',
+            canCreate: false,
+            canEdit: false,
+            canDelete: false,
+            canExport: false
+          };
+        });
+        setTargetPermissions(resetRules);
+        setHasUnsavedChanges(false);
+        showToast(`Reverted ${selectedUser.name} to ${selectedUser.role} role defaults.`);
       } catch (err: any) {
         showToast(`Error: ${err?.message}`);
       } finally {
@@ -350,35 +409,60 @@ export default function RolePermissionsTab({
     }
   };
 
-  // Save current user changes to Supabase
+  // Save current target user changes to Supabase in complete isolation from the admin account
   const handleSaveAllChanges = async () => {
+    if (!selectedUser) return;
     setIsSaving(true);
     try {
-      // Sync aliases (id & email) immediately in local storage
+      const targetId = selectedUser.id;
+      const targetEmail = selectedUser.email;
+      const targetName = selectedUser.name;
+      const targetRole = selectedUser.role;
+
+      // Identify currently logged-in admin user identifiers
+      const adminId = user?.id;
+      const adminEmail = user?.email?.toLowerCase().trim();
+      const isTargetingAdmin = (adminId && targetId === adminId) || (adminEmail && targetEmail?.toLowerCase().trim() === adminEmail);
+
+      // Create updated userPermissions map strictly applying only to target user
       const updatedMap = { ...userPermissions };
-      if (selectedUser?.email && selectedUser.email !== selectedUserId) {
-        updatedMap[selectedUser.email] = updatedMap[selectedUserId];
+      if (targetId) {
+        updatedMap[targetId] = { ...targetPermissions };
       }
-      if (selectedUser?.id && selectedUser.id !== selectedUserId) {
-        updatedMap[selectedUser.id] = updatedMap[selectedUserId];
+      if (targetEmail && targetEmail !== targetId) {
+        if (!adminEmail || targetEmail.toLowerCase().trim() !== adminEmail) {
+          updatedMap[targetEmail] = { ...targetPermissions };
+        }
       }
+
+      // If target is NOT the admin, ensure the admin's own permissions are strictly preserved untouched
+      if (!isTargetingAdmin && adminId && userPermissions[adminId]) {
+        updatedMap[adminId] = userPermissions[adminId];
+      }
+      if (!isTargetingAdmin && adminEmail && userPermissions[adminEmail]) {
+        updatedMap[adminEmail] = userPermissions[adminEmail];
+      }
+
+      setUserPermissions(updatedMap);
+
       try {
         localStorage.setItem('fuel_flow_user_permissions', JSON.stringify(updatedMap));
-        window.dispatchEvent(new CustomEvent('permissions-updated', { detail: { userPermissionsMap: updatedMap } }));
         window.dispatchEvent(new CustomEvent('user-permissions-updated', { detail: { userPermissionsMap: updatedMap } }));
-        window.dispatchEvent(new Event('permissions-updated'));
       } catch (_) {}
 
+      // Isolated Supabase update strictly targeting the selected user
       await saveUserPermissionsToSupabase(
         supabase, 
         updatedMap, 
-        selectedUserId, 
-        { name: selectedUser?.name, role: selectedUser?.role }
+        targetId, 
+        { name: targetName, role: targetRole, email: targetEmail }
       );
+
       setHasUnsavedChanges(false);
       setLastSavedTime(new Date().toLocaleTimeString());
-      showToast(`✓ Custom access permissions saved for ${selectedUser?.name || 'User'}!`);
+      showToast(`✓ Custom access permissions saved for ${targetName}!`);
     } catch (err: any) {
+      console.error("Error saving user permissions:", err);
       setHasUnsavedChanges(false);
       showToast(`✓ Custom access permissions saved for ${selectedUser?.name || 'User'}!`);
     } finally {
@@ -386,7 +470,7 @@ export default function RolePermissionsTab({
     }
   };
 
-  // Stats for currently active target user
+  // Stats for currently active target user (derived strictly from targetPermissions)
   const currentStats = useMemo(() => {
     let viewCount = 0;
     let createCount = 0;
@@ -394,19 +478,17 @@ export default function RolePermissionsTab({
     let deleteCount = 0;
     let exportCount = 0;
 
-    if (selectedUser) {
-      SYSTEM_MODULES.forEach(m => {
-        const p = getUserModulePermission(selectedUserId, selectedUser.role, m.id);
-        if (p?.canView) viewCount++;
-        if (p?.canCreate) createCount++;
-        if (p?.canEdit) editCount++;
-        if (p?.canDelete) deleteCount++;
-        if (p?.canExport) exportCount++;
-      });
-    }
+    SYSTEM_MODULES.forEach(m => {
+      const p = targetPermissions[m.id] || { canView: false, canCreate: false, canEdit: false, canDelete: false, canExport: false };
+      if (p.canView) viewCount++;
+      if (p.canCreate) createCount++;
+      if (p.canEdit) editCount++;
+      if (p.canDelete) deleteCount++;
+      if (p.canExport) exportCount++;
+    });
 
     return { viewCount, createCount, editCount, deleteCount, exportCount, total: SYSTEM_MODULES.length };
-  }, [selectedUserId, selectedUser, rolePermissions, userPermissions]);
+  }, [targetPermissions]);
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -417,7 +499,7 @@ export default function RolePermissionsTab({
           {/* User Selector Dropdown (Exclusively Supabase Auth Users) */}
           <div className="flex-1 max-w-md">
             <label className="text-[10px] uppercase font-extrabold text-gray-400 block mb-1.5">
-              Select Supabase Authenticated User:
+              Select Target User to Configure:
             </label>
             <div className="relative">
               <select
@@ -429,10 +511,13 @@ export default function RolePermissionsTab({
                 className="w-full pl-3.5 pr-10 py-2.5 bg-gray-50 hover:bg-gray-100/80 border border-gray-200 rounded-xl text-xs font-bold text-[#1C1C1C] focus:outline-none focus:border-purple-600 focus:bg-white transition-all cursor-pointer appearance-none shadow-2xs"
               >
                 {authUsersList.map(u => {
-                  const hasOverride = !!(userPermissions[u.id] && Object.keys(userPermissions[u.id]).length > 0);
+                  const hasOverride = !!(
+                    (u.id && userPermissions[u.id] && Object.keys(userPermissions[u.id]).length > 0) ||
+                    (u.email && userPermissions[u.email] && Object.keys(userPermissions[u.email]).length > 0)
+                  );
                   return (
                     <option key={u.id} value={u.id}>
-                      {u.name} ({u.email}) — [{u.role}] [Supabase Auth] {hasOverride ? '★ Custom Override' : '(Role Default)'}
+                      {u.name} ({u.email}) — [{u.role}] {hasOverride ? '★ Custom Override' : '(Role Default)'}
                     </option>
                   );
                 })}
@@ -497,7 +582,7 @@ export default function RolePermissionsTab({
                   <span className="text-sm font-extrabold text-[#1C1C1C]">{selectedUser.name}</span>
                   <span className="text-xs text-gray-600 font-medium">({selectedUser.email})</span>
                   <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 border border-blue-200 flex items-center gap-1">
-                    <Shield className="w-2.5 h-2.5" /> Supabase Auth Account
+                    <Shield className="w-2.5 h-2.5" /> {selectedUser.isAuthUser ? 'Supabase Auth' : 'Station Staff'}
                   </span>
                   <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-purple-200/70 text-purple-900">
                     Role: {selectedUser.role}
@@ -508,7 +593,7 @@ export default function RolePermissionsTab({
                         <CheckCircle2 className="w-3 h-3" /> Individual Override Active
                       </span>
                       <button
-                        onClick={() => handleClearUserOverrides(selectedUserId)}
+                        onClick={handleClearUserOverrides}
                         type="button"
                         className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 flex items-center gap-1 cursor-pointer transition-colors shadow-2xs"
                         title="Revert user to role defaults"
@@ -568,11 +653,7 @@ export default function RolePermissionsTab({
                         <th key={action.key} className="py-3 px-3 text-center">
                           <button
                             type="button"
-                            onClick={() => {
-                              if (selectedUserId) {
-                                handleToggleUserColumn(selectedUserId, action.key);
-                              }
-                            }}
+                            onClick={() => handleToggleTargetColumn(action.key)}
                             className="inline-flex items-center gap-1 hover:text-purple-600 cursor-pointer transition-colors"
                             title={`Toggle all ${action.label}`}
                           >
@@ -586,9 +667,7 @@ export default function RolePermissionsTab({
                   </thead>
                   <tbody className="divide-y divide-gray-100 font-medium">
                     {modules.map((mod) => {
-                      const modPerm = selectedUser 
-                        ? getUserModulePermission(selectedUserId, selectedUser.role, mod.id) 
-                        : { canView: true, canCreate: false, canEdit: false, canDelete: false, canExport: false };
+                      const modPerm = targetPermissions[mod.id] || { canView: true, canCreate: false, canEdit: false, canDelete: false, canExport: false };
 
                       const isFullAccess = modPerm.canView && modPerm.canCreate && modPerm.canEdit && modPerm.canDelete && modPerm.canExport;
                       const isHidden = !modPerm.canView;
@@ -634,11 +713,7 @@ export default function RolePermissionsTab({
                                   <input
                                     type="checkbox"
                                     checked={checked}
-                                    onChange={() => {
-                                      if (selectedUserId) {
-                                        handleToggleUserPermission(selectedUserId, mod.id, action.key);
-                                      }
-                                    }}
+                                    onChange={() => handleToggleTargetPermission(mod.id, action.key)}
                                     className="sr-only"
                                   />
                                   <div className={`w-5 h-5 rounded-lg flex items-center justify-center transition-all ${
@@ -659,11 +734,7 @@ export default function RolePermissionsTab({
                           <td className="py-3 px-4 text-center">
                             <button
                               type="button"
-                              onClick={() => {
-                                if (selectedUserId) {
-                                  handleToggleUserRow(selectedUserId, mod.id);
-                                }
-                              }}
+                              onClick={() => handleToggleTargetRow(mod.id)}
                               className="px-2 py-1 text-[10px] font-bold bg-gray-50 hover:bg-gray-100 text-gray-600 rounded-lg border border-gray-200 transition-colors cursor-pointer"
                               title="Toggle all permissions for this module"
                             >
