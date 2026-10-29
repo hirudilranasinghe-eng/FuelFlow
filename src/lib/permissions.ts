@@ -626,25 +626,103 @@ export async function fetchUserPermissionsFromSupabase(client: any): Promise<Use
     }
 
     console.log(`[RBAC Sync] ✓ Successfully loaded ${data.length} user_permissions record(s) from Supabase.`);
+    console.log(`[RBAC Lookup] fetchUserPermissionsFromSupabase: ${data.length} row(s) retrieved from Supabase:`);
+    data.forEach((row: any, i: number) => {
+      console.log(`[RBAC Lookup] Row #${i + 1} retrieved from Supabase:`, {
+        id: row.id,
+        user_id: row.user_id || row.userId,
+        email: row.email || row.user_email,
+        module: extractModuleKey(row),
+        can_view: extractVisibility(row),
+        can_create: row.can_create ?? row.canCreate ?? false,
+        can_edit: row.can_edit ?? row.canEdit ?? false,
+        can_delete: row.can_delete ?? row.canDelete ?? false,
+        can_export: row.can_export ?? row.canExport ?? false
+      });
+    });
 
     // If Supabase returned records, use them as the absolute source of truth!
     // Start with currentMap as fallback base, but completely purge and replace records for any user present in Supabase
     const updatedMap: UserPermissionsMap = { ...currentMap };
 
     if (data.length > 0) {
+      // Build cross-reference lookup between Supabase Auth UUID and email
+      const authIdToEmail = new Map<string, string>();
+      const authEmailToId = new Map<string, string>();
+
+      // 1. Resolve from active Supabase session
+      try {
+        const sessData = await client?.auth?.getSession?.();
+        const sessUser = sessData?.data?.session?.user;
+        if (sessUser?.id && sessUser?.email) {
+          const sid = String(sessUser.id).trim();
+          const semail = String(sessUser.email).trim().toLowerCase();
+          authIdToEmail.set(sid, semail);
+          authIdToEmail.set(sid.toLowerCase(), semail);
+          authEmailToId.set(semail, sid);
+        }
+      } catch (_) {}
+
+      // 2. Resolve from stored user profile
+      try {
+        const stored = localStorage.getItem('fms_user') || localStorage.getItem('fuelflow_user');
+        if (stored) {
+          const u = JSON.parse(stored);
+          if (u?.id && u?.email) {
+            const uid = String(u.id).trim();
+            const uemail = String(u.email).trim().toLowerCase();
+            authIdToEmail.set(uid, uemail);
+            authIdToEmail.set(uid.toLowerCase(), uemail);
+            authEmailToId.set(uemail, uid);
+          }
+        }
+      } catch (_) {}
+
+      // 3. Resolve from get_supabase_auth_users RPC function
+      try {
+        const { data: authUsers } = await client.rpc('get_supabase_auth_users');
+        if (Array.isArray(authUsers)) {
+          authUsers.forEach((u: any) => {
+            if (u?.id && u?.email) {
+              const uid = String(u.id).trim();
+              const uemail = String(u.email).trim().toLowerCase();
+              authIdToEmail.set(uid, uemail);
+              authIdToEmail.set(uid.toLowerCase(), uemail);
+              authEmailToId.set(uemail, uid);
+            }
+          });
+        }
+      } catch (_) {}
+
       // Find all unique user identifiers returned from Supabase
       const usersInDb = new Set<string>();
       data.forEach((row: any) => {
-        const uId = String(row.user_id || row.userId || '').trim();
+        const uId = String(row.user_id || row.userId || row.email || row.user_email || '').trim();
         if (uId) {
           usersInDb.add(uId);
           usersInDb.add(uId.toLowerCase());
           if (uId.includes('@')) usersInDb.add(uId.toLowerCase().split('@')[0]);
+          if (authIdToEmail.has(uId)) {
+            const em = authIdToEmail.get(uId)!;
+            usersInDb.add(em);
+            usersInDb.add(em.split('@')[0]);
+          }
+          if (authEmailToId.has(uId.toLowerCase())) {
+            usersInDb.add(authEmailToId.get(uId.toLowerCase())!);
+          }
         }
         const rowEmail = String(row.email || row.user_email || '').trim().toLowerCase();
         if (rowEmail) {
           usersInDb.add(rowEmail);
           if (rowEmail.includes('@')) usersInDb.add(rowEmail.split('@')[0]);
+          if (authEmailToId.has(rowEmail)) {
+            usersInDb.add(authEmailToId.get(rowEmail)!);
+          }
+        }
+        const rowName = String(row.user_name || row.userName || '').trim().toLowerCase();
+        if (rowName) {
+          usersInDb.add(rowName);
+          usersInDb.add(rowName.replace(/\s+/g, ''));
         }
       });
 
@@ -654,7 +732,7 @@ export async function fetchUserPermissionsFromSupabase(client: any): Promise<Use
       });
 
       data.forEach((row: any) => {
-        const uId = String(row.user_id || row.userId || '').trim();
+        const uId = String(row.user_id || row.userId || row.email || row.user_email || '').trim();
         const rawMod = extractModuleKey(row);
         if (!uId || !rawMod) return;
 
@@ -687,6 +765,19 @@ export async function fetchUserPermissionsFromSupabase(client: any): Promise<Use
         mapUserAliases(uIdLower);
         if (uIdLower.includes('@')) {
           mapUserAliases(uIdLower.split('@')[0]);
+          if (authEmailToId.has(uIdLower)) {
+            const mappedUuid = authEmailToId.get(uIdLower)!;
+            mapUserAliases(mappedUuid);
+            mapUserAliases(mappedUuid.toLowerCase());
+          }
+        } else {
+          // If uId is a UUID, index under mapped email as well
+          const mappedEmail = authIdToEmail.get(uId) || authIdToEmail.get(uIdLower);
+          if (mappedEmail) {
+            mapUserAliases(mappedEmail);
+            mapUserAliases(mappedEmail.toLowerCase());
+            mapUserAliases(mappedEmail.split('@')[0]);
+          }
         }
 
         // If row has user_name or email, index those as aliases as well
@@ -696,9 +787,14 @@ export async function fetchUserPermissionsFromSupabase(client: any): Promise<Use
           if (rowEmail.includes('@')) {
             mapUserAliases(rowEmail.split('@')[0]);
           }
+          if (authEmailToId.has(rowEmail)) {
+            const mappedUuid = authEmailToId.get(rowEmail)!;
+            mapUserAliases(mappedUuid);
+            mapUserAliases(mappedUuid.toLowerCase());
+          }
         }
 
-        const rowName = String(row.user_name || '').trim().toLowerCase();
+        const rowName = String(row.user_name || row.userName || '').trim().toLowerCase();
         if (rowName) {
           mapUserAliases(rowName);
           mapUserAliases(rowName.replace(/\s+/g, ''));
@@ -783,47 +879,109 @@ export async function fetchAndHydrateActiveUserPermissions(
   const userName = ((user as any).name || '').trim().toLowerCase();
   const userPrefix = userEmail.includes('@') ? userEmail.split('@')[0] : '';
 
-  // Retain cached rules in memory during in-flight fetch so UI does not flicker or revert
-  const cachedActive = getActiveUserPermissions();
-  const activeRules: Record<string, any> = { ...cachedActive };
+  // Multi-key candidate identifiers for the target user
+  const candidateKeys = new Set<string>();
+  if (userId) {
+    candidateKeys.add(userId);
+    candidateKeys.add(userIdLower);
+  }
+  if (userEmail) {
+    candidateKeys.add(userEmail);
+    if (userPrefix) candidateKeys.add(userPrefix);
+  }
+  if (userName) {
+    candidateKeys.add(userName);
+    candidateKeys.add(userName.replace(/\s+/g, ''));
+  }
 
-  // 1. Direct query Supabase user_permissions table first if connected (Authoritative Cloud Truth)
+  // Cross-reference Supabase Auth users directory to link UUID <-> Email if available
+  try {
+    const { data: authUsers } = await client.rpc('get_supabase_auth_users');
+    if (Array.isArray(authUsers)) {
+      authUsers.forEach((au: any) => {
+        const auId = String(au.id || '').trim();
+        const auEmail = String(au.email || '').trim().toLowerCase();
+        if (auId && auEmail) {
+          if (candidateKeys.has(auId) || candidateKeys.has(auId.toLowerCase())) {
+            candidateKeys.add(auEmail);
+            if (auEmail.includes('@')) candidateKeys.add(auEmail.split('@')[0]);
+          }
+          if (candidateKeys.has(auEmail) || (auEmail.includes('@') && candidateKeys.has(auEmail.split('@')[0]))) {
+            candidateKeys.add(auId);
+            candidateKeys.add(auId.toLowerCase());
+          }
+        }
+      });
+    }
+  } catch (_) {}
+
+  // Also check active session user id/email
+  try {
+    const sess = await client?.auth?.getSession?.();
+    const su = sess?.data?.session?.user;
+    if (su?.id && su?.email) {
+      const suId = String(su.id).trim();
+      const suEmail = String(su.email).trim().toLowerCase();
+      if (candidateKeys.has(suId) || candidateKeys.has(suId.toLowerCase())) {
+        candidateKeys.add(suEmail);
+        if (suEmail.includes('@')) candidateKeys.add(suEmail.split('@')[0]);
+      }
+      if (candidateKeys.has(suEmail) || (suEmail.includes('@') && candidateKeys.has(suEmail.split('@')[0]))) {
+        candidateKeys.add(suId);
+        candidateKeys.add(suId.toLowerCase());
+      }
+    }
+  } catch (_) {}
+
+  const candidateList = Array.from(candidateKeys);
+  console.log(`[RBAC Lookup] Hard enforcement on login: Fetching fresh Supabase user_permissions for user identifiers [${candidateList.join(', ')}]`);
+
+  // Start with a clean activeRules object so stale local defaults cannot persist
+  const activeRules: Record<string, any> = {};
   const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
 
   if (isConfigured && client) {
     try {
-      console.log(`[RBAC Hydrate] Fetching active permissions from Supabase for user: ${userEmail || userId}`);
       const { data, error } = await client
         .from('user_permissions')
         .select('*');
 
       if (!error && Array.isArray(data)) {
-        console.log(`[RBAC Hydrate] Retrieved ${data.length} total user_permissions rows from Supabase.`);
+        console.log(`[RBAC Lookup] Hard enforcement fetch: retrieved ${data.length} total user_permissions row(s) from Supabase:`);
+        data.forEach((row: any, i: number) => {
+          console.log(`[RBAC Lookup] Row #${i + 1} retrieved from Supabase:`, {
+            id: row.id,
+            user_id: row.user_id || row.userId,
+            email: row.email || row.user_email,
+            module: extractModuleKey(row),
+            can_view: extractVisibility(row),
+            can_create: row.can_create ?? row.canCreate ?? false,
+            can_edit: row.can_edit ?? row.canEdit ?? false,
+            can_delete: row.can_delete ?? row.canDelete ?? false,
+            can_export: row.can_export ?? row.canExport ?? false
+          });
+        });
 
-        // Find rows specifically belonging to this user
+        // Find rows specifically belonging to this user using all identifiers simultaneously
         const matchedRows = data.filter((row: any) => {
-          const rowUid = String(row.user_id || '').trim().toLowerCase();
-          const rowName = String(row.user_name || '').trim().toLowerCase();
+          const rowUid = String(row.user_id || row.userId || '').trim().toLowerCase();
+          const rowName = String(row.user_name || row.userName || '').trim().toLowerCase();
           const rowEmail = String(row.email || row.user_email || '').trim().toLowerCase();
+          const rowPrefix = rowEmail.includes('@') ? rowEmail.split('@')[0] : (rowUid.includes('@') ? rowUid.split('@')[0] : '');
 
-          return (
-            (userIdLower && (rowUid === userIdLower || rowUid.includes(userIdLower))) ||
-            (userEmail && (
-              rowUid === userEmail ||
-              rowEmail === userEmail ||
-              rowName === userEmail ||
-              (userPrefix && (rowUid === userPrefix || rowUid.includes(userPrefix))) ||
-              rowUid.includes(userEmail)
-            )) ||
-            (userName && (rowName === userName || rowUid === userName || rowName.includes(userName)))
-          );
+          for (const ident of candidateKeys) {
+            const idLow = ident.toLowerCase().trim();
+            if (!idLow) continue;
+            if (rowUid === idLow || rowEmail === idLow || rowName === idLow || rowPrefix === idLow) return true;
+            if (idLow.includes('@') && (rowUid === idLow || rowEmail === idLow)) return true;
+            if (rowUid && (rowUid === idLow || rowUid.includes(idLow) || idLow.includes(rowUid))) return true;
+            if (rowEmail && (rowEmail === idLow || rowEmail.includes(idLow) || idLow.includes(rowEmail))) return true;
+          }
+          return false;
         });
 
         if (matchedRows.length > 0) {
-          console.log(`[RBAC Hydrate] ✓ Found ${matchedRows.length} explicit permission record(s) in Supabase. Using Supabase as absolute source of truth.`);
-
-          // Supabase is absolute source of truth: reset activeRules so stale local defaults cannot persist
-          Object.keys(activeRules).forEach(k => delete activeRules[k]);
+          console.log(`[RBAC Lookup] MATCH FOUND: ${matchedRows.length} explicit permission record(s) in Supabase for user [${candidateList.join(', ')}]!`);
 
           matchedRows.forEach((row: any) => {
             const rawMod = extractModuleKey(row);
@@ -844,30 +1002,32 @@ export async function fetchAndHydrateActiveUserPermissions(
               activeRules[rawMod.replace(/-/g, '_')] = rule;
               activeRules[rawMod.replace(/_/g, '-')] = rule;
               activeRules[`module_${canon}`] = rule;
+              console.log(`[RBAC Lookup] Enforced override: module="${rawMod}" (${canon}) -> can_view=${isVis}`);
             }
           });
         } else {
-          console.log(`[RBAC Hydrate] No specific user_permissions records in Supabase for user ${userEmail || userId}.`);
+          console.log(`[RBAC Lookup] No explicit user_permissions overrides found in Supabase for [${candidateList.join(', ')}]. Active rules cleared.`);
         }
       } else if (error) {
-        console.error('[RBAC Hydrate] ✗ Supabase query error:', error.message);
+        console.error('[RBAC Lookup] ✗ Supabase query error:', error.message);
       }
     } catch (err: any) {
-      console.warn('[RBAC Hydrate] Direct query exception:', err?.message || err);
+      console.warn('[RBAC Lookup] Direct query exception:', err?.message || err);
     }
   }
 
-  // 2. Fallback to cached user permissions if database was not reached or returned no rows
-  if (Object.keys(activeRules).length === 0) {
+  // Fallback to local cached user permissions only if database could not be reached (offline)
+  if (Object.keys(activeRules).length === 0 && (!isConfigured || !client)) {
     const allUserPerms = getCachedUserPermissions();
-    const matched = (userId && allUserPerms[userId]) ||
-      (userIdLower && allUserPerms[userIdLower]) ||
-      (userEmail && allUserPerms[userEmail]) ||
-      (userPrefix && allUserPerms[userPrefix]) ||
-      (userName && allUserPerms[userName]);
-
+    let matched: any = null;
+    for (const key of candidateKeys) {
+      if (allUserPerms[key]) {
+        matched = allUserPerms[key];
+        break;
+      }
+    }
     if (matched) {
-      console.log('[RBAC Hydrate] Populated active rules from local cached user permissions.');
+      console.log('[RBAC Lookup] Populated active rules from local cached user permissions fallback.');
       Object.keys(matched).forEach(k => {
         const canon = canonicalModuleId(k);
         activeRules[k] = matched[k];
@@ -880,6 +1040,13 @@ export async function fetchAndHydrateActiveUserPermissions(
 
   try {
     localStorage.setItem(ACTIVE_USER_PERMS_KEY, JSON.stringify(activeRules));
+    // Also sync the user permissions map in local storage for all candidate keys
+    const currentMap = getCachedUserPermissions();
+    candidateKeys.forEach(k => {
+      currentMap[k] = { ...activeRules };
+    });
+    localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(currentMap));
+
     window.dispatchEvent(new CustomEvent('permissions-updated', { detail: { activeUserPermissions: activeRules } }));
     window.dispatchEvent(new CustomEvent('user-permissions-updated', { detail: { activeUserPermissions: activeRules } }));
     window.dispatchEvent(new Event('permissions-updated'));
@@ -948,12 +1115,9 @@ export async function saveUserPermissionsToSupabase(
   const targetIds = new Set<string>();
   if (targetUserId) {
     targetIds.add(targetUserId);
-    // If target has email alias and it does not collide with admin email, save alias
-    if (targetUserInfo?.email && targetUserInfo.email !== targetUserId) {
-      if (!currentAdminEmail || targetUserInfo.email.toLowerCase().trim() !== currentAdminEmail) {
-        targetIds.add(targetUserInfo.email);
-        targetIds.add(targetUserInfo.email.toLowerCase().trim());
-      }
+    targetIds.add(targetUserId.toLowerCase().trim());
+    if (targetUserInfo?.email) {
+      targetIds.add(targetUserInfo.email.toLowerCase().trim());
     }
   } else {
     Object.keys(userPermissionsMap).forEach(k => targetIds.add(k));
@@ -1298,85 +1462,154 @@ export function checkUserPermission(
     userRole = userOrRole;
   }
 
+  // Fallback to active logged-in session user if user object wasn't passed directly with ID/email
+  if (!userId && !userEmail) {
+    try {
+      const stored = localStorage.getItem('fms_user') || localStorage.getItem('fuelflow_user');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed?.id) userId = String(parsed.id).trim();
+        if (parsed?.email) userEmail = String(parsed.email).trim().toLowerCase();
+        if (parsed?.name && !userName) userName = String(parsed.name).trim();
+        if (parsed?.role && !userRole) userRole = parsed.role;
+      }
+    } catch (_) {}
+  }
+
   const normRole = normalizeRoleName(userRole);
 
-  // 1. Check for specific User Permissions Override in general User Permissions Map
+  // Collect ALL possible identifiers simultaneously: Supabase Auth user.id (UUID), lowercase email, username, email prefix
+  const candidateKeys: string[] = [];
+  if (userId) {
+    const idTrim = userId.trim();
+    candidateKeys.push(idTrim);
+    if (idTrim.toLowerCase() !== idTrim) candidateKeys.push(idTrim.toLowerCase());
+  }
+  if (userEmail) {
+    const emailTrim = userEmail.trim().toLowerCase();
+    candidateKeys.push(emailTrim);
+    if (emailTrim.includes('@')) {
+      candidateKeys.push(emailTrim.split('@')[0]);
+    }
+  }
+  if (userName) {
+    const nameTrim = userName.trim().toLowerCase();
+    candidateKeys.push(nameTrim);
+    candidateKeys.push(nameTrim.replace(/\s+/g, ''));
+  }
+
+  // 1. ABSOLUTE PRIORITY: Check for individual User Permissions Override
+  // Individual user overrides are 100% authoritative over both role defaults and admin bypass.
+  // Explicit individual user denials (can_view: false / is_visible: false) MUST take absolute precedence!
   const uMap = userPermissionsMap || getCachedUserPermissions();
-  const emailLower = userEmail ? userEmail.toLowerCase().trim() : '';
-  const emailPrefix = emailLower.includes('@') ? emailLower.split('@')[0] : '';
-  const idLower = userId ? userId.toLowerCase().trim() : '';
-  const nameLower = userName ? userName.toLowerCase().trim() : '';
+  const activePerms = getActiveUserPermissions();
 
-  let matchedUserRules = (userId && uMap[userId]) ||
-    (idLower && uMap[idLower]) ||
-    (userEmail && uMap[userEmail]) ||
-    (emailLower && uMap[emailLower]) ||
-    (emailPrefix && uMap[emailPrefix]) ||
-    (userName && uMap[userName]) ||
-    (nameLower && uMap[nameLower]);
+  let matchedUserRules: Record<string, any> | null = null;
 
-  // If not matched directly, iterate keys in uMap for flexible matching
+  // Direct lookup across all candidate identifiers simultaneously
+  for (const ident of candidateKeys) {
+    if (uMap && uMap[ident]) {
+      matchedUserRules = uMap[ident];
+      break;
+    }
+  }
+
+  // If not found in direct uMap, check activeUserPermissions if evaluating active session user
+  if (!matchedUserRules && activePerms && Object.keys(activePerms).length > 0) {
+    try {
+      const stored = localStorage.getItem('fms_user') || localStorage.getItem('fuelflow_user');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        const activeEmail = (parsed.email || '').toLowerCase().trim();
+        const activeId = (parsed.id || '').toLowerCase().trim();
+        const activePrefix = activeEmail.includes('@') ? activeEmail.split('@')[0] : '';
+        const matchesActive = candidateKeys.length === 0 || candidateKeys.some(k => {
+          const kl = k.toLowerCase().trim();
+          return kl === activeEmail || kl === activeId || kl === activePrefix;
+        });
+        if (matchesActive) {
+          matchedUserRules = activePerms as any;
+        }
+      } else {
+        matchedUserRules = activePerms as any;
+      }
+    } catch (_) {
+      matchedUserRules = activePerms as any;
+    }
+  }
+
+  // Flexible / fuzzy matching in uMap if still not found
   if (!matchedUserRules && uMap && typeof uMap === 'object') {
     for (const key of Object.keys(uMap)) {
       const kLower = key.toLowerCase().trim();
-      if (
-        (idLower && kLower === idLower) ||
-        (emailLower && (kLower === emailLower || kLower === emailPrefix || kLower.includes(emailLower))) ||
-        (nameLower && kLower === nameLower)
-      ) {
-        matchedUserRules = uMap[key];
-        break;
-      }
-    }
-  }
-
-  // Also check activeUserPermissions if this evaluates the currently logged-in user
-  if (!matchedUserRules) {
-    const activePerms = getActiveUserPermissions();
-    if (activePerms && Object.keys(activePerms).length > 0) {
-      try {
-        const stored = localStorage.getItem('fms_user');
-        if (stored) {
-          const parsed = JSON.parse(stored);
-          const activeEmail = (parsed.email || '').toLowerCase().trim();
-          const activeId = (parsed.id || '').toLowerCase().trim();
-          if ((emailLower && activeEmail === emailLower) || (idLower && activeId === idLower)) {
-            matchedUserRules = activePerms as any;
-          }
+      const kPrefix = kLower.includes('@') ? kLower.split('@')[0] : '';
+      for (const ident of candidateKeys) {
+        const idLow = ident.toLowerCase().trim();
+        if (kLower === idLow || kPrefix === idLow || (idLow.length >= 4 && (kLower.includes(idLow) || idLow.includes(kLower)))) {
+          matchedUserRules = uMap[key];
+          break;
         }
-      } catch (_) {}
+      }
+      if (matchedUserRules) break;
     }
   }
 
-  // If user has an explicit individual override for this module, it is 100% authoritative over both role and admin defaults
+  // STEP 1: Absolute priority for explicit individual user restrictions
+  // If user has an explicit individual record in user_permissions for this module, it MUST take precedence.
+  // Role defaults or general role permissions must NEVER override an explicit individual user denial (can_view: false)!
   if (matchedUserRules) {
-    const userModRule = matchedUserRules[canon] ||
+    let userModRule = matchedUserRules[canon] ||
       matchedUserRules[moduleId] ||
+      matchedUserRules[moduleId.toLowerCase()] ||
       matchedUserRules[moduleId.replace(/-/g, '_')] ||
       matchedUserRules[moduleId.replace(/_/g, '-')] ||
       matchedUserRules[`module_${canon}`];
 
-    if (userModRule) {
+    if (!userModRule) {
+      for (const k of Object.keys(matchedUserRules)) {
+        if (canonicalModuleId(k) === canon || k.toLowerCase() === moduleId.toLowerCase()) {
+          userModRule = matchedUserRules[k];
+          break;
+        }
+      }
+    }
+
+    if (userModRule !== undefined && userModRule !== null) {
       switch (action) {
-        case 'view':
-          // Strictly respect can_view: false - never fall back to true when can_view is false!
-          return extractVisibility(userModRule);
-        case 'create':
-          return userModRule.canCreate !== undefined ? !!userModRule.canCreate : !!(userModRule as any).can_create;
-        case 'edit':
-          return userModRule.canEdit !== undefined ? !!userModRule.canEdit : !!(userModRule as any).can_edit;
-        case 'delete':
-          return userModRule.canDelete !== undefined ? !!userModRule.canDelete : !!(userModRule as any).can_delete;
-        case 'export':
-          return userModRule.canExport !== undefined ? !!userModRule.canExport : !!(userModRule as any).can_export;
+        case 'view': {
+          const isVis = extractVisibility(userModRule);
+          console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) for user [${candidateKeys.join(', ')}]: MATCHED explicit override -> action="${action}", result=${isVis} (ABSOLUTE PRIORITY OVERRIDE)`);
+          return isVis;
+        }
+        case 'create': {
+          const allowed = userModRule.canCreate !== undefined ? !!userModRule.canCreate : !!(userModRule as any).can_create;
+          console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) for user [${candidateKeys.join(', ')}]: MATCHED explicit override -> action="${action}", result=${allowed}`);
+          return allowed;
+        }
+        case 'edit': {
+          const allowed = userModRule.canEdit !== undefined ? !!userModRule.canEdit : !!(userModRule as any).can_edit;
+          console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) for user [${candidateKeys.join(', ')}]: MATCHED explicit override -> action="${action}", result=${allowed}`);
+          return allowed;
+        }
+        case 'delete': {
+          const allowed = userModRule.canDelete !== undefined ? !!userModRule.canDelete : !!(userModRule as any).can_delete;
+          console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) for user [${candidateKeys.join(', ')}]: MATCHED explicit override -> action="${action}", result=${allowed}`);
+          return allowed;
+        }
+        case 'export': {
+          const allowed = userModRule.canExport !== undefined ? !!userModRule.canExport : !!(userModRule as any).can_export;
+          console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) for user [${candidateKeys.join(', ')}]: MATCHED explicit override -> action="${action}", result=${allowed}`);
+          return allowed;
+        }
         default:
           return false;
       }
     }
   }
 
-  // 2. System Admin default bypass ONLY when no explicit override for this module was configured
+  // 2. System Admin default bypass ONLY when no explicit override was configured for this module
   if (normRole === 'System Admin') {
+    console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) for user [${candidateKeys.join(', ')}]: Granted by System Admin default.`);
     return true;
   }
 
@@ -1385,7 +1618,9 @@ export function checkUserPermission(
   const roleRules = map[normRole] || map['Supervisor'];
 
   if (!roleRules) {
-    return action === 'view' ? canon !== 'admin_control' : false;
+    const isDefaultVis = action === 'view' ? canon !== 'admin_control' : false;
+    console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) for user [${candidateKeys.join(', ')}]: No role rules for "${normRole}". Default result=${isDefaultVis}`);
+    return isDefaultVis;
   }
 
   const modRule = roleRules[canon] ||
@@ -1394,23 +1629,34 @@ export function checkUserPermission(
     roleRules[moduleId.replace(/_/g, '-') as SystemModuleId];
 
   if (!modRule) {
-    return action === 'view' ? canon !== 'admin_control' : false;
+    const isDefaultVis = action === 'view' ? canon !== 'admin_control' : false;
+    console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) for user [${candidateKeys.join(', ')}]: No module rule in role "${normRole}". Default result=${isDefaultVis}`);
+    return isDefaultVis;
   }
 
+  let finalResult = false;
   switch (action) {
     case 'view':
-      return extractVisibility(modRule);
+      finalResult = extractVisibility(modRule);
+      break;
     case 'create':
-      return modRule.canCreate !== undefined ? !!modRule.canCreate : !!(modRule as any).can_create;
+      finalResult = modRule.canCreate !== undefined ? !!modRule.canCreate : !!(modRule as any).can_create;
+      break;
     case 'edit':
-      return modRule.canEdit !== undefined ? !!modRule.canEdit : !!(modRule as any).can_edit;
+      finalResult = modRule.canEdit !== undefined ? !!modRule.canEdit : !!(modRule as any).can_edit;
+      break;
     case 'delete':
-      return modRule.canDelete !== undefined ? !!modRule.canDelete : !!(modRule as any).can_delete;
+      finalResult = modRule.canDelete !== undefined ? !!modRule.canDelete : !!(modRule as any).can_delete;
+      break;
     case 'export':
-      return modRule.canExport !== undefined ? !!modRule.canExport : !!(modRule as any).can_export;
+      finalResult = modRule.canExport !== undefined ? !!modRule.canExport : !!(modRule as any).can_export;
+      break;
     default:
-      return false;
+      finalResult = false;
   }
+
+  console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) evaluated from role "${normRole}": action="${action}", result=${finalResult}`);
+  return finalResult;
 }
 
 /**

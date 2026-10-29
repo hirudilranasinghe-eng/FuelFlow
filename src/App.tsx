@@ -186,16 +186,20 @@ export default function App() {
               avatarColor: roleTitle === 'System Admin' ? 'bg-blue-600' : 'bg-purple-600',
             };
             if (isMounted) {
-              setUser(authUser);
               try {
                 localStorage.setItem('fms_user', JSON.stringify(authUser));
               } catch (_) {}
-              // Force-fetch fresh database permissions directly from Supabase for this user
-              fetchAndHydrateActiveUserPermissions(supabase, authUser).then(() => {
-                fetchUserPermissionsFromSupabase(supabase).then(uMap => {
-                  if (uMap && isMounted) setUserPermissions(uMap);
-                });
-              });
+              // Force-fetch fresh database permissions directly from Supabase for this user before setting user state
+              await fetchAndHydrateActiveUserPermissions(supabase, authUser);
+              const [freshRoles, freshUsers] = await Promise.all([
+                fetchRolePermissionsFromSupabase(supabase),
+                fetchUserPermissionsFromSupabase(supabase)
+              ]);
+              if (isMounted) {
+                if (freshRoles) setRolePermissions(freshRoles);
+                if (freshUsers) setUserPermissions(freshUsers);
+                setUser(authUser);
+              }
             }
           }
         } catch (err) {
@@ -213,8 +217,8 @@ export default function App() {
           const stored = localStorage.getItem('fms_user');
           if (stored && isMounted) {
             const parsed = JSON.parse(stored);
-            setUser(parsed);
-            fetchAndHydrateActiveUserPermissions(supabase, parsed);
+            await fetchAndHydrateActiveUserPermissions(supabase, parsed);
+            if (isMounted) setUser(parsed);
           } else if (isMounted) {
             setUser(null);
             invalidatePermissionsCache();
@@ -248,13 +252,17 @@ export default function App() {
           role: roleTitle,
           avatarColor: roleTitle === 'System Admin' ? 'bg-blue-600' : 'bg-purple-600',
         };
-        setUser(authUser);
         try {
           localStorage.setItem('fms_user', JSON.stringify(authUser));
         } catch (_) {}
         fetchAndHydrateActiveUserPermissions(supabase, authUser).then(() => {
-          fetchUserPermissionsFromSupabase(supabase).then(uMap => {
-            if (uMap && isMounted) setUserPermissions(uMap);
+          Promise.all([
+            fetchRolePermissionsFromSupabase(supabase),
+            fetchUserPermissionsFromSupabase(supabase)
+          ]).then(([freshRoles, freshUsers]) => {
+            if (freshRoles && isMounted) setRolePermissions(freshRoles);
+            if (freshUsers && isMounted) setUserPermissions(freshUsers);
+            if (isMounted) setUser(authUser);
           });
         });
       } else {
@@ -279,9 +287,9 @@ export default function App() {
       const canAccess = checkUserPermission(rolePermissions, user, activeTab, 'view', userPermissions);
       if (!canAccess) {
         // Find first available module
-        const fallback = ['dashboard', 'shift', 'deposits', 'reports'].find(m => 
+        const fallback = ['shift', 'deposits', 'fuel_stock', 'reports', 'oil_storage', 'purchases'].find(m => 
           checkUserPermission(rolePermissions, user, m, 'view', userPermissions)
-        ) || 'dashboard';
+        ) || 'shift';
         setActiveTab(fallback);
       }
     }
@@ -290,12 +298,11 @@ export default function App() {
   const handleLoginSuccess = async (signedInUser: AuthUser) => {
     // 1. Invalidate stale cached permissions first
     invalidatePermissionsCache();
-    setUser(signedInUser);
     try {
       localStorage.setItem('fms_user', JSON.stringify(signedInUser));
     } catch (_) {}
 
-    // 2. Fetch fresh permissions from Supabase directly
+    // 2. Fetch fresh permissions from Supabase directly BEFORE setting user state
     await fetchAndHydrateActiveUserPermissions(supabase, signedInUser);
     const [freshRoles, freshUsers] = await Promise.all([
       fetchRolePermissionsFromSupabase(supabase),
@@ -303,6 +310,7 @@ export default function App() {
     ]);
     if (freshRoles) setRolePermissions(freshRoles);
     if (freshUsers) setUserPermissions(freshUsers);
+    setUser(signedInUser);
   };
 
   const handleLogout = async () => {
