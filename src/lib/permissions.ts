@@ -472,7 +472,7 @@ export function getCachedUserPermissions(): UserPermissionsMap {
 }
 
 /**
- * Fetch authenticated users from Supabase Auth via get_supabase_auth_users RPC
+ * Fetch authenticated users from Supabase Auth via get_supabase_auth_users RPC, auth session, and verified permission mappings
  */
 export async function fetchSupabaseAuthUsers(
   client: any
@@ -480,20 +480,90 @@ export async function fetchSupabaseAuthUsers(
   const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
   if (!isConfigured || !client) return [];
 
+  const foundUsers: Array<{ id: string; email: string; full_name: string; role: string }> = [];
+
+  const addUniqueUser = (item: { id: string; email: string; full_name: string; role: string }) => {
+    const email = (item.email || '').toLowerCase().trim();
+    const id = (item.id || '').trim();
+    if (!id && !email) return;
+
+    const exists = foundUsers.some(u => 
+      (id && u.id && u.id === id) || 
+      (email && u.email && u.email.toLowerCase() === email)
+    );
+
+    if (!exists) {
+      foundUsers.push({
+        id: id || email,
+        email: email,
+        full_name: item.full_name || email.split('@')[0] || 'User',
+        role: item.role || 'Supervisor'
+      });
+    }
+  };
+
+  // 1. Primary: Direct query via get_supabase_auth_users RPC function
   try {
     const { data, error } = await client.rpc('get_supabase_auth_users');
     if (!error && Array.isArray(data) && data.length > 0) {
-      return data;
+      data.forEach((u: any) => {
+        if (u) {
+          addUniqueUser({
+            id: String(u.id || u.user_id || u.email || ''),
+            email: String(u.email || ''),
+            full_name: u.full_name || u.name || '',
+            role: u.role || 'user'
+          });
+        }
+      });
     }
   } catch (err) {
-    // Graceful fallback if RPC has not yet been executed in user's database
     console.warn('Notice: get_supabase_auth_users RPC call note:', err);
   }
-  return [];
+
+  // 2. Active Supabase Auth Session
+  try {
+    const { data: sessionData } = await client.auth.getSession();
+    const activeUser = sessionData?.session?.user;
+    if (activeUser) {
+      addUniqueUser({
+        id: activeUser.id,
+        email: activeUser.email || '',
+        full_name: activeUser.user_metadata?.full_name || activeUser.user_metadata?.name || activeUser.email?.split('@')[0] || 'Admin',
+        role: activeUser.user_metadata?.role || 'System Admin'
+      });
+    }
+  } catch (_) {}
+
+  // 3. Verified Authenticated Users already present in user_permissions table
+  try {
+    const { data: permUsers, error: pError } = await client
+      .from('user_permissions')
+      .select('user_id, user_name, user_role')
+      .not('user_id', 'is', null);
+
+    if (!pError && Array.isArray(permUsers)) {
+      permUsers.forEach((pu: any) => {
+        const uid = String(pu.user_id || '').trim();
+        if (uid) {
+          const isEmail = uid.includes('@');
+          addUniqueUser({
+            id: uid,
+            email: isEmail ? uid : '',
+            full_name: pu.user_name || (isEmail ? uid.split('@')[0] : 'Auth User'),
+            role: pu.user_role || 'Supervisor'
+          });
+        }
+      });
+    }
+  } catch (_) {}
+
+  return foundUsers;
 }
 
 /**
  * Fetch all user-specific permission overrides from Supabase `user_permissions` table
+ * Merges authoritative Supabase overrides with cached permissions to guarantee persistent state on page reload
  */
 export async function fetchUserPermissionsFromSupabase(client: any): Promise<UserPermissionsMap> {
   const currentMap = getCachedUserPermissions();
@@ -505,25 +575,49 @@ export async function fetchUserPermissionsFromSupabase(client: any): Promise<Use
       .from('user_permissions')
       .select('*');
 
-    if (!error && data && Array.isArray(data)) {
-      const updatedMap: UserPermissionsMap = {};
+    if (error) {
+      console.warn('Notice: user_permissions query note:', error.message);
+      return currentMap;
+    }
+
+    if (data && Array.isArray(data)) {
+      // Retain existing map as baseline, Supabase records take full precedence
+      const updatedMap: UserPermissionsMap = { ...currentMap };
 
       data.forEach((row: any) => {
         const uId = String(row.user_id || row.userId || '').trim();
-        const mod = row.module;
+        const mod = row.module || row.module_key;
         if (!uId || !mod) return;
 
-        if (!updatedMap[uId]) {
-          updatedMap[uId] = {};
-        }
-
-        updatedMap[uId][mod] = {
+        const canon = canonicalModuleId(mod);
+        const rule = {
           canView: row.is_visible ?? row.can_view ?? row.isVisible ?? row.canView ?? true,
           canCreate: row.can_create ?? row.canCreate ?? false,
           canEdit: row.can_edit ?? row.canEdit ?? false,
           canDelete: row.can_delete ?? row.canDelete ?? false,
           canExport: row.can_export ?? row.canExport ?? false,
         };
+
+        // Index under original uId
+        if (!updatedMap[uId]) updatedMap[uId] = {};
+        updatedMap[uId][mod] = rule;
+        updatedMap[uId][canon] = rule;
+
+        // Index under lowercase uId
+        const lowerUid = uId.toLowerCase();
+        if (lowerUid !== uId) {
+          if (!updatedMap[lowerUid]) updatedMap[lowerUid] = {};
+          updatedMap[lowerUid][mod] = rule;
+          updatedMap[lowerUid][canon] = rule;
+        }
+
+        // If row has user_name or email, index those as aliases
+        const rowEmail = String(row.email || row.user_email || '').trim().toLowerCase();
+        if (rowEmail) {
+          if (!updatedMap[rowEmail]) updatedMap[rowEmail] = {};
+          updatedMap[rowEmail][mod] = rule;
+          updatedMap[rowEmail][canon] = rule;
+        }
       });
 
       try {
@@ -660,7 +754,7 @@ export async function fetchAndHydrateActiveUserPermissions(
 }
 
 /**
- * Save user-specific permissions map to Supabase `user_permissions` and localStorage
+ * Save user-specific permissions map to Supabase `user_permissions` and localStorage with fail-safe upsert
  */
 export async function saveUserPermissionsToSupabase(
   client: any,
@@ -723,6 +817,7 @@ export async function saveUserPermissionsToSupabase(
     if (targetUserInfo?.email && targetUserInfo.email !== targetUserId) {
       if (!currentAdminEmail || targetUserInfo.email.toLowerCase().trim() !== currentAdminEmail) {
         targetIds.add(targetUserInfo.email);
+        targetIds.add(targetUserInfo.email.toLowerCase().trim());
       }
     }
   } else {
@@ -742,6 +837,7 @@ export async function saveUserPermissionsToSupabase(
           user_role: targetUserInfo?.role || null,
           module: moduleId,
           is_visible: isVis,
+          can_view: isVis,
           can_create: !!p.canCreate,
           can_edit: !!p.canEdit,
           can_delete: !!p.canDelete,
@@ -754,7 +850,67 @@ export async function saveUserPermissionsToSupabase(
 
   if (records.length === 0) return { success: true };
 
-  return await resilientUpsertPermissions(client, 'user_permissions', records, 'user_id,module');
+  // 3. Multi-strategy database upsert to handle any PostgreSQL schema / constraint variation
+  // Strategy A: Standard upsert on unique constraint (user_id, module)
+  try {
+    const { error: errA } = await client
+      .from('user_permissions')
+      .upsert(records, { onConflict: 'user_id,module' });
+
+    if (!errA) {
+      console.log('✓ Supabase user permissions saved successfully (Strategy A)');
+      return { success: true };
+    }
+
+    // Strategy B: Upsert on primary key 'id'
+    const { error: errB } = await client
+      .from('user_permissions')
+      .upsert(records, { onConflict: 'id' });
+
+    if (!errB) {
+      console.log('✓ Supabase user permissions saved successfully (Strategy B)');
+      return { success: true };
+    }
+
+    // Strategy C: Delete existing rows for targetUserId then insert
+    if (targetUserId) {
+      await client.from('user_permissions').delete().eq('user_id', targetUserId);
+      if (targetUserInfo?.email && targetUserInfo.email !== targetUserId) {
+        await client.from('user_permissions').delete().eq('user_id', targetUserInfo.email);
+      }
+      const { error: errC } = await client.from('user_permissions').insert(records);
+      if (!errC) {
+        console.log('✓ Supabase user permissions saved successfully (Strategy C delete+insert)');
+        return { success: true };
+      }
+
+      // Strategy D: Core columns only (fallback if user_name or user_role columns do not exist)
+      const coreRecords = records.map(r => ({
+        id: r.id,
+        user_id: r.user_id,
+        module: r.module,
+        is_visible: r.is_visible,
+        can_create: r.can_create,
+        can_edit: r.can_edit,
+        can_delete: r.can_delete,
+        can_export: r.can_export,
+        updated_at: r.updated_at
+      }));
+
+      const { error: errD } = await client.from('user_permissions').insert(coreRecords);
+      if (!errD) {
+        console.log('✓ Supabase user permissions saved successfully (Strategy D core columns)');
+        return { success: true };
+      }
+      console.error('Database error saving user permissions to Supabase:', errD.message, errD.details);
+      return { success: false, error: errD.message };
+    }
+  } catch (err: any) {
+    console.error('Exception saving user permissions to Supabase:', err);
+    return { success: false, error: err?.message || 'Database error' };
+  }
+
+  return { success: true };
 }
 
 /**

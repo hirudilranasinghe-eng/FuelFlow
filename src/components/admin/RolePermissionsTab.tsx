@@ -54,8 +54,14 @@ export default function RolePermissionsTab({
   const [userPermissions, setUserPermissions] = useState<UserPermissionsMap>(() => getCachedUserPermissions());
   const [supabaseAuthUsers, setSupabaseAuthUsers] = useState<Array<{ id: string; email: string; full_name: string; role: string }>>([]);
 
-  // Selected Supabase Auth User State
-  const [selectedUserId, setSelectedUserId] = useState<string>('');
+  // Selected Supabase Auth User State (persisted across reloads)
+  const [selectedUserId, setSelectedUserId] = useState<string>(() => {
+    try {
+      return localStorage.getItem('fuel_flow_selected_rbac_user_id') || '';
+    } catch (_) {
+      return '';
+    }
+  });
 
   // General Filter & Loading States
   const [searchQuery, setSearchQuery] = useState('');
@@ -64,7 +70,7 @@ export default function RolePermissionsTab({
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [lastSavedTime, setLastSavedTime] = useState<string | null>(null);
 
-  // Combined User Directory: Supabase Auth users + station employees (supervisors, pumpers) + admin
+  // User Directory strictly filtered to Supabase Auth users (auth.users) and verified auth mappings
   const authUsersList = useMemo(() => {
     const list: Array<{ 
       id: string; 
@@ -75,20 +81,21 @@ export default function RolePermissionsTab({
       isAuthUser: boolean; 
     }> = [];
 
-    // 1. Add active Supabase Auth accounts returned from get_supabase_auth_users() RPC
+    // 1. Add active Supabase Auth accounts returned from get_supabase_auth_users() RPC or auth service
     supabaseAuthUsers.forEach(sbUser => {
       const email = (sbUser.email || '').toLowerCase().trim();
-      if (!email) return;
+      const id = (sbUser.id || '').trim();
+      if (!email && !id) return;
 
       const alreadyInList = list.some(u => 
-        (u.id && sbUser.id && u.id === sbUser.id) || 
-        (u.email && u.email.toLowerCase().trim() === email)
+        (u.id && id && u.id === id) || 
+        (u.email && email && u.email.toLowerCase().trim() === email)
       );
 
       if (!alreadyInList) {
         const normRole = normalizeRoleName(sbUser.role);
         list.push({
-          id: sbUser.id,
+          id: id || email,
           name: sbUser.full_name || sbUser.email.split('@')[0] || 'Auth User',
           role: normRole,
           email: sbUser.email,
@@ -98,46 +105,27 @@ export default function RolePermissionsTab({
       }
     });
 
-    // 2. Add station employees (Supervisors, Pumpers, etc.) so admin can configure their access
-    employees.forEach(emp => {
-      const empEmail = `${emp.name.toLowerCase().replace(/[^a-z0-9]/g, '.')}@fuelflow.lk`;
+    // 2. Add current authenticated Supabase user session (Admin or active logged-in user)
+    if (user && (user.email || user.id)) {
+      const adminEmail = (user.email || '').toLowerCase().trim();
+      const adminId = (user.id || '').trim();
       const alreadyInList = list.some(u => 
-        (u.id && emp.id && u.id === emp.id) || 
-        (u.name && emp.name && u.name.toLowerCase().trim() === emp.name.toLowerCase().trim())
-      );
-      if (!alreadyInList) {
-        const normRole = normalizeRoleName(emp.role);
-        list.push({
-          id: emp.id,
-          name: emp.name,
-          role: normRole,
-          email: empEmail,
-          avatarColor: emp.avatarColor || (normRole === 'Supervisor' ? 'bg-amber-600' : 'bg-emerald-600'),
-          isAuthUser: false
-        });
-      }
-    });
-
-    // 3. Add current authenticated Supabase user session (Admin)
-    if (user && user.email) {
-      const adminEmail = user.email.toLowerCase().trim();
-      const alreadyInList = list.some(u => 
-        (u.id && user.id && u.id === user.id) || 
-        (u.email && u.email.toLowerCase().trim() === adminEmail)
+        (adminId && u.id && u.id === adminId) || 
+        (adminEmail && u.email && u.email.toLowerCase().trim() === adminEmail)
       );
       if (!alreadyInList) {
         list.push({
           id: user.id || 'user_admin',
-          name: user.name || (user.email.split('@')[0]) || 'Admin User',
+          name: user.name || (user.email?.split('@')[0]) || 'Admin User',
           role: user.role || 'System Admin',
-          email: user.email,
+          email: user.email || '',
           avatarColor: user.avatarColor || 'bg-blue-600',
           isAuthUser: true
         });
       }
     }
 
-    // 4. Fallback default account if database RPC returned no records yet
+    // 3. Fallback default account if database RPC returned no records yet
     if (list.length === 0) {
       list.push({
         id: 'auth_admin_01',
@@ -150,13 +138,22 @@ export default function RolePermissionsTab({
     }
 
     return list;
-  }, [user, supabaseAuthUsers, employees]);
+  }, [user, supabaseAuthUsers]);
 
-  // Set default selected user: Prefer selecting a non-admin team member first
+  // Set default selected user and persist selection across reloads
   useEffect(() => {
-    if (!selectedUserId && authUsersList.length > 0) {
+    if (authUsersList.length === 0) return;
+
+    // Check if previously selected user is still in the active auth list
+    const found = authUsersList.find(u => u.id === selectedUserId);
+    if (!found) {
+      // Prefer selecting a non-admin team member first
       const nonAdmin = authUsersList.find(u => normalizeRoleName(u.role) !== 'System Admin');
-      setSelectedUserId(nonAdmin ? nonAdmin.id : authUsersList[0].id);
+      const nextId = nonAdmin ? nonAdmin.id : authUsersList[0].id;
+      setSelectedUserId(nextId);
+      try {
+        localStorage.setItem('fuel_flow_selected_rbac_user_id', nextId);
+      } catch (_) {}
     }
   }, [authUsersList, selectedUserId]);
 
@@ -169,16 +166,23 @@ export default function RolePermissionsTab({
     return normalizeRoleName(selectedUser?.role);
   }, [selectedUser]);
 
-  // Check if selected user has custom specific overrides
-  const selectedUserHasOverride = useMemo(() => {
-    if (!selectedUser) return false;
+  // Check if selected user has custom specific overrides in userPermissions map
+  const existingOverride = useMemo(() => {
+    if (!selectedUser) return null;
     const uId = selectedUser.id;
     const uEmail = selectedUser.email?.toLowerCase().trim();
-    return !!(
-      (uId && userPermissions[uId] && Object.keys(userPermissions[uId]).length > 0) ||
-      (uEmail && userPermissions[uEmail] && Object.keys(userPermissions[uEmail]).length > 0)
-    );
+    const uName = selectedUser.name?.toLowerCase().trim();
+    return (uId && userPermissions[uId]) ||
+      (uEmail && userPermissions[uEmail]) ||
+      (uId && userPermissions[uId.toLowerCase()]) ||
+      (uEmail && userPermissions[uEmail.toLowerCase()]) ||
+      (uName && userPermissions[uName]) ||
+      null;
   }, [userPermissions, selectedUser]);
+
+  const selectedUserHasOverride = useMemo(() => {
+    return !!(existingOverride && Object.keys(existingOverride).length > 0);
+  }, [existingOverride]);
 
   // =========================================================================
   // DECOUPLED TARGET USER PERMISSIONS STATE
@@ -195,22 +199,32 @@ export default function RolePermissionsTab({
   // Sync target permissions whenever selected target user changes or Supabase permissions refresh
   useEffect(() => {
     if (!selectedUser) return;
-    const uId = selectedUser.id;
-    const uEmail = selectedUser.email?.toLowerCase().trim();
     const norm = normalizeRoleName(selectedUser.role);
     const rRules = rolePermissions[norm] || rolePermissions['Supervisor'] || {};
 
-    const existingOverride = (uId && userPermissions[uId]) || (uEmail && userPermissions[uEmail]);
-
     const initial: Record<string, any> = {};
     SYSTEM_MODULES.forEach(m => {
-      if (existingOverride && existingOverride[m.id]) {
-        initial[m.id] = { ...existingOverride[m.id] };
+      const canon = m.id;
+      const modOverride = existingOverride ? (
+        existingOverride[m.id] ||
+        existingOverride[canon] ||
+        existingOverride[m.id.replace(/-/g, '_')] ||
+        existingOverride[m.id.replace(/_/g, '-')]
+      ) : null;
+
+      if (modOverride) {
+        initial[m.id] = {
+          canView: modOverride.canView !== undefined ? modOverride.canView : ((modOverride as any).is_visible ?? true),
+          canCreate: !!modOverride.canCreate,
+          canEdit: !!modOverride.canEdit,
+          canDelete: !!modOverride.canDelete,
+          canExport: !!modOverride.canExport
+        };
       } else if (rRules[m.id]) {
         initial[m.id] = { ...rRules[m.id] };
       } else {
         initial[m.id] = {
-          canView: m.id !== 'admin',
+          canView: m.id !== 'admin_control',
           canCreate: false,
           canEdit: false,
           canDelete: false,
@@ -221,7 +235,7 @@ export default function RolePermissionsTab({
 
     setTargetPermissions(initial);
     setHasUnsavedChanges(false);
-  }, [selectedUserId, selectedUser?.id, selectedUser?.email, selectedUser?.role, rolePermissions, userPermissions]);
+  }, [selectedUserId, selectedUser?.id, selectedUser?.email, selectedUser?.role, rolePermissions, userPermissions, existingOverride]);
 
   // Load permissions and RPC auth users from Supabase on mount
   useEffect(() => {
@@ -415,22 +429,26 @@ export default function RolePermissionsTab({
     setIsSaving(true);
     try {
       const targetId = selectedUser.id;
-      const targetEmail = selectedUser.email;
+      const targetEmail = selectedUser.email?.toLowerCase().trim();
       const targetName = selectedUser.name;
       const targetRole = selectedUser.role;
 
       // Identify currently logged-in admin user identifiers
       const adminId = user?.id;
       const adminEmail = user?.email?.toLowerCase().trim();
-      const isTargetingAdmin = (adminId && targetId === adminId) || (adminEmail && targetEmail?.toLowerCase().trim() === adminEmail);
+      const isTargetingAdmin = (adminId && targetId === adminId) || (adminEmail && targetEmail === adminEmail);
 
       // Create updated userPermissions map strictly applying only to target user
       const updatedMap = { ...userPermissions };
       if (targetId) {
         updatedMap[targetId] = { ...targetPermissions };
+        const lowerId = targetId.toLowerCase();
+        if (lowerId !== targetId) {
+          updatedMap[lowerId] = { ...targetPermissions };
+        }
       }
       if (targetEmail && targetEmail !== targetId) {
-        if (!adminEmail || targetEmail.toLowerCase().trim() !== adminEmail) {
+        if (!adminEmail || targetEmail !== adminEmail) {
           updatedMap[targetEmail] = { ...targetPermissions };
         }
       }
@@ -451,7 +469,7 @@ export default function RolePermissionsTab({
       } catch (_) {}
 
       // Isolated Supabase update strictly targeting the selected user
-      await saveUserPermissionsToSupabase(
+      const res = await saveUserPermissionsToSupabase(
         supabase, 
         updatedMap, 
         targetId, 
@@ -460,7 +478,11 @@ export default function RolePermissionsTab({
 
       setHasUnsavedChanges(false);
       setLastSavedTime(new Date().toLocaleTimeString());
-      showToast(`✓ Custom access permissions saved for ${targetName}!`);
+      if (res && res.error) {
+        showToast(`Saved locally. Supabase note: ${res.error}`);
+      } else {
+        showToast(`✓ Custom access permissions saved & synced for ${targetName}!`);
+      }
     } catch (err: any) {
       console.error("Error saving user permissions:", err);
       setHasUnsavedChanges(false);
@@ -505,7 +527,11 @@ export default function RolePermissionsTab({
               <select
                 value={selectedUserId}
                 onChange={(e) => {
-                  setSelectedUserId(e.target.value);
+                  const newId = e.target.value;
+                  setSelectedUserId(newId);
+                  try {
+                    localStorage.setItem('fuel_flow_selected_rbac_user_id', newId);
+                  } catch (_) {}
                   setHasUnsavedChanges(false);
                 }}
                 className="w-full pl-3.5 pr-10 py-2.5 bg-gray-50 hover:bg-gray-100/80 border border-gray-200 rounded-xl text-xs font-bold text-[#1C1C1C] focus:outline-none focus:border-purple-600 focus:bg-white transition-all cursor-pointer appearance-none shadow-2xs"
@@ -517,7 +543,7 @@ export default function RolePermissionsTab({
                   );
                   return (
                     <option key={u.id} value={u.id}>
-                      {u.name} ({u.email}) — [{u.role}] {hasOverride ? '★ Custom Override' : '(Role Default)'}
+                      {u.name} ({u.email || u.id}) — [{u.role}] {hasOverride ? '★ Custom Override' : '(Role Default)'}
                     </option>
                   );
                 })}
@@ -582,7 +608,7 @@ export default function RolePermissionsTab({
                   <span className="text-sm font-extrabold text-[#1C1C1C]">{selectedUser.name}</span>
                   <span className="text-xs text-gray-600 font-medium">({selectedUser.email})</span>
                   <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 border border-blue-200 flex items-center gap-1">
-                    <Shield className="w-2.5 h-2.5" /> {selectedUser.isAuthUser ? 'Supabase Auth' : 'Station Staff'}
+                    <Shield className="w-2.5 h-2.5" /> {selectedUser.isAuthUser ? 'Supabase Auth' : 'Verified Auth'}
                   </span>
                   <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-purple-200/70 text-purple-900">
                     Role: {selectedUser.role}
