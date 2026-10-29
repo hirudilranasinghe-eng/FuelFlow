@@ -40,7 +40,8 @@ import {
   fetchRolePermissionsFromSupabase, 
   fetchUserPermissionsFromSupabase,
   fetchAndHydrateActiveUserPermissions,
-  clearActiveUserPermissions
+  clearActiveUserPermissions,
+  invalidatePermissionsCache
 } from './lib/permissions';
 
 export const defaultPumpMachines: PumpMachine[] = [];
@@ -84,13 +85,25 @@ export default function App() {
         setUserPermissions(e.detail.userPermissionsMap);
       }
     };
+    const handleGeneralPermissionsSync = (e: any) => {
+      if (isMounted) {
+        if (e?.detail?.userPermissionsMap) {
+          setUserPermissions(e.detail.userPermissionsMap);
+        }
+        if (e?.detail?.permissionsMap) {
+          setRolePermissions(e.detail.permissionsMap);
+        }
+      }
+    };
 
     window.addEventListener('role-permissions-updated', handleRoleSync);
     window.addEventListener('user-permissions-updated', handleUserSync);
+    window.addEventListener('permissions-updated', handleGeneralPermissionsSync);
     return () => {
       isMounted = false;
       window.removeEventListener('role-permissions-updated', handleRoleSync);
       window.removeEventListener('user-permissions-updated', handleUserSync);
+      window.removeEventListener('permissions-updated', handleGeneralPermissionsSync);
     };
   }, []);
 
@@ -177,14 +190,19 @@ export default function App() {
               try {
                 localStorage.setItem('fms_user', JSON.stringify(authUser));
               } catch (_) {}
-              fetchAndHydrateActiveUserPermissions(supabase, authUser);
+              // Force-fetch fresh database permissions directly from Supabase for this user
+              fetchAndHydrateActiveUserPermissions(supabase, authUser).then(() => {
+                fetchUserPermissionsFromSupabase(supabase).then(uMap => {
+                  if (uMap && isMounted) setUserPermissions(uMap);
+                });
+              });
             }
           }
         } catch (err) {
           console.warn("Supabase auth session check notice:", err);
           if (isMounted) {
             setUser(null);
-            clearActiveUserPermissions();
+            invalidatePermissionsCache();
             try {
               localStorage.removeItem('fms_user');
             } catch (_) {}
@@ -199,12 +217,12 @@ export default function App() {
             fetchAndHydrateActiveUserPermissions(supabase, parsed);
           } else if (isMounted) {
             setUser(null);
-            clearActiveUserPermissions();
+            invalidatePermissionsCache();
           }
         } catch (_) {
           if (isMounted) {
             setUser(null);
-            clearActiveUserPermissions();
+            invalidatePermissionsCache();
           }
         }
       }
@@ -234,10 +252,14 @@ export default function App() {
         try {
           localStorage.setItem('fms_user', JSON.stringify(authUser));
         } catch (_) {}
-        fetchAndHydrateActiveUserPermissions(supabase, authUser);
+        fetchAndHydrateActiveUserPermissions(supabase, authUser).then(() => {
+          fetchUserPermissionsFromSupabase(supabase).then(uMap => {
+            if (uMap && isMounted) setUserPermissions(uMap);
+          });
+        });
       } else {
         setUser(null);
-        clearActiveUserPermissions();
+        invalidatePermissionsCache();
         try {
           localStorage.removeItem('fms_user');
         } catch (_) {}
@@ -265,12 +287,22 @@ export default function App() {
     }
   }, [user, activeTab, rolePermissions, userPermissions]);
 
-  const handleLoginSuccess = (signedInUser: AuthUser) => {
+  const handleLoginSuccess = async (signedInUser: AuthUser) => {
+    // 1. Invalidate stale cached permissions first
+    invalidatePermissionsCache();
     setUser(signedInUser);
     try {
       localStorage.setItem('fms_user', JSON.stringify(signedInUser));
     } catch (_) {}
-    fetchAndHydrateActiveUserPermissions(supabase, signedInUser);
+
+    // 2. Fetch fresh permissions from Supabase directly
+    await fetchAndHydrateActiveUserPermissions(supabase, signedInUser);
+    const [freshRoles, freshUsers] = await Promise.all([
+      fetchRolePermissionsFromSupabase(supabase),
+      fetchUserPermissionsFromSupabase(supabase)
+    ]);
+    if (freshRoles) setRolePermissions(freshRoles);
+    if (freshUsers) setUserPermissions(freshUsers);
   };
 
   const handleLogout = async () => {
@@ -281,7 +313,7 @@ export default function App() {
       }
     } catch (_) {}
     setUser(null);
-    clearActiveUserPermissions();
+    invalidatePermissionsCache();
     try {
       localStorage.removeItem('fms_user');
       localStorage.removeItem('fuelflow_user');
