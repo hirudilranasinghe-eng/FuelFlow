@@ -567,9 +567,12 @@ export async function fetchSupabaseAuthUsers(
  * Never fall back to default true when can_view is false.
  */
 export function extractVisibility(record: any): boolean {
-  if (!record || typeof record !== 'object') return true;
+  if (record === false || record === 'false' || record === 0) return false;
+  if (record === true || record === 'true' || record === 1) return true;
+  if (record === null || record === undefined) return false;
+  if (typeof record !== 'object') return false;
 
-  // Strict check: if can_view or is_visible is explicitly false (or 0 / 'false'), immediately return false
+  // Strict check: if can_view, canView, is_visible, or isVisible is explicitly false, immediately return false
   if (record.can_view === false || record.can_view === 'false' || record.can_view === 0) return false;
   if (record.canView === false || record.canView === 'false' || record.canView === 0) return false;
   if (record.is_visible === false || record.is_visible === 'false' || record.is_visible === 0) return false;
@@ -581,7 +584,7 @@ export function extractVisibility(record: any): boolean {
   if (record.is_visible === true || record.is_visible === 'true' || record.is_visible === 1) return true;
   if (record.isVisible === true || record.isVisible === 'true' || record.isVisible === 1) return true;
 
-  return true;
+  return false;
 }
 
 /**
@@ -600,22 +603,55 @@ export function extractModuleKey(row: any): string {
 export async function fetchUserPermissionsFromSupabase(client: any): Promise<UserPermissionsMap> {
   const currentMap = getCachedUserPermissions();
   const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
-  if (!isConfigured || !client) return currentMap;
+  if (!isConfigured || !client) {
+    console.warn('[RBAC Sync] Supabase client not configured or unavailable. Falling back to cached local permissions.');
+    return currentMap;
+  }
 
   try {
+    console.log('[RBAC Sync] Fetching user permissions from Supabase table "user_permissions"...');
     const { data, error } = await client
       .from('user_permissions')
       .select('*');
 
     if (error) {
-      console.warn('Notice: user_permissions query note:', error.message);
+      console.error('[RBAC Sync] ✗ Failed to fetch user_permissions from Supabase:', error.message, error.details || '');
+      console.warn('[RBAC Sync] Falling back to local cache due to database query error.');
       return currentMap;
     }
 
-    if (data && Array.isArray(data)) {
-      // Build fresh permissions map directly from authoritative Supabase database rows.
-      // Do not merge with stale local cache so modifications and removals on other laptops reflect immediately!
-      const updatedMap: UserPermissionsMap = {};
+    if (!data || !Array.isArray(data)) {
+      console.warn('[RBAC Sync] Supabase returned empty/non-array data. Falling back to cached local permissions.');
+      return currentMap;
+    }
+
+    console.log(`[RBAC Sync] ✓ Successfully loaded ${data.length} user_permissions record(s) from Supabase.`);
+
+    // If Supabase returned records, use them as the absolute source of truth!
+    // Start with currentMap as fallback base, but completely purge and replace records for any user present in Supabase
+    const updatedMap: UserPermissionsMap = { ...currentMap };
+
+    if (data.length > 0) {
+      // Find all unique user identifiers returned from Supabase
+      const usersInDb = new Set<string>();
+      data.forEach((row: any) => {
+        const uId = String(row.user_id || row.userId || '').trim();
+        if (uId) {
+          usersInDb.add(uId);
+          usersInDb.add(uId.toLowerCase());
+          if (uId.includes('@')) usersInDb.add(uId.toLowerCase().split('@')[0]);
+        }
+        const rowEmail = String(row.email || row.user_email || '').trim().toLowerCase();
+        if (rowEmail) {
+          usersInDb.add(rowEmail);
+          if (rowEmail.includes('@')) usersInDb.add(rowEmail.split('@')[0]);
+        }
+      });
+
+      // Clear cached permissions for users that exist in Supabase so stale local rules never overwrite database truth
+      usersInDb.forEach(k => {
+        delete updatedMap[k];
+      });
 
       data.forEach((row: any) => {
         const uId = String(row.user_id || row.userId || '').trim();
@@ -668,17 +704,18 @@ export async function fetchUserPermissionsFromSupabase(client: any): Promise<Use
           mapUserAliases(rowName.replace(/\s+/g, ''));
         }
       });
-
-      try {
-        localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(updatedMap));
-        window.dispatchEvent(new CustomEvent('user-permissions-updated', { detail: { userPermissionsMap: updatedMap } }));
-        window.dispatchEvent(new CustomEvent('permissions-updated', { detail: { userPermissionsMap: updatedMap } }));
-      } catch (_) {}
-
-      return updatedMap;
     }
-  } catch (err) {
-    console.warn('Notice: Error fetching user_permissions from Supabase:', err);
+
+    try {
+      localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(updatedMap));
+      window.dispatchEvent(new CustomEvent('user-permissions-updated', { detail: { userPermissionsMap: updatedMap } }));
+      window.dispatchEvent(new CustomEvent('permissions-updated', { detail: { userPermissionsMap: updatedMap } }));
+    } catch (_) {}
+
+    return updatedMap;
+  } catch (err: any) {
+    console.error('[RBAC Sync] ✗ Exception in fetchUserPermissionsFromSupabase:', err?.message || err);
+    console.warn('[RBAC Sync] Falling back to local cache.');
   }
 
   return currentMap;
@@ -746,84 +783,30 @@ export async function fetchAndHydrateActiveUserPermissions(
   const userName = ((user as any).name || '').trim().toLowerCase();
   const userPrefix = userEmail.includes('@') ? userEmail.split('@')[0] : '';
 
-  // 1. Clear stale active permissions first so old rules from previous sessions cannot bleed through
-  try {
-    localStorage.removeItem(ACTIVE_USER_PERMS_KEY);
-  } catch (_) {}
+  // Retain cached rules in memory during in-flight fetch so UI does not flicker or revert
+  const cachedActive = getActiveUserPermissions();
+  const activeRules: Record<string, any> = { ...cachedActive };
 
-  const activeRules: Record<string, any> = {};
-
-  // 2. Direct query Supabase user_permissions table first if connected (Authoritative Cloud Truth)
+  // 1. Direct query Supabase user_permissions table first if connected (Authoritative Cloud Truth)
   const isConfigured = !!(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
-  let dbRows: any[] | null = null;
 
   if (isConfigured && client) {
     try {
+      console.log(`[RBAC Hydrate] Fetching active permissions from Supabase for user: ${userEmail || userId}`);
       const { data, error } = await client
         .from('user_permissions')
         .select('*');
 
       if (!error && Array.isArray(data)) {
-        dbRows = data;
+        console.log(`[RBAC Hydrate] Retrieved ${data.length} total user_permissions rows from Supabase.`);
 
-        // Populate fresh full map from cloud records
-        const freshUserMap: UserPermissionsMap = {};
-        dbRows.forEach((row: any) => {
-          const rUid = String(row.user_id || row.userId || '').trim();
-          const rawMod = extractModuleKey(row);
-          if (!rUid || !rawMod) return;
-
-          const canon = canonicalModuleId(rawMod);
-          const isVis = extractVisibility(row);
-
-          const rule = {
-            canView: isVis,
-            can_view: isVis,
-            is_visible: isVis,
-            canCreate: row.can_create ?? row.canCreate ?? false,
-            canEdit: row.can_edit ?? row.canEdit ?? false,
-            canDelete: row.can_delete ?? row.canDelete ?? false,
-            canExport: row.can_export ?? row.canExport ?? false,
-          };
-
-          const mapAlias = (k: string) => {
-            if (!k) return;
-            if (!freshUserMap[k]) freshUserMap[k] = {};
-            freshUserMap[k][rawMod] = rule;
-            freshUserMap[k][canon] = rule;
-            freshUserMap[k][rawMod.replace(/-/g, '_')] = rule;
-            freshUserMap[k][rawMod.replace(/_/g, '-')] = rule;
-            freshUserMap[k][`module_${canon}`] = rule;
-          };
-
-          mapAlias(rUid);
-          mapAlias(rUid.toLowerCase());
-          if (rUid.includes('@')) {
-            mapAlias(rUid.toLowerCase().split('@')[0]);
-          }
-          const rEmail = String(row.email || row.user_email || '').trim().toLowerCase();
-          if (rEmail) {
-            mapAlias(rEmail);
-            if (rEmail.includes('@')) mapAlias(rEmail.split('@')[0]);
-          }
-          const rName = String(row.user_name || '').trim().toLowerCase();
-          if (rName) {
-            mapAlias(rName);
-          }
-        });
-
-        try {
-          localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(freshUserMap));
-        } catch (_) {}
-
-        // Multi-identifier matching for the active logged-in user:
-        // Match by user_id (UUID), lowercase email, prefix before '@', and user_name
-        dbRows.forEach((row: any) => {
+        // Find rows specifically belonging to this user
+        const matchedRows = data.filter((row: any) => {
           const rowUid = String(row.user_id || '').trim().toLowerCase();
           const rowName = String(row.user_name || '').trim().toLowerCase();
           const rowEmail = String(row.email || row.user_email || '').trim().toLowerCase();
 
-          const isMatch = (
+          return (
             (userIdLower && (rowUid === userIdLower || rowUid.includes(userIdLower))) ||
             (userEmail && (
               rowUid === userEmail ||
@@ -834,8 +817,15 @@ export async function fetchAndHydrateActiveUserPermissions(
             )) ||
             (userName && (rowName === userName || rowUid === userName || rowName.includes(userName)))
           );
+        });
 
-          if (isMatch) {
+        if (matchedRows.length > 0) {
+          console.log(`[RBAC Hydrate] ✓ Found ${matchedRows.length} explicit permission record(s) in Supabase. Using Supabase as absolute source of truth.`);
+
+          // Supabase is absolute source of truth: reset activeRules so stale local defaults cannot persist
+          Object.keys(activeRules).forEach(k => delete activeRules[k]);
+
+          matchedRows.forEach((row: any) => {
             const rawMod = extractModuleKey(row);
             if (rawMod) {
               const canon = canonicalModuleId(rawMod);
@@ -855,15 +845,19 @@ export async function fetchAndHydrateActiveUserPermissions(
               activeRules[rawMod.replace(/_/g, '-')] = rule;
               activeRules[`module_${canon}`] = rule;
             }
-          }
-        });
+          });
+        } else {
+          console.log(`[RBAC Hydrate] No specific user_permissions records in Supabase for user ${userEmail || userId}.`);
+        }
+      } else if (error) {
+        console.error('[RBAC Hydrate] ✗ Supabase query error:', error.message);
       }
-    } catch (err) {
-      console.warn('Direct user_permissions query notice:', err);
+    } catch (err: any) {
+      console.warn('[RBAC Hydrate] Direct query exception:', err?.message || err);
     }
   }
 
-  // 3. Fallback to cached user permissions if database was not reached or returned no rows
+  // 2. Fallback to cached user permissions if database was not reached or returned no rows
   if (Object.keys(activeRules).length === 0) {
     const allUserPerms = getCachedUserPermissions();
     const matched = (userId && allUserPerms[userId]) ||
@@ -873,6 +867,7 @@ export async function fetchAndHydrateActiveUserPermissions(
       (userName && allUserPerms[userName]);
 
     if (matched) {
+      console.log('[RBAC Hydrate] Populated active rules from local cached user permissions.');
       Object.keys(matched).forEach(k => {
         const canon = canonicalModuleId(k);
         activeRules[k] = matched[k];

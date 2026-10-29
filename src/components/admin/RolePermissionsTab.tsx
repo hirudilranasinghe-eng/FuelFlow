@@ -32,7 +32,8 @@ import {
   saveUserPermissionsToSupabase,
   clearUserPermissionOverrides,
   getCachedUserPermissions,
-  fetchSupabaseAuthUsers
+  fetchSupabaseAuthUsers,
+  extractVisibility
 } from '../../lib/permissions';
 import { supabase } from '../../lib/supabase';
 
@@ -145,8 +146,17 @@ export default function RolePermissionsTab({
     if (authUsersList.length === 0) return;
 
     // Check if previously selected user is still in the active auth list
-    const found = authUsersList.find(u => u.id === selectedUserId);
+    const found = authUsersList.find(u => 
+      u.id === selectedUserId || 
+      (u.email && selectedUserId && u.email.toLowerCase().trim() === selectedUserId.toLowerCase().trim())
+    );
+
+    // Only fallback if auth users have finished loading and target is genuinely not in the directory
     if (!found) {
+      if (isLoading || supabaseAuthUsers.length === 0) {
+        // Still loading auth accounts from Supabase; preserve user selection!
+        return;
+      }
       // Prefer selecting a non-admin team member first
       const nonAdmin = authUsersList.find(u => normalizeRoleName(u.role) !== 'System Admin');
       const nextId = nonAdmin ? nonAdmin.id : authUsersList[0].id;
@@ -155,11 +165,14 @@ export default function RolePermissionsTab({
         localStorage.setItem('fuel_flow_selected_rbac_user_id', nextId);
       } catch (_) {}
     }
-  }, [authUsersList, selectedUserId]);
+  }, [authUsersList, selectedUserId, isLoading, supabaseAuthUsers.length]);
 
   // Selected User Object
   const selectedUser = useMemo(() => {
-    return authUsersList.find(u => u.id === selectedUserId) || authUsersList[0] || null;
+    return authUsersList.find(u => 
+      u.id === selectedUserId || 
+      (u.email && selectedUserId && u.email.toLowerCase().trim() === selectedUserId.toLowerCase().trim())
+    ) || authUsersList[0] || null;
   }, [authUsersList, selectedUserId]);
 
   const selectedUserNormRole = useMemo(() => {
@@ -170,14 +183,31 @@ export default function RolePermissionsTab({
   const existingOverride = useMemo(() => {
     if (!selectedUser) return null;
     const uId = selectedUser.id;
+    const uIdLower = uId.toLowerCase().trim();
     const uEmail = selectedUser.email?.toLowerCase().trim();
     const uName = selectedUser.name?.toLowerCase().trim();
-    return (uId && userPermissions[uId]) ||
+    const uPrefix = uEmail?.includes('@') ? uEmail.split('@')[0] : '';
+
+    let found = (uId && userPermissions[uId]) ||
+      (uIdLower && userPermissions[uIdLower]) ||
       (uEmail && userPermissions[uEmail]) ||
-      (uId && userPermissions[uId.toLowerCase()]) ||
-      (uEmail && userPermissions[uEmail.toLowerCase()]) ||
-      (uName && userPermissions[uName]) ||
-      null;
+      (uPrefix && userPermissions[uPrefix]) ||
+      (uName && userPermissions[uName]);
+
+    if (!found && userPermissions && typeof userPermissions === 'object') {
+      for (const k of Object.keys(userPermissions)) {
+        const kLower = k.toLowerCase().trim();
+        if (
+          (uIdLower && kLower === uIdLower) ||
+          (uEmail && (kLower === uEmail || kLower === uPrefix || kLower.includes(uEmail))) ||
+          (uName && kLower === uName)
+        ) {
+          found = userPermissions[k];
+          break;
+        }
+      }
+    }
+    return found || null;
   }, [userPermissions, selectedUser]);
 
   const selectedUserHasOverride = useMemo(() => {
@@ -213,8 +243,9 @@ export default function RolePermissionsTab({
       ) : null;
 
       if (modOverride) {
+        const isVis = extractVisibility(modOverride);
         initial[m.id] = {
-          canView: modOverride.canView !== undefined ? modOverride.canView : ((modOverride as any).is_visible ?? true),
+          canView: isVis,
           canCreate: !!modOverride.canCreate,
           canEdit: !!modOverride.canEdit,
           canDelete: !!modOverride.canDelete,
