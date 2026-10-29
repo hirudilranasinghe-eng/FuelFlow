@@ -12,17 +12,7 @@ import {
   Scale
 } from 'lucide-react';
 
-import { AuthUser, resolveUserRole, RolePermissionsMap, UserPermissionsMap, normalizeRoleName } from '../types';
-import { 
-  getCachedRolePermissions, 
-  getCachedUserPermissions, 
-  checkUserPermission, 
-  isModuleVisible,
-  canPerformAction,
-  fetchRolePermissionsFromSupabase, 
-  fetchUserPermissionsFromSupabase 
-} from '../lib/permissions';
-import { supabase } from '../lib/supabase';
+import { AuthUser } from '../types';
 import FuelLogo from './FuelLogo';
 
 interface SidebarProps {
@@ -34,8 +24,6 @@ interface SidebarProps {
   onLogout?: () => void;
   isCollapsed?: boolean;
   onToggleCollapse?: () => void;
-  rolePermissions?: RolePermissionsMap;
-  userPermissions?: UserPermissionsMap;
 }
 
 export default function Sidebar({ 
@@ -46,79 +34,13 @@ export default function Sidebar({
   user, 
   onLogout,
   isCollapsed: externalIsCollapsed,
-  onToggleCollapse,
-  rolePermissions: externalRolePermissions,
-  userPermissions: externalUserPermissions
+  onToggleCollapse
 }: SidebarProps) {
   const [internalIsCollapsed, setInternalIsCollapsed] = useState(false);
   const isCollapsed = externalIsCollapsed !== undefined ? externalIsCollapsed : internalIsCollapsed;
 
-  const [permissions, setPermissions] = useState<RolePermissionsMap>(() => externalRolePermissions || getCachedRolePermissions());
-  const [userPerms, setUserPerms] = useState<UserPermissionsMap>(() => externalUserPermissions || getCachedUserPermissions());
   const [isReportsExpanded, setIsReportsExpanded] = useState<boolean>(activeTab === 'reports');
   const [isAdminExpanded, setIsAdminExpanded] = useState<boolean>(activeTab === 'admin');
-
-  // Sync role & user permissions
-  useEffect(() => {
-    if (externalRolePermissions) {
-      setPermissions(externalRolePermissions);
-    }
-  }, [externalRolePermissions]);
-
-  useEffect(() => {
-    if (externalUserPermissions) {
-      setUserPerms(externalUserPermissions);
-    }
-  }, [externalUserPermissions]);
-
-  useEffect(() => {
-    let isMounted = true;
-    Promise.all([
-      fetchRolePermissionsFromSupabase(supabase),
-      fetchUserPermissionsFromSupabase(supabase)
-    ]).then(([rMap, uMap]) => {
-      if (isMounted) {
-        if (rMap) setPermissions(rMap);
-        if (uMap) setUserPerms(uMap);
-      }
-    });
-
-    const handleRoleSync = (e: any) => {
-      if (e?.detail?.permissionsMap && isMounted) {
-        setPermissions(e.detail.permissionsMap);
-      } else if (isMounted) {
-        setPermissions(getCachedRolePermissions());
-      }
-    };
-    const handleUserSync = (e: any) => {
-      if (e?.detail?.userPermissionsMap && isMounted) {
-        setUserPerms(e.detail.userPermissionsMap);
-      } else if (isMounted) {
-        setUserPerms(getCachedUserPermissions());
-      }
-    };
-    const handleGeneralSync = () => {
-      if (isMounted) {
-        setPermissions(getCachedRolePermissions());
-        setUserPerms(getCachedUserPermissions());
-      }
-    };
-
-    window.addEventListener('role-permissions-updated', handleRoleSync);
-    window.addEventListener('user-permissions-updated', handleUserSync);
-    window.addEventListener('permissions-updated', handleUserSync);
-    window.addEventListener('permissions-updated', handleGeneralSync);
-    window.addEventListener('storage', handleGeneralSync);
-
-    return () => {
-      isMounted = false;
-      window.removeEventListener('role-permissions-updated', handleRoleSync);
-      window.removeEventListener('user-permissions-updated', handleUserSync);
-      window.removeEventListener('permissions-updated', handleUserSync);
-      window.removeEventListener('permissions-updated', handleGeneralSync);
-      window.removeEventListener('storage', handleGeneralSync);
-    };
-  }, []);
 
   useEffect(() => {
     if (activeTab === 'reports') {
@@ -137,26 +59,21 @@ export default function Sidebar({
     }
   };
 
-  const rawMenuItems = [
-    { id: 'dashboard', name: 'Dashboard', icon: LayoutDashboard, moduleKey: 'dashboard' },
-    { id: 'shift', name: 'Shift Management', icon: Clock, moduleKey: 'shift_management' },
-    { id: 'pumper-short-excess', name: 'Pumper Short & Excess', icon: Scale, moduleKey: 'pumper_short_excess' },
-    { id: 'deposits', name: 'Deposits', icon: Landmark, moduleKey: 'deposits' },
-    { id: 'stock', name: 'Fuel Stock', icon: Fuel, moduleKey: 'fuel_stock' },
-    { id: 'oil-storage', name: 'Oil Storage', icon: Droplets, moduleKey: 'oil_storage' },
-    { id: 'gas-inventory', name: 'LP Gas Inventory', icon: Flame, moduleKey: 'gas_inventory' },
-    { id: 'purchases', name: 'Purchases', icon: Truck, moduleKey: 'purchases' },
-    { id: 'manual-dip-record', name: 'Manual Dip Record', icon: Droplet, moduleKey: 'manual_dip_record' },
-    { id: 'reports', name: 'Reports', icon: FileText, moduleKey: 'reports' },
-    { id: 'customers', name: 'Customers', icon: Users, moduleKey: 'customers' },
-    { id: 'admin', name: 'Admin Control', icon: ShieldCheck, moduleKey: 'admin_control' },
+  // All modules are accessible to all users without role permission restrictions
+  const menuItems = [
+    { id: 'dashboard', name: 'Dashboard', icon: LayoutDashboard },
+    { id: 'shift', name: 'Shift Management', icon: Clock },
+    { id: 'pumper-short-excess', name: 'Pumper Short & Excess', icon: Scale },
+    { id: 'deposits', name: 'Deposits', icon: Landmark },
+    { id: 'stock', name: 'Fuel Stock', icon: Fuel },
+    { id: 'oil-storage', name: 'Oil Storage', icon: Droplets },
+    { id: 'gas-inventory', name: 'LP Gas Inventory', icon: Flame },
+    { id: 'purchases', name: 'Purchases', icon: Truck },
+    { id: 'manual-dip-record', name: 'Manual Dip Record', icon: Droplet },
+    { id: 'reports', name: 'Reports', icon: FileText },
+    { id: 'customers', name: 'Customers', icon: Users },
+    { id: 'admin', name: 'Admin Control', icon: ShieldCheck },
   ];
-
-  // Strictly enforce visibility: unchecking 'View' immediately hides the tab from Navigation Bar
-  // Does NOT bypass permissions for System Admin if is_visible is false
-  const menuItems = rawMenuItems.filter(item => {
-    return isModuleVisible(user, item.moduleKey, permissions, userPerms) && isModuleVisible(user, item.id, permissions, userPerms);
-  });
 
   const reportSubItems = [
     { id: 'daily-sales', name: 'Daily Sales', fullName: 'Daily Sales History', icon: BarChart3 },
@@ -167,7 +84,6 @@ export default function Sidebar({
     { id: 'mapping', name: 'Dispenser Nozzles & Pumps', fullName: 'Dispenser Nozzles & Pumps Mapping', icon: Gauge },
     { id: 'oils', name: 'Bulk Oil & Lubricants', fullName: 'Bulk Oil & Lubricant Storage', icon: Droplets },
     { id: 'employees', name: 'Staff Directory & Roles', fullName: 'Staff Directory & Access Roles', icon: Users },
-    { id: 'permissions', name: 'Role Permissions (RBAC)', fullName: 'Role Access & Permissions Matrix', icon: ShieldCheck },
     { id: 'price', name: 'Fuel Tariff & Prices', fullName: 'Fuel Tariff & Price Management', icon: Tag },
   ];
 

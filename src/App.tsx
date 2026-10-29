@@ -29,20 +29,9 @@ import PriceManagementTab from './components/PriceManagementTab';
 import DepositsTab from './components/DepositsTab';
 import PumperShortExcessTab from './components/PumperShortExcessTab';
 import LoginPage, { LoginModal } from './components/LoginPage';
-import { AuthUser, Employee, FuelTank, OilTank, Pump, PumpMachine, Shift, StockDelivery, PriceSchedule, Customer, CreditTransaction, CreditPayment, LPGasItem, ShiftBankDeposit, resolveUserRole, PumperShortageExcessRecord, RolePermissionsMap, UserPermissionsMap, normalizeRoleName } from './types';
+import { AuthUser, Employee, FuelTank, OilTank, Pump, PumpMachine, Shift, StockDelivery, PriceSchedule, Customer, CreditTransaction, CreditPayment, LPGasItem, ShiftBankDeposit, resolveUserRole, PumperShortageExcessRecord } from './types';
 import { supabase, getTanksTableName, setTanksTableName } from './lib/supabase';
 import { upsertPumpReadings, syncCreditAndCardSales, syncAllNonCashSales, updateNozzleMeterCarryover, saveOilTank, recordShiftBankDeposit, fetchShiftBankDeposits, saveIndividualBankDeposit, deleteIndividualBankDeposit, isPumpReadingActiveOrAssigned, saveShiftLogs, savePumperShortageExcessRecords } from './lib/supabaseClient';
-import { 
-  getCachedRolePermissions, 
-  getCachedUserPermissions, 
-  checkUserPermission, 
-  isModuleVisible,
-  fetchRolePermissionsFromSupabase, 
-  fetchUserPermissionsFromSupabase,
-  fetchAndHydrateActiveUserPermissions,
-  clearActiveUserPermissions,
-  invalidatePermissionsCache
-} from './lib/permissions';
 
 export const defaultPumpMachines: PumpMachine[] = [];
 export const defaultPumps: Pump[] = [];
@@ -52,98 +41,13 @@ export default function App() {
   const [isCheckingAuth, setIsCheckingAuth] = useState<boolean>(true);
   const [user, setUser] = useState<AuthUser | null>(null);
 
-  // RBAC permissions state (Role & User Overrides)
-  const [rolePermissions, setRolePermissions] = useState<RolePermissionsMap>(() => getCachedRolePermissions());
-  const [userPermissions, setUserPermissions] = useState<UserPermissionsMap>(() => getCachedUserPermissions());
-
   // Navigation active tab
   const [activeTab, setActiveTab] = useState<string>('dashboard');
   const [reportSubTab, setReportSubTab] = useState<string>('daily-sales');
-  const [adminSubTab, setAdminSubTab] = useState<'tanks' | 'oils' | 'mapping' | 'employees' | 'permissions' | 'price' | 'system'>('tanks');
+  const [adminSubTab, setAdminSubTab] = useState<'tanks' | 'oils' | 'mapping' | 'employees' | 'price' | 'system'>('tanks');
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false);
 
-  // Sync role and user permissions from Supabase
-  useEffect(() => {
-    let isMounted = true;
-    Promise.all([
-      fetchRolePermissionsFromSupabase(supabase),
-      fetchUserPermissionsFromSupabase(supabase)
-    ]).then(([rMap, uMap]) => {
-      if (isMounted) {
-        if (rMap) setRolePermissions(rMap);
-        if (uMap) setUserPermissions(uMap);
-      }
-    });
-
-    const handleRoleSync = (e: any) => {
-      if (e?.detail?.permissionsMap && isMounted) {
-        setRolePermissions(e.detail.permissionsMap);
-      }
-    };
-    const handleUserSync = (e: any) => {
-      if (e?.detail?.userPermissionsMap && isMounted) {
-        setUserPermissions(e.detail.userPermissionsMap);
-      }
-    };
-    const handleGeneralPermissionsSync = (e: any) => {
-      if (isMounted) {
-        if (e?.detail?.userPermissionsMap) {
-          setUserPermissions(e.detail.userPermissionsMap);
-        }
-        if (e?.detail?.permissionsMap) {
-          setRolePermissions(e.detail.permissionsMap);
-        }
-      }
-    };
-
-    window.addEventListener('role-permissions-updated', handleRoleSync);
-    window.addEventListener('user-permissions-updated', handleUserSync);
-    window.addEventListener('permissions-updated', handleGeneralPermissionsSync);
-    return () => {
-      isMounted = false;
-      window.removeEventListener('role-permissions-updated', handleRoleSync);
-      window.removeEventListener('user-permissions-updated', handleUserSync);
-      window.removeEventListener('permissions-updated', handleGeneralPermissionsSync);
-    };
-  }, []);
-
-  const ALL_MODULE_TABS = [
-    { id: 'dashboard', moduleKey: 'dashboard' },
-    { id: 'shift', moduleKey: 'shift_management' },
-    { id: 'pumper-short-excess', moduleKey: 'pumper_short_excess' },
-    { id: 'deposits', moduleKey: 'deposits' },
-    { id: 'stock', moduleKey: 'fuel_stock' },
-    { id: 'oil-storage', moduleKey: 'oil_storage' },
-    { id: 'gas-inventory', moduleKey: 'gas_inventory' },
-    { id: 'purchases', moduleKey: 'purchases' },
-    { id: 'manual-dip-record', moduleKey: 'manual_dip_record' },
-    { id: 'reports', moduleKey: 'reports' },
-    { id: 'customers', moduleKey: 'customers' },
-    { id: 'admin', moduleKey: 'admin_control' }
-  ];
-
-  // Route Guard: If activeTab has can_view: false, automatically redirect to first permitted module
-  useEffect(() => {
-    if (user && !isCheckingAuth) {
-      const allowed = isModuleVisible(user, activeTab, rolePermissions, userPermissions);
-      if (!allowed) {
-        const firstPermitted = ALL_MODULE_TABS.find(t => 
-          isModuleVisible(user, t.id, rolePermissions, userPermissions) || 
-          isModuleVisible(user, t.moduleKey, rolePermissions, userPermissions)
-        );
-        if (firstPermitted && firstPermitted.id !== activeTab) {
-          setActiveTab(firstPermitted.id);
-        }
-      }
-    }
-  }, [user, activeTab, rolePermissions, userPermissions, isCheckingAuth]);
-
   const handleSetActiveTab = (tab: string, subTab?: string) => {
-    // Strictly prevent navigation if user has can_view: false
-    if (!isModuleVisible(user, tab, rolePermissions, userPermissions)) {
-      console.warn(`Route Guard: Navigation blocked to "${tab}" because can_view is false.`);
-      return;
-    }
     setActiveTab(tab);
     if (tab === 'reports') {
       setReportSubTab(subTab || 'daily-sales');
@@ -189,24 +93,13 @@ export default function App() {
               try {
                 localStorage.setItem('fms_user', JSON.stringify(authUser));
               } catch (_) {}
-              // Force-fetch fresh database permissions directly from Supabase for this user before setting user state
-              await fetchAndHydrateActiveUserPermissions(supabase, authUser);
-              const [freshRoles, freshUsers] = await Promise.all([
-                fetchRolePermissionsFromSupabase(supabase),
-                fetchUserPermissionsFromSupabase(supabase)
-              ]);
-              if (isMounted) {
-                if (freshRoles) setRolePermissions(freshRoles);
-                if (freshUsers) setUserPermissions(freshUsers);
-                setUser(authUser);
-              }
+              setUser(authUser);
             }
           }
         } catch (err) {
           console.warn("Supabase auth session check notice:", err);
           if (isMounted) {
             setUser(null);
-            invalidatePermissionsCache();
             try {
               localStorage.removeItem('fms_user');
             } catch (_) {}
@@ -217,16 +110,13 @@ export default function App() {
           const stored = localStorage.getItem('fms_user');
           if (stored && isMounted) {
             const parsed = JSON.parse(stored);
-            await fetchAndHydrateActiveUserPermissions(supabase, parsed);
-            if (isMounted) setUser(parsed);
+            setUser(parsed);
           } else if (isMounted) {
             setUser(null);
-            invalidatePermissionsCache();
           }
         } catch (_) {
           if (isMounted) {
             setUser(null);
-            invalidatePermissionsCache();
           }
         }
       }
@@ -255,19 +145,13 @@ export default function App() {
         try {
           localStorage.setItem('fms_user', JSON.stringify(authUser));
         } catch (_) {}
-        fetchAndHydrateActiveUserPermissions(supabase, authUser).then(() => {
-          Promise.all([
-            fetchRolePermissionsFromSupabase(supabase),
-            fetchUserPermissionsFromSupabase(supabase)
-          ]).then(([freshRoles, freshUsers]) => {
-            if (freshRoles && isMounted) setRolePermissions(freshRoles);
-            if (freshUsers && isMounted) setUserPermissions(freshUsers);
-            if (isMounted) setUser(authUser);
-          });
-        });
+        if (isMounted) {
+          setUser(authUser);
+        }
       } else {
-        setUser(null);
-        invalidatePermissionsCache();
+        if (isMounted) {
+          setUser(null);
+        }
         try {
           localStorage.removeItem('fms_user');
         } catch (_) {}
@@ -281,36 +165,11 @@ export default function App() {
     };
   }, []);
 
-  // Dynamic RBAC tab guard: Redirect users away from modules they lack view permission for
-  useEffect(() => {
-    if (user) {
-      const canAccess = checkUserPermission(rolePermissions, user, activeTab, 'view', userPermissions);
-      if (!canAccess) {
-        // Find first available module
-        const fallback = ['shift', 'deposits', 'fuel_stock', 'reports', 'oil_storage', 'purchases'].find(m => 
-          checkUserPermission(rolePermissions, user, m, 'view', userPermissions)
-        ) || 'shift';
-        setActiveTab(fallback);
-      }
-    }
-  }, [user, activeTab, rolePermissions, userPermissions]);
-
   const handleLoginSuccess = async (signedInUser: AuthUser) => {
-    // 1. Invalidate stale cached permissions first
-    invalidatePermissionsCache();
+    setUser(signedInUser);
     try {
       localStorage.setItem('fms_user', JSON.stringify(signedInUser));
     } catch (_) {}
-
-    // 2. Fetch fresh permissions from Supabase directly BEFORE setting user state
-    await fetchAndHydrateActiveUserPermissions(supabase, signedInUser);
-    const [freshRoles, freshUsers] = await Promise.all([
-      fetchRolePermissionsFromSupabase(supabase),
-      fetchUserPermissionsFromSupabase(supabase)
-    ]);
-    if (freshRoles) setRolePermissions(freshRoles);
-    if (freshUsers) setUserPermissions(freshUsers);
-    setUser(signedInUser);
   };
 
   const handleLogout = async () => {
@@ -321,7 +180,6 @@ export default function App() {
       }
     } catch (_) {}
     setUser(null);
-    invalidatePermissionsCache();
     try {
       localStorage.removeItem('fms_user');
       localStorage.removeItem('fuelflow_user');
@@ -1920,8 +1778,6 @@ export default function App() {
         onLogout={handleLogout} 
         isCollapsed={sidebarCollapsed}
         onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
-        rolePermissions={rolePermissions}
-        userPermissions={userPermissions}
       />
 
       {/* Main Panel Content Area */}
@@ -2010,33 +1866,15 @@ export default function App() {
           </div>
         )}
         <AnimatePresence mode="wait">
-          {!isModuleVisible(user, activeTab, rolePermissions, userPermissions) ? (
-            <motion.div
-              key="access-restricted-screen"
-              id="access-restricted-screen"
-              initial={{ opacity: 0, scale: 0.98 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0 }}
-              className="min-h-[50vh] flex flex-col items-center justify-center p-8 bg-white rounded-3xl border border-gray-100 shadow-sm text-center animate-fade-in"
-            >
-              <div className="w-14 h-14 rounded-2xl bg-rose-50 text-rose-600 flex items-center justify-center mb-4 shadow-2xs">
-                <ShieldCheck className="w-7 h-7 text-rose-600" />
-              </div>
-              <h2 className="text-base font-extrabold text-[#1C1C1C]">Access Restricted</h2>
-              <p className="text-xs text-gray-500 max-w-md mt-1 mb-5">
-                You do not have view permissions (<code className="bg-rose-50 text-rose-700 px-1.5 py-0.5 rounded font-mono font-bold text-[11px]">can_view: false</code>) for this module.
-              </p>
-            </motion.div>
-          ) : (
-            <motion.div
-              key={activeTab}
-              id={`tab-content-wrapper-${activeTab}`}
-              initial={{ opacity: 0, y: 15 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -15 }}
-              transition={{ duration: 0.25, ease: 'easeInOut' }}
-              className="w-full h-full"
-            >
+          <motion.div
+            key={activeTab}
+            id={`tab-content-wrapper-${activeTab}`}
+            initial={{ opacity: 0, y: 15 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -15 }}
+            transition={{ duration: 0.25, ease: 'easeInOut' }}
+            className="w-full h-full"
+          >
               {activeTab === 'dashboard' && (
               <DashboardTab
                 employees={employees}
@@ -2259,7 +2097,6 @@ export default function App() {
               />
             )}
           </motion.div>
-        )}
         </AnimatePresence>
       </div>
     </div>

@@ -1430,257 +1430,41 @@ export async function clearUserPermissionOverrides(
 }
 
 /**
- * Prioritized Permission Evaluator:
- * 1. Checks if specific user has an override in `user_permissions` (matched by id, email, or name).
- *    If an individual user override exists, it is 100% authoritative (takes priority over role & admin bypass).
- *    Strictly respects can_view: false - never falls back to default true if an explicit permission record exists.
- * 2. If no user override exists, System Admin has full access.
- * 3. Falls back to `role_permissions` matrix according to the user's role.
+ * Permission Evaluator:
+ * RBAC feature has been removed. All users have default unrestricted access.
  */
 export function checkUserPermission(
-  permissionsMap: RolePermissionsMap | null | undefined,
-  userOrRole?: string | AuthUser | { id?: string; email?: string; role?: string; name?: string } | null,
-  moduleId?: string,
-  action: 'view' | 'create' | 'edit' | 'delete' | 'export' = 'view',
-  userPermissionsMap?: UserPermissionsMap | null
+  _permissionsMap?: RolePermissionsMap | null | undefined,
+  _userOrRole?: string | AuthUser | { id?: string; email?: string; role?: string; name?: string } | null,
+  _moduleId?: string,
+  _action: 'view' | 'create' | 'edit' | 'delete' | 'export' = 'view',
+  _userPermissionsMap?: UserPermissionsMap | null
 ): boolean {
-  if (!moduleId) return true;
-
-  const canon = canonicalModuleId(moduleId);
-
-  let userRole: string | undefined;
-  let userId: string | undefined;
-  let userEmail: string | undefined;
-  let userName: string | undefined;
-
-  if (typeof userOrRole === 'object' && userOrRole !== null) {
-    userRole = userOrRole.role;
-    userId = userOrRole.id;
-    userEmail = (userOrRole as any).email;
-    userName = (userOrRole as any).name;
-  } else if (typeof userOrRole === 'string') {
-    userRole = userOrRole;
-  }
-
-  // Fallback to active logged-in session user if user object wasn't passed directly with ID/email
-  if (!userId && !userEmail) {
-    try {
-      const stored = localStorage.getItem('fms_user') || localStorage.getItem('fuelflow_user');
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (parsed?.id) userId = String(parsed.id).trim();
-        if (parsed?.email) userEmail = String(parsed.email).trim().toLowerCase();
-        if (parsed?.name && !userName) userName = String(parsed.name).trim();
-        if (parsed?.role && !userRole) userRole = parsed.role;
-      }
-    } catch (_) {}
-  }
-
-  const normRole = normalizeRoleName(userRole);
-
-  // Collect ALL possible identifiers simultaneously: Supabase Auth user.id (UUID), lowercase email, username, email prefix
-  const candidateKeys: string[] = [];
-  if (userId) {
-    const idTrim = userId.trim();
-    candidateKeys.push(idTrim);
-    if (idTrim.toLowerCase() !== idTrim) candidateKeys.push(idTrim.toLowerCase());
-  }
-  if (userEmail) {
-    const emailTrim = userEmail.trim().toLowerCase();
-    candidateKeys.push(emailTrim);
-    if (emailTrim.includes('@')) {
-      candidateKeys.push(emailTrim.split('@')[0]);
-    }
-  }
-  if (userName) {
-    const nameTrim = userName.trim().toLowerCase();
-    candidateKeys.push(nameTrim);
-    candidateKeys.push(nameTrim.replace(/\s+/g, ''));
-  }
-
-  // 1. ABSOLUTE PRIORITY: Check for individual User Permissions Override
-  // Individual user overrides are 100% authoritative over both role defaults and admin bypass.
-  // Explicit individual user denials (can_view: false / is_visible: false) MUST take absolute precedence!
-  const uMap = userPermissionsMap || getCachedUserPermissions();
-  const activePerms = getActiveUserPermissions();
-
-  let matchedUserRules: Record<string, any> | null = null;
-
-  // Direct lookup across all candidate identifiers simultaneously
-  for (const ident of candidateKeys) {
-    if (uMap && uMap[ident]) {
-      matchedUserRules = uMap[ident];
-      break;
-    }
-  }
-
-  // If not found in direct uMap, check activeUserPermissions if evaluating active session user
-  if (!matchedUserRules && activePerms && Object.keys(activePerms).length > 0) {
-    try {
-      const stored = localStorage.getItem('fms_user') || localStorage.getItem('fuelflow_user');
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        const activeEmail = (parsed.email || '').toLowerCase().trim();
-        const activeId = (parsed.id || '').toLowerCase().trim();
-        const activePrefix = activeEmail.includes('@') ? activeEmail.split('@')[0] : '';
-        const matchesActive = candidateKeys.length === 0 || candidateKeys.some(k => {
-          const kl = k.toLowerCase().trim();
-          return kl === activeEmail || kl === activeId || kl === activePrefix;
-        });
-        if (matchesActive) {
-          matchedUserRules = activePerms as any;
-        }
-      } else {
-        matchedUserRules = activePerms as any;
-      }
-    } catch (_) {
-      matchedUserRules = activePerms as any;
-    }
-  }
-
-  // Flexible / fuzzy matching in uMap if still not found
-  if (!matchedUserRules && uMap && typeof uMap === 'object') {
-    for (const key of Object.keys(uMap)) {
-      const kLower = key.toLowerCase().trim();
-      const kPrefix = kLower.includes('@') ? kLower.split('@')[0] : '';
-      for (const ident of candidateKeys) {
-        const idLow = ident.toLowerCase().trim();
-        if (kLower === idLow || kPrefix === idLow || (idLow.length >= 4 && (kLower.includes(idLow) || idLow.includes(kLower)))) {
-          matchedUserRules = uMap[key];
-          break;
-        }
-      }
-      if (matchedUserRules) break;
-    }
-  }
-
-  // STEP 1: Absolute priority for explicit individual user restrictions
-  // If user has an explicit individual record in user_permissions for this module, it MUST take precedence.
-  // Role defaults or general role permissions must NEVER override an explicit individual user denial (can_view: false)!
-  if (matchedUserRules) {
-    let userModRule = matchedUserRules[canon] ||
-      matchedUserRules[moduleId] ||
-      matchedUserRules[moduleId.toLowerCase()] ||
-      matchedUserRules[moduleId.replace(/-/g, '_')] ||
-      matchedUserRules[moduleId.replace(/_/g, '-')] ||
-      matchedUserRules[`module_${canon}`];
-
-    if (!userModRule) {
-      for (const k of Object.keys(matchedUserRules)) {
-        if (canonicalModuleId(k) === canon || k.toLowerCase() === moduleId.toLowerCase()) {
-          userModRule = matchedUserRules[k];
-          break;
-        }
-      }
-    }
-
-    if (userModRule !== undefined && userModRule !== null) {
-      switch (action) {
-        case 'view': {
-          const isVis = extractVisibility(userModRule);
-          console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) for user [${candidateKeys.join(', ')}]: MATCHED explicit override -> action="${action}", result=${isVis} (ABSOLUTE PRIORITY OVERRIDE)`);
-          return isVis;
-        }
-        case 'create': {
-          const allowed = userModRule.canCreate !== undefined ? !!userModRule.canCreate : !!(userModRule as any).can_create;
-          console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) for user [${candidateKeys.join(', ')}]: MATCHED explicit override -> action="${action}", result=${allowed}`);
-          return allowed;
-        }
-        case 'edit': {
-          const allowed = userModRule.canEdit !== undefined ? !!userModRule.canEdit : !!(userModRule as any).can_edit;
-          console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) for user [${candidateKeys.join(', ')}]: MATCHED explicit override -> action="${action}", result=${allowed}`);
-          return allowed;
-        }
-        case 'delete': {
-          const allowed = userModRule.canDelete !== undefined ? !!userModRule.canDelete : !!(userModRule as any).can_delete;
-          console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) for user [${candidateKeys.join(', ')}]: MATCHED explicit override -> action="${action}", result=${allowed}`);
-          return allowed;
-        }
-        case 'export': {
-          const allowed = userModRule.canExport !== undefined ? !!userModRule.canExport : !!(userModRule as any).can_export;
-          console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) for user [${candidateKeys.join(', ')}]: MATCHED explicit override -> action="${action}", result=${allowed}`);
-          return allowed;
-        }
-        default:
-          return false;
-      }
-    }
-  }
-
-  // 2. System Admin default bypass ONLY when no explicit override was configured for this module
-  if (normRole === 'System Admin') {
-    console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) for user [${candidateKeys.join(', ')}]: Granted by System Admin default.`);
-    return true;
-  }
-
-  // 3. Role Permissions Fallback
-  const map = permissionsMap || getCachedRolePermissions();
-  const roleRules = map[normRole] || map['Supervisor'];
-
-  if (!roleRules) {
-    const isDefaultVis = action === 'view' ? canon !== 'admin_control' : false;
-    console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) for user [${candidateKeys.join(', ')}]: No role rules for "${normRole}". Default result=${isDefaultVis}`);
-    return isDefaultVis;
-  }
-
-  const modRule = roleRules[canon] ||
-    roleRules[moduleId as SystemModuleId] ||
-    roleRules[moduleId.replace(/-/g, '_') as SystemModuleId] ||
-    roleRules[moduleId.replace(/_/g, '-') as SystemModuleId];
-
-  if (!modRule) {
-    const isDefaultVis = action === 'view' ? canon !== 'admin_control' : false;
-    console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) for user [${candidateKeys.join(', ')}]: No module rule in role "${normRole}". Default result=${isDefaultVis}`);
-    return isDefaultVis;
-  }
-
-  let finalResult = false;
-  switch (action) {
-    case 'view':
-      finalResult = extractVisibility(modRule);
-      break;
-    case 'create':
-      finalResult = modRule.canCreate !== undefined ? !!modRule.canCreate : !!(modRule as any).can_create;
-      break;
-    case 'edit':
-      finalResult = modRule.canEdit !== undefined ? !!modRule.canEdit : !!(modRule as any).can_edit;
-      break;
-    case 'delete':
-      finalResult = modRule.canDelete !== undefined ? !!modRule.canDelete : !!(modRule as any).can_delete;
-      break;
-    case 'export':
-      finalResult = modRule.canExport !== undefined ? !!modRule.canExport : !!(modRule as any).can_export;
-      break;
-    default:
-      finalResult = false;
-  }
-
-  console.log(`[RBAC Lookup] Module "${moduleId}" (${canon}) evaluated from role "${normRole}": action="${action}", result=${finalResult}`);
-  return finalResult;
+  return true;
 }
 
 /**
- * Helper to check if a module is strictly visible in navigation
+ * Helper to check if a module is visible in navigation (always true)
  */
 export function isModuleVisible(
-  userOrRole?: string | AuthUser | null,
-  moduleId?: string,
-  permissionsMap?: RolePermissionsMap | null,
-  userPermissionsMap?: UserPermissionsMap | null
+  _userOrRole?: string | AuthUser | null,
+  _moduleId?: string,
+  _permissionsMap?: RolePermissionsMap | null,
+  _userPermissionsMap?: UserPermissionsMap | null
 ): boolean {
-  return checkUserPermission(permissionsMap, userOrRole, moduleId, 'view', userPermissionsMap);
+  return true;
 }
 
 /**
- * Helper to check if user can perform a specific action (view, create, edit, delete, export)
+ * Helper to check if user can perform a specific action (always true)
  */
 export function canPerformAction(
-  userOrRole?: string | AuthUser | null,
-  moduleId?: string,
-  action: 'view' | 'create' | 'edit' | 'delete' | 'export' = 'view',
-  permissionsMap?: RolePermissionsMap | null,
-  userPermissionsMap?: UserPermissionsMap | null
+  _userOrRole?: string | AuthUser | null,
+  _moduleId?: string,
+  _action: 'view' | 'create' | 'edit' | 'delete' | 'export' = 'view',
+  _permissionsMap?: RolePermissionsMap | null,
+  _userPermissionsMap?: UserPermissionsMap | null
 ): boolean {
-  return checkUserPermission(permissionsMap, userOrRole, moduleId, action, userPermissionsMap);
+  return true;
 }
 
